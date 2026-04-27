@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -32,7 +33,7 @@ from PyQt6.QtWidgets import (
 
 from profiles_store import BrowserProfile, load_profiles, save_profiles
 from fingerprint_generator import generate_test_fingerprint
-from playwright_runner import run_profile
+from playwright_runner import run_profile, profile_user_data_dir
 from zaliver_theme import ZALIVER_DARK_QSS
 
 
@@ -375,6 +376,20 @@ class MainWindow(QMainWindow):
         res = QMessageBox.question(self, "Delete profile", f"Delete '{p.name}'?\n\nID: {p.profile_id}")
         if res != QMessageBox.StandardButton.Yes:
             return
+
+        # Stop running instance if any (user should close browser window, but we can prevent deletion while running)
+        r = self._runners.get(p.profile_id)
+        if r and r.isRunning():
+            QMessageBox.warning(self, "Running", "This profile is currently running. Close the browser window first.")
+            return
+
+        # Remove on-disk storage for the profile (Playwright persistent context directory)
+        try:
+            shutil.rmtree(profile_user_data_dir(p.profile_id), ignore_errors=True)
+        except Exception:
+            # keep going; profile removal should not be blocked by fs issues
+            pass
+
         self._profiles = [x for x in self._profiles if x.profile_id != p.profile_id]
         self._active_profile_id = self._profiles[0].profile_id if self._profiles else None
         save_profiles(self._profiles)
