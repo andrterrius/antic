@@ -227,6 +227,42 @@ def profile_user_data_dir(profile_id: str) -> Path:
     return d
 
 
+def _canonical_proxy_scheme(scheme: str) -> str:
+    """Map user/URL schemes to Chromium/Playwright proxy server schemes."""
+    s = (scheme or "http").lower()
+    if s == "https":
+        return "http"
+    if s in ("socks5h", "socks5a"):
+        return "socks5"
+    return s
+
+
+def normalize_proxy_server_url(raw: str) -> str:
+    """
+    Single source of truth for proxy URL: http://host:port or socks5://host:port (etc.).
+    Bare host:port defaults to http://; SOCKS5 must be explicit (socks5://...).
+    Preserves user:pass@host if present (for requests); Playwright strips creds in _proxy_settings.
+    """
+    server = (raw or "").strip()
+    if not server:
+        return server
+    if "://" not in server:
+        return f"http://{server}"
+
+    parsed = urlparse(server)
+    canon = _canonical_proxy_scheme(parsed.scheme)
+    return urlunparse(
+        (
+            canon,
+            parsed.netloc,
+            parsed.path or "",
+            parsed.params or "",
+            parsed.query or "",
+            parsed.fragment or "",
+        )
+    )
+
+
 def _proxy_settings(p: BrowserProfile) -> ProxySettings | None:
     if not p.proxy_server:
         return None
@@ -235,41 +271,37 @@ def _proxy_settings(p: BrowserProfile) -> ProxySettings | None:
     username = (p.proxy_username or "").strip() or None
     password = (p.proxy_password or "").strip() or None
 
-    # Parse if URL format is provided
     if "://" in server:
         parsed = urlparse(server)
 
-        # Extract credentials from URL if not explicitly provided
         if parsed.username and not username:
             username = parsed.username
         if parsed.password and not password:
             password = parsed.password
 
-        # Rebuild server URL without credentials
         if parsed.username or parsed.password:
             netloc = parsed.hostname or ""
             if parsed.port:
                 netloc = f"{netloc}:{parsed.port}"
-            # Preserve scheme and path
-            server = urlunparse((
-                parsed.scheme,
-                netloc,
-                parsed.path or "",
-                parsed.params or "",
-                parsed.query or "",
-                parsed.fragment or ""
-            ))
+            scheme = _canonical_proxy_scheme(parsed.scheme)
+            server = urlunparse(
+                (
+                    scheme,
+                    netloc,
+                    parsed.path or "",
+                    parsed.params or "",
+                    parsed.query or "",
+                    parsed.fragment or "",
+                )
+            )
+        else:
+            server = normalize_proxy_server_url(server)
     else:
-        # If no scheme provided, default to socks5
-        if ":" in server and not server.startswith(("http://", "https://", "socks4://", "socks5://")):
-            server = f"socks5://{server}"
+        server = normalize_proxy_server_url(server)
 
-    # Validate server format
-    if not server or "://" not in server:
-        # Add default scheme if missing
-        server = f"socks5://{server}"
+    if "://" not in server:
+        server = f"http://{server}"
 
-    # Build proxy settings
     proxy: ProxySettings = {"server": server}
     if username:
         proxy["username"] = username
@@ -285,26 +317,34 @@ def get_proxy_ip(proxy_server: str, proxy_username: str = None, proxy_password: 
     """
     try:
         import requests
-        proxy_url = proxy_server
-        if not proxy_url.startswith(('http://', 'https://', 'socks5://')):
-            proxy_url = 'http://' + proxy_url
 
-        proxies = {
-            'http': proxy_url,
-            'https': proxy_url,
-        }
+        proxy_url = normalize_proxy_server_url(proxy_server)
+        if not proxy_url:
+            return None
 
         if proxy_username and proxy_password:
-            # Форматируем прокси с авторизацией
             parsed = urlparse(proxy_url)
-            auth_proxy = f"{parsed.scheme}://{proxy_username}:{proxy_password}@{parsed.netloc}"
-            proxies = {
-                'http': auth_proxy,
-                'https': auth_proxy,
-            }
+            auth_netloc = parsed.netloc
+            if "@" not in auth_netloc:
+                auth_netloc = f"{proxy_username}:{proxy_password}@{auth_netloc}"
+            proxy_url = urlunparse(
+                (
+                    parsed.scheme,
+                    auth_netloc,
+                    parsed.path or "",
+                    parsed.params or "",
+                    parsed.query or "",
+                    parsed.fragment or "",
+                )
+            )
 
-        response = requests.get('https://api.ipify.org?format=json', proxies=proxies, timeout=10)
-        proxy_ip = response.json()['ip']
+        proxies = {
+            "http": proxy_url,
+            "https": proxy_url,
+        }
+
+        response = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=10)
+        proxy_ip = response.json()["ip"]
         return proxy_ip
     except Exception as e:
         print(f"Failed to get proxy IP: {e}")
