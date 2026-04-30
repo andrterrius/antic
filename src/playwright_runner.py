@@ -287,7 +287,7 @@ def run_profile(
             '--disable-logging',
             '--log-level=3',
             '--silent-debugger-extension-api',
-
+            '--disable-webgl'
         ]
 
     try:
@@ -414,6 +414,7 @@ def run_profile(
                     if stop_requested and stop_requested():
                         log("Stop requested — closing context...")
                         break
+                    page.save()
                     page.wait_for_timeout(500)
             except Exception:
                 pass
