@@ -187,7 +187,7 @@ def ensure_playwright_chromium_installed(log: Callable[[str], None]) -> bool:
         with contextlib.redirect_stdout(lw), contextlib.redirect_stderr(lw):
             try:
                 old_argv = sys.argv[:]
-                sys.argv = ["patchright", "install", "--force", "chromium"]
+                sys.argv = ["playwright", "install", "--force", "chromium"]
                 try:
                     playwright_main()
                 finally:
