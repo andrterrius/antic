@@ -11,6 +11,7 @@ from typing import Any
 class BrowserProfile:
     profile_id: str
     name: str
+    automation_enabled: bool = False
     proxy_server: str | None = None  # e.g. http://host:port
     proxy_username: str | None = None
     proxy_password: str | None = None
@@ -21,11 +22,20 @@ class BrowserProfile:
     user_agent: str | None = None
     locale: str | None = None          # e.g. en-US
     timezone_id: str | None = None     # e.g. Europe/Moscow
-    viewport_width: int | None = 1280
-    viewport_height: int | None = 720
+    country_code: str | None = None    # ISO-3166 alpha-2, e.g. RU, US
+    # Desktop UI uses system-default sizing; keep optional for compatibility (e.g., mobile emulation).
+    viewport_width: int | None = None
+    viewport_height: int | None = None
     color_scheme: str | None = None    # "light"|"dark"|"no-preference"
     geo_lat: float | None = None
     geo_lon: float | None = None
+
+    # Fingerprint-consistency overrides (best-effort)
+    webgl_vendor: str | None = None
+    webgl_renderer: str | None = None
+    # WebGL getParameter(7938) / (35724); if unset, Chromium-like defaults apply when vendor/renderer are set
+    webgl_version: str | None = None
+    webgl_shading_language_version: str | None = None
 
 
 def _data_dir() -> Path:
@@ -58,6 +68,7 @@ def load_profiles() -> list[BrowserProfile]:
             BrowserProfile(
                 profile_id=str(item.get("profile_id", "")).strip(),
                 name=str(item.get("name", "")).strip() or "Profile",
+                automation_enabled=bool(item.get("automation_enabled", False)),
                 proxy_server=_none_if_blank(item.get("proxy_server")),
                 proxy_username=_none_if_blank(item.get("proxy_username")),
                 proxy_password=_none_if_blank(item.get("proxy_password")),
@@ -66,11 +77,16 @@ def load_profiles() -> list[BrowserProfile]:
                 user_agent=_none_if_blank(item.get("user_agent")),
                 locale=_none_if_blank(item.get("locale")),
                 timezone_id=_none_if_blank(item.get("timezone_id")),
-                viewport_width=_int_or_none(item.get("viewport_width"), default=1280),
-                viewport_height=_int_or_none(item.get("viewport_height"), default=720),
+                country_code=_none_if_blank(item.get("country_code")),
+                viewport_width=_int_or_none(item.get("viewport_width"), default=None),
+                viewport_height=_int_or_none(item.get("viewport_height"), default=None),
                 color_scheme=_none_if_blank(item.get("color_scheme")),
                 geo_lat=_float_or_none(item.get("geo_lat")),
                 geo_lon=_float_or_none(item.get("geo_lon")),
+                webgl_vendor=_none_if_blank(item.get("webgl_vendor")),
+                webgl_renderer=_none_if_blank(item.get("webgl_renderer")),
+                webgl_version=_none_if_blank(item.get("webgl_version")),
+                webgl_shading_language_version=_none_if_blank(item.get("webgl_shading_language_version")),
             )
         )
 
