@@ -12,7 +12,9 @@ import platform
 import io
 import contextlib
 import sys
+import json
 
+import patchright
 from playwright.sync_api import ProxySettings, BrowserContext, Page, Playwright
 from patchright.sync_api import sync_playwright
 
@@ -127,20 +129,26 @@ def _playwright_browsers_path() -> Path:
         return p
 
 
+def _patchright_chromium_revision() -> str:
+    browsers_json = Path(patchright.__file__).resolve().parent / "driver" / "package" / "browsers.json"
+    data = json.loads(browsers_json.read_text(encoding="utf-8"))
+    for entry in data.get("browsers", []):
+        if entry.get("name") == "chromium":
+            return str(entry["revision"])
+    raise KeyError("chromium entry missing in patchright browsers.json")
+
+
 def _chromium_executable_exists(browsers_root: Path) -> bool:
-    # Windows: chromium-*/chrome-win*/chrome.exe
-    for exe in browsers_root.glob("chromium-*/chrome-win*/chrome.exe"):
+    """True only for the Chromium revision shipped with the installed patchright package."""
+    rev = _patchright_chromium_revision()
+    for exe in browsers_root.glob(f"chromium-{rev}/chrome-win*/chrome.exe"):
         if exe.is_file():
             return True
-    # macOS: chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium
-    for exe in browsers_root.glob("chromium-*/chrome-mac-*"):
-        if exe.is_dir():
+    for d in browsers_root.glob(f"chromium-{rev}/chrome-mac-*"):
+        if d.is_dir():
             return True
-    # Linux: chromium-*/chrome-linux/chrome
-    for exe in browsers_root.glob("chromium-*/chrome-linux/chrome"):
-        if exe.is_file():
-            return True
-    return False
+    exe = browsers_root / f"chromium-{rev}" / "chrome-linux" / "chrome"
+    return exe.is_file()
 
 
 class _LogWriter(io.TextIOBase):
@@ -178,34 +186,35 @@ def ensure_playwright_chromium_installed(log: Callable[[str], None]) -> bool:
         return True
 
     log(f"Playwright browsers not found in: {browsers_root}")
-    log("Installing Chromium (playwright install chromium)...")
+    log("Installing Chromium (patchright install chromium)...")
     try:
-        # playwright CLI's entrypoint reads arguments from sys.argv.
-        from playwright.__main__ import main as playwright_main  # type: ignore
+        # Runtime uses patchright.sync_api; browser revisions differ from upstream
+        # playwright. Installing via playwright would download the wrong chromium-* folder.
+        from patchright.__main__ import main as patchright_main  # type: ignore
 
         lw = _LogWriter(log)
         with contextlib.redirect_stdout(lw), contextlib.redirect_stderr(lw):
             try:
                 old_argv = sys.argv[:]
-                sys.argv = ["playwright", "install", "--force", "chromium"]
+                sys.argv = ["patchright", "install", "chromium"]
                 try:
-                    playwright_main()
+                    patchright_main()
                 finally:
                     sys.argv = old_argv
             except SystemExit as e:
                 code = int(getattr(e, "code", 1) or 0)
                 if code != 0:
-                    log(f"Playwright install failed with exit code {code}")
+                    log(f"patchright install failed with exit code {code}")
                     return False
 
         if _chromium_executable_exists(browsers_root):
-            log("Playwright Chromium installed successfully.")
+            log("Patchright Chromium installed successfully.")
             return True
 
-        log("Playwright install finished, but Chromium executable was not found.")
+        log("patchright install finished, but Chromium executable was not found.")
         return False
     except Exception as e:
-        log(f"Failed to install Playwright Chromium automatically: {e}")
+        log(f"Failed to install Patchright Chromium automatically: {e}")
         log(traceback.format_exc())
         return False
 
@@ -226,27 +235,47 @@ def _proxy_settings(p: BrowserProfile) -> ProxySettings | None:
     username = (p.proxy_username or "").strip() or None
     password = (p.proxy_password or "").strip() or None
 
-    # Allow pasting proxy as http://user:pass@host:port
-    # Playwright expects credentials in separate fields, not in the server URL.
+    # Parse if URL format is provided
     if "://" in server:
         parsed = urlparse(server)
+
+        # Extract credentials from URL if not explicitly provided
         if parsed.username and not username:
             username = parsed.username
         if parsed.password and not password:
             password = parsed.password
 
+        # Rebuild server URL without credentials
         if parsed.username or parsed.password:
-            # strip creds from server
             netloc = parsed.hostname or ""
             if parsed.port:
                 netloc = f"{netloc}:{parsed.port}"
-            server = urlunparse((parsed.scheme, netloc, parsed.path or "", "", "", ""))
+            # Preserve scheme and path
+            server = urlunparse((
+                parsed.scheme,
+                netloc,
+                parsed.path or "",
+                parsed.params or "",
+                parsed.query or "",
+                parsed.fragment or ""
+            ))
+    else:
+        # If no scheme provided, default to socks5
+        if ":" in server and not server.startswith(("http://", "https://", "socks4://", "socks5://")):
+            server = f"socks5://{server}"
 
+    # Validate server format
+    if not server or "://" not in server:
+        # Add default scheme if missing
+        server = f"socks5://{server}"
+
+    # Build proxy settings
     proxy: ProxySettings = {"server": server}
     if username:
         proxy["username"] = username
     if password:
         proxy["password"] = password
+
     return proxy
 
 
@@ -491,7 +520,7 @@ def run_profile(
 
         # Ensure Playwright browsers are available before trying to launch.
         if not ensure_playwright_chromium_installed(log):
-            return LaunchResult(ok=False, message="Playwright Chromium is not installed (playwright install chromium).")
+            return LaunchResult(ok=False, message="Chromium is not installed (patchright install chromium).")
 
         with sync_playwright() as pw:
             # UI no longer exposes engine choice; default to Chromium.
