@@ -32,6 +32,29 @@ class LaunchResult:
     message: str
 
 
+def _get_playwright_default_cache_path() -> Optional[Path]:
+    """
+    Get the default Playwright cache path for current OS.
+    """
+    system = platform.system().lower()
+
+    if system == "windows":
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            return Path(local_appdata) / "ms-playwright"
+
+    elif system == "darwin":  # macOS
+        # macOS default Playwright cache path
+        home = Path.home()
+        return home / "Library" / "Caches" / "ms-playwright"
+
+    elif system == "linux":
+        home = Path.home()
+        return home / ".cache" / "ms-playwright"
+
+    return None
+
+
 def _playwright_browsers_path() -> Path:
     """
     Ensure Playwright browsers are stored in a persistent per-app folder.
@@ -40,10 +63,10 @@ def _playwright_browsers_path() -> Path:
     If we keep Playwright defaults, it can end up looking for browsers inside that
     temp dir, which breaks on next run. Using a fixed path avoids that.
     """
-    # On Windows, Playwright/Patchright default cache is under LOCALAPPDATA.
-    # Prefer that location so we can reuse already installed browsers and avoid
-    # Roaming profile sync / permission edge-cases.
-    if platform.system().lower() == "windows":
+    system = platform.system().lower()
+
+    # Windows logic
+    if system == "windows":
         local_appdata = os.environ.get("LOCALAPPDATA")
         if local_appdata:
             local_pw = Path(local_appdata) / "ms-playwright"
@@ -70,12 +93,38 @@ def _playwright_browsers_path() -> Path:
         p.mkdir(parents=True, exist_ok=True)
         return p
 
-    # Non-Windows: keep the previous "per-app persistent folder" behaviour.
-    appdata = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
-    root = Path(appdata) / "AntidetectUI" if appdata else (Path(__file__).resolve().parent.parent / "data")
-    p = root / "ms-playwright"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    # macOS logic
+    elif system == "darwin":
+        # First check default Playwright cache location
+        default_cache = _get_playwright_default_cache_path()
+        if default_cache and _chromium_executable_exists(default_cache):
+            return default_cache
+
+        # If not found, use per-app persistent folder inside Caches
+        home = Path.home()
+        root = home / "Library" / "Caches" / "AntidetectUI"
+        p = root / "ms-playwright"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    # Linux and other Unix-like systems
+    else:
+        # Check default Playwright cache location
+        default_cache = _get_playwright_default_cache_path()
+        if default_cache and _chromium_executable_exists(default_cache):
+            return default_cache
+
+        # Fallback to per-app persistent folder
+        appdata = os.environ.get("XDG_CACHE_HOME")
+        if appdata:
+            root = Path(appdata) / "AntidetectUI"
+        else:
+            home = Path.home()
+            root = home / ".cache" / "AntidetectUI"
+
+        p = root / "ms-playwright"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
 
 
 def _chromium_executable_exists(browsers_root: Path) -> bool:
