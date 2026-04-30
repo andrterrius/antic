@@ -133,7 +133,7 @@ def _chromium_executable_exists(browsers_root: Path) -> bool:
         if exe.is_file():
             return True
     # macOS: chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium
-    for exe in browsers_root.glob("chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium"):
+    for exe in browsers_root.glob("chromium-*/chrome-mac-*"):
         if exe.is_file():
             return True
     # Linux: chromium-*/chrome-linux/chrome
