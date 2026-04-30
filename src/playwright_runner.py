@@ -14,11 +14,7 @@ import contextlib
 import sys
 
 from playwright.sync_api import ProxySettings, BrowserContext, Page, Playwright
-try:
-    # patchright is an optional Playwright fork; keep runtime working even if it's not installed.
-    from patchright.sync_api import sync_playwright  # type: ignore
-except Exception:  # pragma: no cover
-    from playwright.sync_api import sync_playwright
+from patchright.sync_api import sync_playwright
 
 
 from profiles_store import BrowserProfile
