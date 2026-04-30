@@ -9,9 +9,16 @@ from urllib.parse import urlparse, urlunparse
 import os
 import subprocess
 import platform
+import io
+import contextlib
+import sys
 
 from playwright.sync_api import ProxySettings, BrowserContext, Page, Playwright
-from patchright.sync_api import sync_playwright
+try:
+    # patchright is an optional Playwright fork; keep runtime working even if it's not installed.
+    from patchright.sync_api import sync_playwright  # type: ignore
+except Exception:  # pragma: no cover
+    from playwright.sync_api import sync_playwright
 
 
 from profiles_store import BrowserProfile
@@ -27,6 +34,135 @@ from fingerprint_consistency import (
 class LaunchResult:
     ok: bool
     message: str
+
+
+def _playwright_browsers_path() -> Path:
+    """
+    Ensure Playwright browsers are stored in a persistent per-app folder.
+
+    PyInstaller onefile extracts the Playwright driver into a temp `_MEI...` dir.
+    If we keep Playwright defaults, it can end up looking for browsers inside that
+    temp dir, which breaks on next run. Using a fixed path avoids that.
+    """
+    # On Windows, Playwright/Patchright default cache is under LOCALAPPDATA.
+    # Prefer that location so we can reuse already installed browsers and avoid
+    # Roaming profile sync / permission edge-cases.
+    if platform.system().lower() == "windows":
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            local_pw = Path(local_appdata) / "ms-playwright"
+            # If browsers already exist there, reuse them.
+            if _chromium_executable_exists(local_pw):
+                return local_pw
+
+        # Fall back to per-app persistent folder in LocalAppData.
+        if local_appdata:
+            root = Path(local_appdata) / "AntidetectUI"
+            p = root / "ms-playwright"
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+
+        # Very last resort: Roaming.
+        roaming_appdata = os.environ.get("APPDATA")
+        if roaming_appdata:
+            root = Path(roaming_appdata) / "AntidetectUI"
+            p = root / "ms-playwright"
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+
+        p = (Path(__file__).resolve().parent.parent / "data" / "ms-playwright")
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    # Non-Windows: keep the previous "per-app persistent folder" behaviour.
+    appdata = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+    root = Path(appdata) / "AntidetectUI" if appdata else (Path(__file__).resolve().parent.parent / "data")
+    p = root / "ms-playwright"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _chromium_executable_exists(browsers_root: Path) -> bool:
+    # Windows: chromium-*/chrome-win*/chrome.exe
+    for exe in browsers_root.glob("chromium-*/chrome-win*/chrome.exe"):
+        if exe.is_file():
+            return True
+    # macOS: chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium
+    for exe in browsers_root.glob("chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium"):
+        if exe.is_file():
+            return True
+    # Linux: chromium-*/chrome-linux/chrome
+    for exe in browsers_root.glob("chromium-*/chrome-linux/chrome"):
+        if exe.is_file():
+            return True
+    return False
+
+
+class _LogWriter(io.TextIOBase):
+    def __init__(self, log: Callable[[str], None]) -> None:
+        super().__init__()
+        self._log = log
+        self._buf = ""
+
+    def write(self, s: str) -> int:  # type: ignore[override]
+        if not s:
+            return 0
+        self._buf += s
+        while True:
+            nl = self._buf.find("\n")
+            if nl < 0:
+                break
+            line = self._buf[:nl].rstrip("\r")
+            self._buf = self._buf[nl + 1 :]
+            if line.strip():
+                self._log(line)
+        return len(s)
+
+    def flush(self) -> None:  # type: ignore[override]
+        tail = self._buf.strip("\r\n")
+        self._buf = ""
+        if tail.strip():
+            self._log(tail)
+
+
+def ensure_playwright_chromium_installed(log: Callable[[str], None]) -> bool:
+    browsers_root = _playwright_browsers_path()
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_root)
+
+    if _chromium_executable_exists(browsers_root):
+        return True
+
+    log(f"Playwright browsers not found in: {browsers_root}")
+    log("Installing Chromium (playwright install chromium)...")
+    try:
+        # playwright CLI's entrypoint reads arguments from sys.argv.
+        from playwright.__main__ import main as playwright_main  # type: ignore
+
+        lw = _LogWriter(log)
+        with contextlib.redirect_stdout(lw), contextlib.redirect_stderr(lw):
+            try:
+                old_argv = sys.argv[:]
+                sys.argv = ["patchright", "install", "--force", "chromium"]
+                try:
+                    playwright_main()
+                finally:
+                    sys.argv = old_argv
+            except SystemExit as e:
+                code = int(getattr(e, "code", 1) or 0)
+                if code != 0:
+                    log(f"Playwright install failed with exit code {code}")
+                    return False
+
+        if _chromium_executable_exists(browsers_root):
+            log("Playwright Chromium installed successfully.")
+            return True
+
+        log("Playwright install finished, but Chromium executable was not found.")
+        return False
+    except Exception as e:
+        log(f"Failed to install Playwright Chromium automatically: {e}")
+        log(traceback.format_exc())
+        return False
 
 
 def profile_user_data_dir(profile_id: str) -> Path:
@@ -308,6 +444,10 @@ def run_profile(
         profile = normalize_timezone_country(profile)
         user_data_dir = profile_user_data_dir(profile.profile_id)
 
+        # Ensure Playwright browsers are available before trying to launch.
+        if not ensure_playwright_chromium_installed(log):
+            return LaunchResult(ok=False, message="Playwright Chromium is not installed (playwright install chromium).")
+
         with sync_playwright() as pw:
             # UI no longer exposes engine choice; default to Chromium.
             browser_type = pw.chromium
@@ -414,7 +554,6 @@ def run_profile(
                     if stop_requested and stop_requested():
                         log("Stop requested — closing context...")
                         break
-                    page.save()
                     page.wait_for_timeout(500)
             except Exception:
                 pass

@@ -4,6 +4,7 @@ import random
 from dataclasses import replace
 from typing import TypeVar
 
+from chromium_release_versions import CHROMIUM_RELEASE_VERSIONS
 from profiles_store import BrowserProfile
 
 T = TypeVar("T")
@@ -179,20 +180,7 @@ _WGL_PIXEL: list[tuple[str, str, str, str]] = [
 
 
 def _chrome_ua_windows(rnd: random.Random) -> str:
-    major = _wchoice(
-        rnd,
-        [
-            (128, 0.08),
-            (130, 0.12),
-            (131, 0.18),
-            (132, 0.22),
-            (133, 0.22),
-            (134, 0.12),
-            (135, 0.06),
-        ],
-    )
-    patch = rnd.randint(0, 6478)
-    build = f"{major}.0.{patch}.0"
+    build = rnd.choice(CHROMIUM_RELEASE_VERSIONS)
     return (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
         f"Chrome/{build} Safari/537.36"
@@ -200,20 +188,7 @@ def _chrome_ua_windows(rnd: random.Random) -> str:
 
 
 def _chrome_ua_macos(rnd: random.Random) -> str:
-    major = _wchoice(
-        rnd,
-        [
-            (128, 0.08),
-            (130, 0.12),
-            (131, 0.18),
-            (132, 0.22),
-            (133, 0.22),
-            (134, 0.12),
-            (135, 0.06),
-        ],
-    )
-    patch = rnd.randint(0, 6478)
-    build = f"{major}.0.{patch}.0"
+    build = rnd.choice(CHROMIUM_RELEASE_VERSIONS)
     return (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
         f"Chrome/{build} Safari/537.36"
