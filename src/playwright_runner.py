@@ -78,7 +78,7 @@ def _playwright_browsers_path() -> Path:
 
         # Fall back to per-app persistent folder in LocalAppData.
         if local_appdata:
-            root = Path(local_appdata) / "AntidetectUI"
+            root = Path(local_appdata)
             p = root / "ms-playwright"
             p.mkdir(parents=True, exist_ok=True)
             return p
@@ -86,7 +86,7 @@ def _playwright_browsers_path() -> Path:
         # Very last resort: Roaming.
         roaming_appdata = os.environ.get("APPDATA")
         if roaming_appdata:
-            root = Path(roaming_appdata) / "AntidetectUI"
+            root = Path(roaming_appdata)
             p = root / "ms-playwright"
             p.mkdir(parents=True, exist_ok=True)
             return p
@@ -104,7 +104,7 @@ def _playwright_browsers_path() -> Path:
 
         # If not found, use per-app persistent folder inside Caches
         home = Path.home()
-        root = home / "Library" / "Caches" / "AntidetectUI"
+        root = home / "Library" / "Caches"
         p = root / "ms-playwright"
         p.mkdir(parents=True, exist_ok=True)
         return p
@@ -119,35 +119,24 @@ def _playwright_browsers_path() -> Path:
         # Fallback to per-app persistent folder
         appdata = os.environ.get("XDG_CACHE_HOME")
         if appdata:
-            root = Path(appdata) / "AntidetectUI"
+            root = Path(appdata)
         else:
             home = Path.home()
-            root = home / ".cache" / "AntidetectUI"
+            root = home / ".cache"
 
         p = root / "ms-playwright"
         p.mkdir(parents=True, exist_ok=True)
         return p
 
-
-def _patchright_chromium_revision() -> str:
-    browsers_json = Path(patchright.__file__).resolve().parent / "driver" / "package" / "browsers.json"
-    data = json.loads(browsers_json.read_text(encoding="utf-8"))
-    for entry in data.get("browsers", []):
-        if entry.get("name") == "chromium":
-            return str(entry["revision"])
-    raise KeyError("chromium entry missing in patchright browsers.json")
-
-
 def _chromium_executable_exists(browsers_root: Path) -> bool:
     """True only for the Chromium revision shipped with the installed patchright package."""
-    rev = _patchright_chromium_revision()
-    for exe in browsers_root.glob(f"chromium-{rev}/chrome-win*/chrome.exe"):
+    for exe in browsers_root.glob(f"chromium-*/chrome-win*/chrome.exe"):
         if exe.is_file():
             return True
-    for d in browsers_root.glob(f"chromium-{rev}/chrome-mac-*"):
+    for d in browsers_root.glob(f"chromium-*/chrome-mac-*"):
         if d.is_dir():
             return True
-    exe = browsers_root / f"chromium-{rev}" / "chrome-linux" / "chrome"
+    exe = browsers_root / f"chromium-*" / "chrome-linux" / "chrome"
     return exe.is_file()
 
 
@@ -181,6 +170,8 @@ class _LogWriter(io.TextIOBase):
 def ensure_playwright_chromium_installed(log: Callable[[str], None]) -> bool:
     browsers_root = _playwright_browsers_path()
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_root)
+
+    print(browsers_root)
 
     if _chromium_executable_exists(browsers_root):
         return True
