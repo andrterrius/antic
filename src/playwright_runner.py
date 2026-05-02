@@ -102,7 +102,7 @@ def _playwright_browsers_path(log: Callable[[str], None]) -> Path:
         elif system == "darwin":
             # First check default Playwright cache location
             default_cache = _get_playwright_default_cache_path(log)
-            if default_cache and _chromium_executable_exists(default_cache):
+            if default_cache and _chromium_executable_exists(default_cache, log):
                 return default_cache
 
             # If not found, use per-app persistent folder inside Caches
@@ -116,7 +116,7 @@ def _playwright_browsers_path(log: Callable[[str], None]) -> Path:
         else:
             # Check default Playwright cache location
             default_cache = _get_playwright_default_cache_path(log)
-            if default_cache and _chromium_executable_exists(default_cache):
+            if default_cache and _chromium_executable_exists(default_cache, log):
                 return default_cache
 
             # Fallback to per-app persistent folder
