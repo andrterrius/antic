@@ -738,44 +738,47 @@ def _work_area_logical() -> tuple[int | None, int | None, int | None, int | None
     """
     Returns (left, top, width, height) for the primary work area in logical pixels.
     """
-    sysname = (platform.system() or "").strip().lower()
-    if sysname == "windows":
-        try:
-            import ctypes
-            from ctypes import wintypes
+    try:
+        sysname = (platform.system() or "").strip().lower()
+        if sysname == "windows":
+            try:
+                import ctypes
+                from ctypes import wintypes
 
-            class RECT(ctypes.Structure):
-                _fields_ = [
-                    ("left", wintypes.LONG),
-                    ("top", wintypes.LONG),
-                    ("right", wintypes.LONG),
-                    ("bottom", wintypes.LONG),
-                ]
+                class RECT(ctypes.Structure):
+                    _fields_ = [
+                        ("left", wintypes.LONG),
+                        ("top", wintypes.LONG),
+                        ("right", wintypes.LONG),
+                        ("bottom", wintypes.LONG),
+                    ]
 
-            SPI_GETWORKAREA = 0x0030
-            rect = RECT()
-            ok = ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)  # type: ignore[attr-defined]
-            if not ok:
+                SPI_GETWORKAREA = 0x0030
+                rect = RECT()
+                ok = ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)  # type: ignore[attr-defined]
+                if not ok:
+                    return None, None, None, None
+                left = int(rect.left)
+                top = int(rect.top)
+                width = int(rect.right - rect.left)
+                height = int(rect.bottom - rect.top)
+                return left, top, width, height
+            except Exception:
                 return None, None, None, None
-            left = int(rect.left)
-            top = int(rect.top)
-            width = int(rect.right - rect.left)
-            height = int(rect.bottom - rect.top)
-            return left, top, width, height
+
+        # Fallback (Linux/macOS): approximate with full screen.
+        try:
+            import tkinter as tk
+
+            root = tk.Tk()
+            root.withdraw()
+            w = int(root.winfo_screenwidth())
+            h = int(root.winfo_screenheight())
+            root.destroy()
+            return 0, 0, w, h
         except Exception:
             return None, None, None, None
-
-    # Fallback (Linux/macOS): approximate with full screen.
-    try:
-        import tkinter as tk
-
-        root = tk.Tk()
-        root.withdraw()
-        w = int(root.winfo_screenwidth())
-        h = int(root.winfo_screenheight())
-        root.destroy()
-        return 0, 0, w, h
-    except Exception:
+    except:
         return None, None, None, None
 
 
