@@ -501,187 +501,189 @@ def run_profile(
     Launches a persistent Chromium context for a profile.
     WebRTC IP будет подменен на IP прокси
     """
-
-    # Получаем IP прокси для подмены
-    proxy_ip = None
-    if force_webrtc_proxy_ip and profile.proxy_server:
-        proxy_ip = get_proxy_ip(
-            profile.proxy_server,
-            profile.proxy_username,
-            profile.proxy_password
-        )
-        if proxy_ip:
-            log(f"Detected proxy IP: {proxy_ip}")
-        else:
-            log("Warning: Could not detect proxy IP, WebRTC protection may not work")
-
-    # Аргументы для максимальной защиты WebRTC
-    extra_args = []
-    if protect_webrtc:
-        log("Enabling WebRTC protection...")
-        extra_args = [
-            '--disable-webrtc',
-            '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-            '--disable-features=WebRtcHideLocalIpsWithMdns,IsolateOrigins,site-per-process',
-            '--force-fieldtrials=WebRTC/Disabled/',
-            '--webrtc-ip-handling-policy=disable_non_proxied_udp',
-            '--disable-blink-features=AutomationControlled',
-            '--disable-site-isolation-trials',
-            '--no-sandbox',
-            '--remote-allow-origins=*',
-            '--disable-dev-shm-usage',
-            '--disable-breakpad',
-            '--disable-crash-reporter',
-            '--disable-logging',
-            '--log-level=3',
-            '--silent-debugger-extension-api',
-            '--disable-webgl'
-        ]
-
     try:
-        # If proxy is present, align geo/timezone/country with the proxy IP (best-effort).
-        if profile.proxy_server and proxy_ip:
-            geo = geoip_from_ip(proxy_ip)
-            if geo:
-                profile = replace(
-                    profile,
-                    country_code=str(geo.get("country_code") or profile.country_code or "").strip() or None,
-                    timezone_id=str(geo.get("timezone_id") or profile.timezone_id or "").strip() or None,
-                    # Force locale to be re-derived from country (avoid stale/random locale from profile).
-                    locale=None,
-                    geo_lat=geo.get("geo_lat") if geo.get("geo_lat") is not None else profile.geo_lat,
-                    geo_lon=geo.get("geo_lon") if geo.get("geo_lon") is not None else profile.geo_lon,
+        # Получаем IP прокси для подмены
+        proxy_ip = None
+        if force_webrtc_proxy_ip and profile.proxy_server:
+            proxy_ip = get_proxy_ip(
+                profile.proxy_server,
+                profile.proxy_username,
+                profile.proxy_password
+            )
+            if proxy_ip:
+                log(f"Detected proxy IP: {proxy_ip}")
+            else:
+                log("Warning: Could not detect proxy IP, WebRTC protection may not work")
+
+        # Аргументы для максимальной защиты WebRTC
+        extra_args = []
+        if protect_webrtc:
+            log("Enabling WebRTC protection...")
+            extra_args = [
+                '--disable-webrtc',
+                '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+                '--disable-features=WebRtcHideLocalIpsWithMdns,IsolateOrigins,site-per-process',
+                '--force-fieldtrials=WebRTC/Disabled/',
+                '--webrtc-ip-handling-policy=disable_non_proxied_udp',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-site-isolation-trials',
+                '--no-sandbox',
+                '--remote-allow-origins=*',
+                '--disable-dev-shm-usage',
+                '--disable-breakpad',
+                '--disable-crash-reporter',
+                '--disable-logging',
+                '--log-level=3',
+                '--silent-debugger-extension-api',
+                '--disable-webgl'
+            ]
+
+        try:
+            # If proxy is present, align geo/timezone/country with the proxy IP (best-effort).
+            if profile.proxy_server and proxy_ip:
+                geo = geoip_from_ip(proxy_ip)
+                if geo:
+                    profile = replace(
+                        profile,
+                        country_code=str(geo.get("country_code") or profile.country_code or "").strip() or None,
+                        timezone_id=str(geo.get("timezone_id") or profile.timezone_id or "").strip() or None,
+                        # Force locale to be re-derived from country (avoid stale/random locale from profile).
+                        locale=None,
+                        geo_lat=geo.get("geo_lat") if geo.get("geo_lat") is not None else profile.geo_lat,
+                        geo_lon=geo.get("geo_lon") if geo.get("geo_lon") is not None else profile.geo_lon,
+                    )
+
+            profile = normalize_timezone_country(profile)
+            user_data_dir = profile_user_data_dir(profile.profile_id)
+
+            # Ensure Playwright browsers are available before trying to launch.
+            if not ensure_playwright_chromium_installed(log):
+                return LaunchResult(ok=False, message="Chromium is not installed (patchright install chromium).")
+
+            with sync_playwright() as pw:
+                # UI no longer exposes engine choice; default to Chromium.
+                browser_type = pw.chromium
+                device_opts = _device_options(pw, profile.device_preset)
+
+                desktop_vp = None
+                if not device_opts.get("is_mobile"):
+                    desktop_vp = _desktop_viewport_from_work_area()
+
+                # Если используем прокси, обязательно применяем его
+                proxy_settings = _proxy_settings(profile)
+                if proxy_settings:
+                    log(f"Using proxy: {proxy_settings['server']}")
+
+                launch_args = list(extra_args)
+                # Desktop: let CDP set window bounds after launch (work-area sized).
+                # For mobile presets we keep explicit viewport.
+                if not device_opts.get("is_mobile"):
+                    # Keep a stable top-left; CDP will adjust further.
+                    launch_args.append("--window-position=0,0")
+
+                context: BrowserContext = browser_type.launch_persistent_context(
+                    user_data_dir=str(user_data_dir),
+                    headless=False,
+                    proxy=proxy_settings,
+                    viewport=(desktop_vp or _launch_viewport(profile, device_opts)),
+                    user_agent=profile.user_agent or device_opts.get("user_agent"),
+                    locale=(profile.locale if profile.proxy_server else None),
+                    timezone_id=(profile.timezone_id if profile.proxy_server else None),
+                    color_scheme=profile.color_scheme,
+                    geolocation=_geolocation(profile),
+                    permissions=(["geolocation"] if _geolocation(profile) else None),
+                    device_scale_factor=device_opts.get("device_scale_factor"),
+                    is_mobile=device_opts.get("is_mobile"),
+                    has_touch=device_opts.get("has_touch"),
+                    args=launch_args
                 )
 
-        profile = normalize_timezone_country(profile)
-        user_data_dir = profile_user_data_dir(profile.profile_id)
+                page: Page
+                if context.pages:
+                    page = context.pages[0]
+                else:
+                    page = context.new_page()
 
-        # Ensure Playwright browsers are available before trying to launch.
-        if not ensure_playwright_chromium_installed(log):
-            return LaunchResult(ok=False, message="Chromium is not installed (patchright install chromium).")
+                # Keep any newly opened tabs/popups at the same size.
+                if desktop_vp:
+                    def _size_new_page(p: Page) -> None:
+                        try:
+                            p.set_viewport_size({"width": int(desktop_vp["width"]), "height": int(desktop_vp["height"])})
+                        except Exception:
+                            pass
 
-        with sync_playwright() as pw:
-            # UI no longer exposes engine choice; default to Chromium.
-            browser_type = pw.chromium
-            device_opts = _device_options(pw, profile.device_preset)
-
-            desktop_vp = None
-            if not device_opts.get("is_mobile"):
-                desktop_vp = _desktop_viewport_from_work_area()
-
-            # Если используем прокси, обязательно применяем его
-            proxy_settings = _proxy_settings(profile)
-            if proxy_settings:
-                log(f"Using proxy: {proxy_settings['server']}")
-
-            launch_args = list(extra_args)
-            # Desktop: let CDP set window bounds after launch (work-area sized).
-            # For mobile presets we keep explicit viewport.
-            if not device_opts.get("is_mobile"):
-                # Keep a stable top-left; CDP will adjust further.
-                launch_args.append("--window-position=0,0")
-
-            context: BrowserContext = browser_type.launch_persistent_context(
-                user_data_dir=str(user_data_dir),
-                headless=False,
-                proxy=proxy_settings,
-                viewport=(desktop_vp or _launch_viewport(profile, device_opts)),
-                user_agent=profile.user_agent or device_opts.get("user_agent"),
-                locale=(profile.locale if profile.proxy_server else None),
-                timezone_id=(profile.timezone_id if profile.proxy_server else None),
-                color_scheme=profile.color_scheme,
-                geolocation=_geolocation(profile),
-                permissions=(["geolocation"] if _geolocation(profile) else None),
-                device_scale_factor=device_opts.get("device_scale_factor"),
-                is_mobile=device_opts.get("is_mobile"),
-                has_touch=device_opts.get("has_touch"),
-                args=launch_args
-            )
-
-            page: Page
-            if context.pages:
-                page = context.pages[0]
-            else:
-                page = context.new_page()
-
-            # Keep any newly opened tabs/popups at the same size.
-            if desktop_vp:
-                def _size_new_page(p: Page) -> None:
                     try:
-                        p.set_viewport_size({"width": int(desktop_vp["width"]), "height": int(desktop_vp["height"])})
+                        context.on("page", _size_new_page)
                     except Exception:
                         pass
 
+                # Best-effort: make the window fill the screen width (not F11 fullscreen).
+                if not device_opts.get("is_mobile"):
+                    _try_set_window_to_work_area_chromium(context, page, log)
+
+                # Fingerprint consistency: platform (UA-aligned) + WebGL overrides.
+                effective_ua = profile.user_agent or device_opts.get("user_agent")
+                platform_value = platform_from_user_agent(effective_ua)
+
+                # Chromium-only: also align UA-CH metadata where possible.
                 try:
-                    context.on("page", _size_new_page)
+                    if (profile.engine or "chromium").lower() == "chromium" and effective_ua:
+                        meta = chromium_ua_metadata_from_user_agent(effective_ua)
+                        if meta:
+                            sess = context.new_cdp_session(page)
+                            sess.send("Emulation.setUserAgentOverride", {"userAgent": effective_ua, "userAgentMetadata": meta})
                 except Exception:
+                    # Best-effort; don't block launch if CDP is unavailable.
                     pass
 
-            # Best-effort: make the window fill the screen width (not F11 fullscreen).
-            if not device_opts.get("is_mobile"):
-                _try_set_window_to_work_area_chromium(context, page, log)
+                # Внедряем подмену WebRTC IP на IP прокси
+                if protect_webrtc and force_webrtc_proxy_ip and proxy_ip:
+                    inject_webrtc_ip_override(page, proxy_ip, log)
+                elif protect_webrtc:
+                    log("Warning: WebRTC protection enabled but proxy IP not available")
 
-            # Fingerprint consistency: platform (UA-aligned) + WebGL overrides.
-            effective_ua = profile.user_agent or device_opts.get("user_agent")
-            platform_value = platform_from_user_agent(effective_ua)
+                log(f"Open: {start_url}")
+                page.goto(start_url, wait_until="domcontentloaded")
+                # page.add_init_script(
+                #     webgl_override_script(
+                #         vendor=profile.webgl_vendor,
+                #         renderer=profile.webgl_renderer,
+                #         platform_value=platform_value,
+                #         webgl_version=profile.webgl_version,
+                #         webgl_shading_language_version=profile.webgl_shading_language_version,
+                #     )
+                # )
 
-            # Chromium-only: also align UA-CH metadata where possible.
-            try:
-                if (profile.engine or "chromium").lower() == "chromium" and effective_ua:
-                    meta = chromium_ua_metadata_from_user_agent(effective_ua)
-                    if meta:
-                        sess = context.new_cdp_session(page)
-                        sess.send("Emulation.setUserAgentOverride", {"userAgent": effective_ua, "userAgentMetadata": meta})
-            except Exception:
-                # Best-effort; don't block launch if CDP is unavailable.
-                pass
+                if script_path:
+                    _run_user_script(script_path, page, log)
 
-            # Внедряем подмену WebRTC IP на IP прокси
-            if protect_webrtc and force_webrtc_proxy_ip and proxy_ip:
-                inject_webrtc_ip_override(page, proxy_ip, log)
-            elif protect_webrtc:
-                log("Warning: WebRTC protection enabled but proxy IP not available")
+                log("Browser running. Close the browser window to end the session.")
+                context.on("close", lambda: log("Context closed."))
 
-            log(f"Open: {start_url}")
-            page.goto(start_url, wait_until="domcontentloaded")
-            # page.add_init_script(
-            #     webgl_override_script(
-            #         vendor=profile.webgl_vendor,
-            #         renderer=profile.webgl_renderer,
-            #         platform_value=platform_value,
-            #         webgl_version=profile.webgl_version,
-            #         webgl_shading_language_version=profile.webgl_shading_language_version,
-            #     )
-            # )
-
-            if script_path:
-                _run_user_script(script_path, page, log)
-
-            log("Browser running. Close the browser window to end the session.")
-            context.on("close", lambda: log("Context closed."))
-
-            # block until closed by user (or stop requested)
-            try:
-                while True:
-                    if stop_requested and stop_requested():
-                        log("Stop requested — closing context...")
-                        break
-                    page.wait_for_timeout(500)
-            except Exception:
-                pass
-            finally:
+                # block until closed by user (or stop requested)
                 try:
-                    context.close()
+                    while True:
+                        if stop_requested and stop_requested():
+                            log("Stop requested — closing context...")
+                            break
+                        page.wait_for_timeout(500)
                 except Exception:
                     pass
+                finally:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
 
-        return LaunchResult(ok=True, message="Closed")
+            return LaunchResult(ok=True, message="Closed")
+        except Exception as e:
+            log("ERROR:")
+            log(str(e))
+            log(traceback.format_exc())
+            return LaunchResult(ok=False, message=str(e))
     except Exception as e:
         log("ERROR:")
         log(str(e))
-        log(traceback.format_exc())
-        return LaunchResult(ok=False, message=str(e))
-
 
 def _try_set_window_to_work_area_chromium(context: BrowserContext, page: Page, log: Callable[[str], None]) -> None:
     """
