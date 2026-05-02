@@ -570,6 +570,7 @@ def run_profile(
 
                 desktop_vp = None
                 if not device_opts.get("is_mobile"):
+                    log("Getting desktop work area...")
                     desktop_vp = _desktop_viewport_from_work_area()
 
                 # Если используем прокси, обязательно применяем его
@@ -583,7 +584,7 @@ def run_profile(
                 if not device_opts.get("is_mobile"):
                     # Keep a stable top-left; CDP will adjust further.
                     launch_args.append("--window-position=0,0")
-
+                log("Getting context...")
                 context: BrowserContext = browser_type.launch_persistent_context(
                     user_data_dir=str(user_data_dir),
                     headless=False,
