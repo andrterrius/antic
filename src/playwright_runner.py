@@ -570,10 +570,6 @@ def run_profile(
                 device_opts = _device_options(pw, profile.device_preset)
 
                 desktop_vp = None
-                if not device_opts.get("is_mobile"):
-                    log("Getting desktop work area...")
-                    desktop_vp = _desktop_viewport_from_work_area()
-                    log("Getted work area...")
 
                 # Если используем прокси, обязательно применяем его
                 try:
@@ -625,10 +621,6 @@ def run_profile(
                         context.on("page", _size_new_page)
                     except Exception:
                         pass
-
-                # Best-effort: make the window fill the screen width (not F11 fullscreen).
-                if not device_opts.get("is_mobile"):
-                    _try_set_window_to_work_area_chromium(context, page, log)
 
                 # Fingerprint consistency: platform (UA-aligned) + WebGL overrides.
                 effective_ua = profile.user_agent or device_opts.get("user_agent")
