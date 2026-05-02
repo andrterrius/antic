@@ -572,12 +572,16 @@ def run_profile(
                 if not device_opts.get("is_mobile"):
                     log("Getting desktop work area...")
                     desktop_vp = _desktop_viewport_from_work_area()
+                    log("Getted work area...")
 
                 # Если используем прокси, обязательно применяем его
-                proxy_settings = _proxy_settings(profile)
-                if proxy_settings:
-                    log(f"Using proxy: {proxy_settings['server']}")
-
+                try:
+                    proxy_settings = _proxy_settings(profile)
+                    if proxy_settings:
+                        log(f"Using proxy: {proxy_settings['server']}")
+                except Exception as e:
+                    log(f"Error: {e}")
+                log("Launching args...")
                 launch_args = list(extra_args)
                 # Desktop: let CDP set window bounds after launch (work-area sized).
                 # For mobile presets we keep explicit viewport.
@@ -787,12 +791,15 @@ def _desktop_viewport_from_work_area() -> dict | None:
     Desktop viewport based on OS work-area (logical pixels).
     Using a context-level viewport ensures *new tabs* inherit the same size.
     """
-    left, top, width, height = _work_area_logical()
-    if width is None or height is None:
+    try:
+        left, top, width, height = _work_area_logical()
+        if width is None or height is None:
+            return None
+        if width < 640 or height < 480:
+            return None
+        return {"width": int(width), "height": int(height)}
+    except:
         return None
-    if width < 640 or height < 480:
-        return None
-    return {"width": int(width), "height": int(height)}
 
 
 def _browser_type(pw: Playwright, engine: str | None):
