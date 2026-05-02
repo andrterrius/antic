@@ -566,6 +566,7 @@ def run_profile(
                 log("Browser started...")
                 # UI no longer exposes engine choice; default to Chromium.
                 browser_type = pw.chromium
+                log("Getting devise options...")
                 device_opts = _device_options(pw, profile.device_preset)
 
                 desktop_vp = None
@@ -803,36 +804,41 @@ def _desktop_viewport_from_work_area() -> dict | None:
 
 
 def _browser_type(pw: Playwright, engine: str | None):
-    eng = (engine or "chromium").strip().lower()
-    if eng == "firefox":
-        return pw.firefox
-    if eng == "webkit":
-        return pw.webkit
-    return pw.chromium
-
+    try:
+        eng = (engine or "chromium").strip().lower()
+        if eng == "firefox":
+            return pw.firefox
+        if eng == "webkit":
+            return pw.webkit
+        return pw.chromium
+    except:
+        return pw.chromium
 
 def _device_options(pw: Playwright, preset: str | None) -> dict:
-    if not preset:
-        return {}
     try:
-        d = pw.devices.get(preset)
-    except Exception:
-        d = None
-    if not d:
-        return {}
+        if not preset:
+            return {}
+        try:
+            d = pw.devices.get(preset)
+        except Exception:
+            d = None
+        if not d:
+            return {}
 
-    out: dict = {}
-    if "userAgent" in d:
-        out["user_agent"] = d["userAgent"]
-    if "viewport" in d:
-        out["viewport"] = d["viewport"]
-    if "deviceScaleFactor" in d:
-        out["device_scale_factor"] = d["deviceScaleFactor"]
-    if "isMobile" in d:
-        out["is_mobile"] = d["isMobile"]
-    if "hasTouch" in d:
-        out["has_touch"] = d["hasTouch"]
-    return out
+        out: dict = {}
+        if "userAgent" in d:
+            out["user_agent"] = d["userAgent"]
+        if "viewport" in d:
+            out["viewport"] = d["viewport"]
+        if "deviceScaleFactor" in d:
+            out["device_scale_factor"] = d["deviceScaleFactor"]
+        if "isMobile" in d:
+            out["is_mobile"] = d["isMobile"]
+        if "hasTouch" in d:
+            out["has_touch"] = d["hasTouch"]
+        return out
+    except:
+        return {}
 
 
 def _viewport(profile: BrowserProfile, device_opts: dict) -> dict | None:
