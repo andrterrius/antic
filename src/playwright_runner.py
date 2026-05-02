@@ -556,11 +556,14 @@ def run_profile(
             profile = normalize_timezone_country(profile)
             user_data_dir = profile_user_data_dir(profile.profile_id)
 
+            log("Success getted profile")
+
             # Ensure Playwright browsers are available before trying to launch.
             if not ensure_playwright_chromium_installed(log):
                 return LaunchResult(ok=False, message="Chromium is not installed (patchright install chromium).")
-
+            log("Starting browser...")
             with sync_playwright() as pw:
+                log("Browser started...")
                 # UI no longer exposes engine choice; default to Chromium.
                 browser_type = pw.chromium
                 device_opts = _device_options(pw, profile.device_preset)
