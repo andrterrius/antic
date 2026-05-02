@@ -34,30 +34,32 @@ class LaunchResult:
     message: str
 
 
-def _get_playwright_default_cache_path() -> Optional[Path]:
+def _get_playwright_default_cache_path(log: Callable[[str], None]) -> Optional[Path]:
     """
     Get the default Playwright cache path for current OS.
     """
-    system = platform.system().lower()
+    try:
+        system = platform.system().lower()
 
-    if system == "windows":
-        local_appdata = os.environ.get("LOCALAPPDATA")
-        if local_appdata:
-            return Path(local_appdata) / "ms-playwright"
+        if system == "windows":
+            local_appdata = os.environ.get("LOCALAPPDATA")
+            if local_appdata:
+                return Path(local_appdata) / "ms-playwright"
 
-    elif system == "darwin":  # macOS
-        # macOS default Playwright cache path
-        home = Path.home()
-        return home / "Library" / "Caches" / "ms-playwright"
+        elif system == "darwin":  # macOS
+            # macOS default Playwright cache path
+            home = Path.home()
+            return home / "Library" / "Caches" / "ms-playwright"
 
-    elif system == "linux":
-        home = Path.home()
-        return home / ".cache" / "ms-playwright"
+        elif system == "linux":
+            home = Path.home()
+            return home / ".cache" / "ms-playwright"
 
-    return None
+        return None
+    except Exception as e:
+        log(f"Error: {e}")
 
-
-def _playwright_browsers_path() -> Path:
+def _playwright_browsers_path(log: Callable[[str], None]) -> Path:
     """
     Ensure Playwright browsers are stored in a persistent per-app folder.
 
@@ -65,79 +67,85 @@ def _playwright_browsers_path() -> Path:
     If we keep Playwright defaults, it can end up looking for browsers inside that
     temp dir, which breaks on next run. Using a fixed path avoids that.
     """
-    system = platform.system().lower()
+    try:
+        system = platform.system().lower()
 
-    # Windows logic
-    if system == "windows":
-        local_appdata = os.environ.get("LOCALAPPDATA")
-        if local_appdata:
-            local_pw = Path(local_appdata) / "ms-playwright"
-            # If browsers already exist there, reuse them.
-            if _chromium_executable_exists(local_pw):
-                return local_pw
+        # Windows logic
+        if system == "windows":
+            local_appdata = os.environ.get("LOCALAPPDATA")
+            if local_appdata:
+                local_pw = Path(local_appdata) / "ms-playwright"
+                # If browsers already exist there, reuse them.
+                if _chromium_executable_exists(local_pw, log):
+                    return local_pw
 
-        # Fall back to per-app persistent folder in LocalAppData.
-        if local_appdata:
-            root = Path(local_appdata)
-            p = root / "ms-playwright"
+            # Fall back to per-app persistent folder in LocalAppData.
+            if local_appdata:
+                root = Path(local_appdata)
+                p = root / "ms-playwright"
+                p.mkdir(parents=True, exist_ok=True)
+                return p
+
+            # Very last resort: Roaming.
+            roaming_appdata = os.environ.get("APPDATA")
+            if roaming_appdata:
+                root = Path(roaming_appdata)
+                p = root / "ms-playwright"
+                p.mkdir(parents=True, exist_ok=True)
+                return p
+
+            p = (Path(__file__).resolve().parent.parent / "data" / "ms-playwright")
             p.mkdir(parents=True, exist_ok=True)
             return p
 
-        # Very last resort: Roaming.
-        roaming_appdata = os.environ.get("APPDATA")
-        if roaming_appdata:
-            root = Path(roaming_appdata)
-            p = root / "ms-playwright"
-            p.mkdir(parents=True, exist_ok=True)
-            return p
+        # macOS logic
+        elif system == "darwin":
+            # First check default Playwright cache location
+            default_cache = _get_playwright_default_cache_path(log)
+            if default_cache and _chromium_executable_exists(default_cache):
+                return default_cache
 
-        p = (Path(__file__).resolve().parent.parent / "data" / "ms-playwright")
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-
-    # macOS logic
-    elif system == "darwin":
-        # First check default Playwright cache location
-        default_cache = _get_playwright_default_cache_path()
-        if default_cache and _chromium_executable_exists(default_cache):
-            return default_cache
-
-        # If not found, use per-app persistent folder inside Caches
-        home = Path.home()
-        root = home / "Library" / "Caches"
-        p = root / "ms-playwright"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-
-    # Linux and other Unix-like systems
-    else:
-        # Check default Playwright cache location
-        default_cache = _get_playwright_default_cache_path()
-        if default_cache and _chromium_executable_exists(default_cache):
-            return default_cache
-
-        # Fallback to per-app persistent folder
-        appdata = os.environ.get("XDG_CACHE_HOME")
-        if appdata:
-            root = Path(appdata)
-        else:
+            # If not found, use per-app persistent folder inside Caches
             home = Path.home()
-            root = home / ".cache"
+            root = home / "Library" / "Caches"
+            p = root / "ms-playwright"
+            p.mkdir(parents=True, exist_ok=True)
+            return p
 
-        p = root / "ms-playwright"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        # Linux and other Unix-like systems
+        else:
+            # Check default Playwright cache location
+            default_cache = _get_playwright_default_cache_path(log)
+            if default_cache and _chromium_executable_exists(default_cache):
+                return default_cache
 
-def _chromium_executable_exists(browsers_root: Path) -> bool:
+            # Fallback to per-app persistent folder
+            appdata = os.environ.get("XDG_CACHE_HOME")
+            if appdata:
+                root = Path(appdata)
+            else:
+                home = Path.home()
+                root = home / ".cache"
+
+            p = root / "ms-playwright"
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+    except Exception as e:
+        log(f"Error: {e}")
+
+def _chromium_executable_exists(browsers_root: Path, log: Callable[[str], None]) -> bool:
     """True only for the Chromium revision shipped with the installed patchright package."""
-    for exe in browsers_root.glob(f"chromium-*/chrome-win*/chrome.exe"):
-        if exe.is_file():
-            return True
-    for d in browsers_root.glob(f"chromium-*/chrome-mac-*"):
-        if d.is_dir():
-            return True
-    exe = browsers_root / f"chromium-*" / "chrome-linux" / "chrome"
-    return exe.is_file()
+    try:
+        for exe in browsers_root.glob(f"chromium-*/chrome-win*/chrome.exe"):
+            if exe.is_file():
+                return True
+        for d in browsers_root.glob(f"chromium-*/chrome-mac-*"):
+            if d.is_dir():
+                return True
+        exe = browsers_root / f"chromium-*" / "chrome-linux" / "chrome"
+        return exe.is_file()
+    except Exception as e:
+        log(f"Error: {e}")
 
 
 class _LogWriter(io.TextIOBase):
@@ -168,12 +176,11 @@ class _LogWriter(io.TextIOBase):
 
 
 def ensure_playwright_chromium_installed(log: Callable[[str], None]) -> bool:
-    browsers_root = _playwright_browsers_path()
+    browsers_root = _playwright_browsers_path(log)
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_root)
+    log(f"Playwright path: {browsers_root}...")
 
-    print(browsers_root)
-
-    if _chromium_executable_exists(browsers_root):
+    if _chromium_executable_exists(browsers_root, log):
         return True
 
     log(f"Playwright browsers not found in: {browsers_root}")
@@ -198,7 +205,7 @@ def ensure_playwright_chromium_installed(log: Callable[[str], None]) -> bool:
                     log(f"patchright install failed with exit code {code}")
                     return False
 
-        if _chromium_executable_exists(browsers_root):
+        if _chromium_executable_exists(browsers_root, log):
             log("Patchright Chromium installed successfully.")
             return True
 
