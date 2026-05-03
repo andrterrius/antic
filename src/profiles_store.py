@@ -15,6 +15,10 @@ class BrowserProfile:
     proxy_server: str | None = None  # e.g. http://host:port
     proxy_username: str | None = None
     proxy_password: str | None = None
+    # Последняя проверка доступности прокси (ipify через прокси); обновляется только по явной проверке / импорту
+    proxy_health_ok: bool | None = None
+    proxy_health_checked_at: str | None = None  # ISO-8601 UTC, напр. 2026-05-03T12:00:00Z
+    proxy_health_message: str | None = None
 
     # Playwright context config (legitimate test knobs)
     engine: str | None = "chromium"   # chromium|firefox|webkit
@@ -72,6 +76,9 @@ def load_profiles() -> list[BrowserProfile]:
                 proxy_server=_none_if_blank(item.get("proxy_server")),
                 proxy_username=_none_if_blank(item.get("proxy_username")),
                 proxy_password=_none_if_blank(item.get("proxy_password")),
+                proxy_health_ok=_bool_or_none(item.get("proxy_health_ok")),
+                proxy_health_checked_at=_none_if_blank(item.get("proxy_health_checked_at")),
+                proxy_health_message=_none_if_blank(item.get("proxy_health_message")),
                 engine=_none_if_blank(item.get("engine")) or "chromium",
                 device_preset=_none_if_blank(item.get("device_preset")),
                 user_agent=_none_if_blank(item.get("user_agent")),
@@ -105,6 +112,24 @@ def _none_if_blank(v: Any) -> str | None:
         return None
     s = str(v).strip()
     return s if s else None
+
+
+def _bool_or_none(v: Any) -> bool | None:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        if v == 1:
+            return True
+        if v == 0:
+            return False
+    s = str(v).strip().lower()
+    if s in ("true", "1", "yes"):
+        return True
+    if s in ("false", "0", "no"):
+        return False
+    return None
 
 
 def _int_or_none(v: Any, *, default: int | None = None) -> int | None:

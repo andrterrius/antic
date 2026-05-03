@@ -309,16 +309,23 @@ def _proxy_settings(p: BrowserProfile) -> ProxySettings | None:
     return proxy
 
 
-def get_proxy_ip(proxy_server: str, proxy_username: str = None, proxy_password: str = None) -> Optional[str]:
+def probe_proxy_connection(
+    proxy_server: str,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
+    *,
+    timeout: float = 10.0,
+) -> tuple[str | None, str | None]:
     """
-    Получает IP адрес прокси для подстановки в WebRTC
+    Проверка: запрос наружу через прокси (как WebRTC-детект).
+    Возвращает (exit_ip, None) при успехе или (None, короткое_описание_ошибки).
     """
     try:
         import requests
 
         proxy_url = normalize_proxy_server_url(proxy_server)
         if not proxy_url:
-            return None
+            return None, "Пустой адрес прокси"
 
         if proxy_username and proxy_password:
             parsed = urlparse(proxy_url)
@@ -341,12 +348,25 @@ def get_proxy_ip(proxy_server: str, proxy_username: str = None, proxy_password: 
             "https": proxy_url,
         }
 
-        response = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=10)
-        proxy_ip = response.json()["ip"]
-        return proxy_ip
+        response = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=timeout)
+        data = response.json()
+        if not isinstance(data, dict) or not data.get("ip"):
+            return None, "Некорректный ответ ipify"
+        return str(data["ip"]).strip(), None
     except Exception as e:
-        print(f"Failed to get proxy IP: {e}")
-        return None
+        return None, str(e).strip()[:400] or "Ошибка соединения"
+
+
+def get_proxy_ip(proxy_server: str, proxy_username: str = None, proxy_password: str = None) -> Optional[str]:
+    """
+    Получает IP адрес прокси для подстановки в WebRTC
+    """
+    ip, err = probe_proxy_connection(proxy_server, proxy_username, proxy_password)
+    if ip:
+        return ip
+    if err:
+        print(f"Failed to get proxy IP: {err}")
+    return None
 
 
 def geoip_from_ip(ip: str) -> dict[str, object] | None:

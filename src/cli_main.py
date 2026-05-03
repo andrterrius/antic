@@ -14,6 +14,8 @@ from typing import Callable, Optional
 from profiles_store import BrowserProfile, load_profiles, save_profiles
 from fingerprint_generator import generate_test_fingerprint
 from fingerprint_consistency import normalize_timezone_country
+from proxy_health import profile_with_recorded_proxy_health
+from proxy_import import apply_proxy_and_sync_geo, parse_host_port_user_pass_line, proxy_server_url
 from playwright_runner import (
     ensure_playwright_chromium_installed,
     geoip_from_ip,
@@ -117,23 +119,8 @@ def cmd_profiles_new(args: argparse.Namespace) -> int:
     proxy_user = _blank_to_none(args.proxy_username)
     proxy_pass = _blank_to_none(args.proxy_password)
     if proxy_server:
-        p = replace(p, proxy_server=proxy_server, proxy_username=proxy_user, proxy_password=proxy_pass)
-        proxy_ip = get_proxy_ip(proxy_server, proxy_user, proxy_pass)
-        if proxy_ip:
-            geo = geoip_from_ip(proxy_ip)
-        else:
-            geo = None
-        if geo:
-            p = replace(
-                p,
-                country_code=str(geo.get("country_code") or "").strip().upper() or None,
-                timezone_id=str(geo.get("timezone_id") or "").strip() or None,
-                locale=None,
-                geo_lat=geo.get("geo_lat") if geo.get("geo_lat") is not None else p.geo_lat,
-                geo_lon=geo.get("geo_lon") if geo.get("geo_lon") is not None else p.geo_lon,
-            )
-        p = normalize_timezone_country(p)
-        p = replace(p, viewport_width=None, viewport_height=None)
+        p = apply_proxy_and_sync_geo(p, proxy_server=proxy_server, proxy_username=proxy_user, proxy_password=proxy_pass)
+        p = profile_with_recorded_proxy_health(p)
 
     profiles.append(p)
     save_profiles(profiles)
@@ -145,6 +132,64 @@ def cmd_profiles_new(args: argparse.Namespace) -> int:
         print(_json_dump(asdict(p)))
     else:
         print(f"Created profile: {p.profile_id} ({p.name})")
+    return 0
+
+
+def cmd_profiles_import_proxies(args: argparse.Namespace) -> int:
+    """
+    Text file: one proxy per line, host:port:username:password (IPv4).
+    Creates one profile per non-empty, non-comment line.
+    """
+    path = Path((args.file or "").strip())
+    if not path.is_file():
+        raise SystemExit(f"File not found: {path}")
+
+    raw = path.read_text(encoding=args.encoding or "utf-8")
+    lines = raw.splitlines()
+    scheme = (args.proxy_scheme or "http").strip().lower()
+    if scheme not in ("http", "socks5"):
+        raise SystemExit("--proxy-scheme must be http or socks5")
+
+    profiles = load_profiles()
+    created: list[BrowserProfile] = []
+    skipped = 0
+
+    for line in lines:
+        parsed = parse_host_port_user_pass_line(line)
+        if parsed is None:
+            if (line or "").strip():
+                skipped += 1
+            continue
+        host, port, user, pwd = parsed
+        server = proxy_server_url(host, port, scheme)
+        profile_id = uuid.uuid4().hex[:12]
+        while _find_profile(profiles, profile_id) or _find_profile(created, profile_id):
+            profile_id = uuid.uuid4().hex[:12]
+
+        idx = len(profiles) + len(created) + 1
+        base = BrowserProfile(profile_id=profile_id, name=f"Profile {idx}")
+        p = generate_test_fingerprint(base)
+        p = apply_proxy_and_sync_geo(p, proxy_server=server, proxy_username=user, proxy_password=pwd)
+        p = profile_with_recorded_proxy_health(p)
+        created.append(p)
+
+    if not created:
+        raise SystemExit("No valid proxy lines in file (expected host:port:user:pass per line).")
+
+    profiles.extend(created)
+    save_profiles(profiles)
+
+    if args.quiet:
+        return 0
+
+    if args.format == "json":
+        print(_json_dump([asdict(x) for x in created]))
+    else:
+        print(f"Created {len(created)} profile(s) from {path.name}.")
+        if skipped:
+            print(f"Skipped {skipped} non-comment line(s) that did not match host:port:user:pass.")
+        for p in created:
+            print(f"  {p.profile_id}\t{p.name}\t{p.proxy_server}")
     return 0
 
 
@@ -218,6 +263,13 @@ def cmd_profiles_set(args: argparse.Namespace) -> int:
             )
         updated = normalize_timezone_country(updated)
         updated = replace(updated, viewport_width=None, viewport_height=None)
+
+    if (
+        (p.proxy_server or None) != (updated.proxy_server or None)
+        or (p.proxy_username or None) != (updated.proxy_username or None)
+        or (p.proxy_password or None) != (updated.proxy_password or None)
+    ):
+        updated = replace(updated, proxy_health_ok=None, proxy_health_checked_at=None, proxy_health_message=None)
 
     profiles2 = [updated if x.profile_id == updated.profile_id else x for x in profiles]
     save_profiles(profiles2)
@@ -375,6 +427,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp_new.add_argument("--format", choices=["text", "json"], default="text")
     sp_new.add_argument("--quiet", action="store_true")
     sp_new.set_defaults(func=cmd_profiles_new)
+
+    sp_imp = psub.add_parser(
+        "import-proxies",
+        help="Create profiles from a text file (one line: host:port:user:pass).",
+    )
+    sp_imp.add_argument("file", help="Path to .txt with one proxy per line.")
+    sp_imp.add_argument(
+        "--proxy-scheme",
+        choices=["http", "socks5"],
+        default="http",
+        help="URL scheme for host:port (default: http).",
+    )
+    sp_imp.add_argument("--encoding", default="utf-8", help="File encoding (default: utf-8).")
+    sp_imp.add_argument("--format", choices=["text", "json"], default="text")
+    sp_imp.add_argument("--quiet", action="store_true")
+    sp_imp.set_defaults(func=cmd_profiles_import_proxies)
 
     sp_del = psub.add_parser("delete", help="Delete a profile.")
     sp_del.add_argument("profile_id")
