@@ -17,6 +17,22 @@ try:
 except Exception:
     patchright_datas = []
 
+for _pkg in (
+    "uvicorn",
+    "fastapi",
+    "starlette",
+    "anyio",
+    "h11",
+    "sniffio",
+    "pydantic",
+    "pydantic_core",
+    "websockets",
+):
+    try:
+        hidden += collect_submodules(_pkg)
+    except Exception:
+        pass
+
 a = Analysis(
     ["src/qt_main.py"],
     pathex=["src"],

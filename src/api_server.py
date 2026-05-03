@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import socket
+from pathlib import Path
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -686,6 +687,9 @@ def start_profile_api_background() -> str | None:
     Host/port: ANTIDETECT_API_HOST (default 127.0.0.1), ANTIDETECT_API_PORT (default 18765).
     Returns base URL (e.g. http://127.0.0.1:18765) on first start, or None if already running.
     """
+    import tempfile
+    import traceback
+
     global _app
     if _app is not None:
         return None
@@ -699,10 +703,35 @@ def start_profile_api_background() -> str | None:
 
     _app = build_app()
 
-    def _serve() -> None:
-        import uvicorn
+    # PyInstaller windowed (console=False): stdout/stderr are None — uvicorn/logging падают.
+    if getattr(sys, "frozen", False):
+        if sys.stdout is None:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
+        if sys.stderr is None:
+            sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
 
-        uvicorn.run(_app, host=host, port=port, log_level="warning")
+    def _serve() -> None:
+        try:
+            import uvicorn
+
+            opts: dict[str, Any] = {
+                "host": host,
+                "port": port,
+                "log_level": "warning",
+                "access_log": False,
+            }
+            # В onefile-EXE httptools часто не тянется; h11 — чистый Python и стабильнее в сборке.
+            if getattr(sys, "frozen", False):
+                opts["loop"] = "asyncio"
+                opts["http"] = "h11"
+
+            uvicorn.run(_app, **opts)
+        except BaseException:
+            try:
+                err_path = Path(tempfile.gettempdir()) / "AntidetectUI_api_error.log"
+                err_path.write_text(traceback.format_exc(), encoding="utf-8")
+            except Exception:
+                pass
 
     t = threading.Thread(target=_serve, name="antidetect-fastapi", daemon=True)
     t.start()
