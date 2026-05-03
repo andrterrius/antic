@@ -28,6 +28,8 @@ class ProfileOut(BaseModel):
 
     profile_id: str = Field(..., description="Уникальный идентификатор профиля")
     name: str = Field(..., description="Имя профиля в списке")
+    tags: list[str] = Field(default_factory=list, description="Теги профиля (произвольное число)")
+    description: str | None = Field(None, description="Текстовое описание профиля")
     automation_enabled: bool = Field(False, description="Флаг автоматизации (по смыслу приложения)")
     proxy_server: str | None = Field(None, description="Прокси, напр. http://host:port или socks5://…")
     proxy_username: str | None = Field(None)

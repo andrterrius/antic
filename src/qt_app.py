@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QPlainTextEdit,
+    QScrollArea,
     QSplitter,
     QStackedWidget,
     QStyle,
@@ -40,7 +41,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
 )
 
-from profiles_store import BrowserProfile, load_profiles, save_profiles
+from profiles_store import BrowserProfile, load_profiles, save_profiles, tags_from_delimited_text
 from fingerprint_generator import generate_test_fingerprint
 from proxy_health import probe_proxy_health_triple, update_all_profiles_matching_proxy_credentials
 from proxy_import import apply_proxy_and_sync_geo, parse_host_port_user_pass_line, proxy_server_url
@@ -260,11 +261,37 @@ class ImportProfilesBuildThread(QThread):
             self.failed.emit(str(e).strip() or "Ошибка при создании профилей")
 
 
+class _TagChip(QFrame):
+    """Отображение одного тега с кнопкой удаления."""
+
+    removed = pyqtSignal(str)
+
+    def __init__(self, tag: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._tag = tag
+        self.setObjectName("tagChip")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 2, 2, 2)
+        lay.setSpacing(0)
+        lbl = QLabel(tag)
+        close_btn = QPushButton("×")
+        close_btn.setObjectName("tagChipClose")
+        close_btn.setFixedSize(22, 22)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setToolTip("Удалить тег")
+        close_btn.clicked.connect(lambda: self.removed.emit(self._tag))
+        lay.addWidget(lbl, 0)
+        lay.addWidget(close_btn, 0)
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Antidetect (Playwright Profiles) — UI")
         self.setMinimumSize(1060, 680)
+
+        self._editable_tags: list[str] = []
 
         root = QWidget()
         root.setObjectName("zaliverRoot")
@@ -327,6 +354,35 @@ class MainWindow(QMainWindow):
         sp.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
         w.setSizePolicy(sp)
         w.setMinimumWidth(min_w)
+
+    def _rebuild_tag_chips(self) -> None:
+        lay = self._tags_chips_layout
+        while lay.count():
+            it = lay.takeAt(0)
+            if w := it.widget():
+                w.deleteLater()
+        for tag in self._editable_tags:
+            chip = _TagChip(tag, self)
+            chip.removed.connect(self._on_tag_chip_removed)
+            lay.addWidget(chip)
+        lay.addStretch(1)
+
+    def _on_tag_chip_removed(self, tag: str) -> None:
+        try:
+            self._editable_tags.remove(tag)
+        except ValueError:
+            pass
+        self._rebuild_tag_chips()
+
+    def _on_commit_new_tags(self) -> None:
+        raw = (self.ed_tag_add.text() or "").strip()
+        if not raw:
+            return
+        for t in tags_from_delimited_text(raw):
+            if t not in self._editable_tags:
+                self._editable_tags.append(t)
+        self.ed_tag_add.clear()
+        self._rebuild_tag_chips()
 
     def _apply_theme(self) -> None:
         app = QApplication.instance()
@@ -437,6 +493,37 @@ class MainWindow(QMainWindow):
         self.ed_webgl_slv = QLineEdit()
         self.ed_webgl_slv.setPlaceholderText("WebGL GLSL ES 1.0 … — по умолчанию")
 
+        chips_inner = QWidget()
+        self._tags_chips_layout = QHBoxLayout(chips_inner)
+        self._tags_chips_layout.setContentsMargins(0, 0, 0, 0)
+        self._tags_chips_layout.setSpacing(6)
+
+        self._tags_scroll = QScrollArea()
+        self._tags_scroll.setWidgetResizable(True)
+        self._tags_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._tags_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._tags_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._tags_scroll.setFixedHeight(36)
+        self._tags_scroll.setWidget(chips_inner)
+
+        self.ed_tag_add = QLineEdit()
+        self.ed_tag_add.setPlaceholderText("Новый тег — Enter; несколько через запятую")
+        self.ed_tag_add.returnPressed.connect(self._on_commit_new_tags)
+
+        self._tags_input_block = QWidget()
+        _til = QVBoxLayout(self._tags_input_block)
+        _til.setContentsMargins(0, 0, 0, 0)
+        _til.setSpacing(4)
+        _til.addWidget(self._tags_scroll)
+        _til.addWidget(self.ed_tag_add)
+
+        self.ed_description = QPlainTextEdit()
+        self.ed_description.setPlaceholderText("Заметки к профилю…")
+        self.ed_description.setFixedHeight(48)
+        self.ed_description.setTabChangesFocus(True)
+        self._expand_field(self._tags_input_block)
+        self._expand_field(self.ed_description)
+
         for _w in (
             self.ed_name,
             self.ed_proxy_server,
@@ -515,11 +602,39 @@ class MainWindow(QMainWindow):
         form.addRow("WebGL VERSION (GL1)", self.ed_webgl_version)
         form.addRow("WebGL SHADING_LANGUAGE_VERSION (GL1)", self.ed_webgl_slv)
 
+        lbl_tags = QLabel("Теги")
+        lbl_tags.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        lbl_desc = QLabel("Описание")
+        lbl_desc.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        lbl_desc.setContentsMargins(0, 3, 0, 0)
+        _fm = lbl_tags.fontMetrics()
+        _lab_w = max(_fm.horizontalAdvance("Описание"), _fm.horizontalAdvance("Теги")) + 6
+        lbl_tags.setFixedWidth(_lab_w)
+        lbl_desc.setFixedWidth(_lab_w)
+
+        tags_row = QHBoxLayout()
+        tags_row.setSpacing(8)
+        tags_row.addWidget(lbl_tags, 0)
+        tags_row.addWidget(self._tags_input_block, 1)
+
+        desc_row = QHBoxLayout()
+        desc_row.setSpacing(8)
+        desc_row.addWidget(lbl_desc, 0, Qt.AlignmentFlag.AlignTop)
+        desc_row.addWidget(self.ed_description, 1)
+
+        meta_left = QWidget()
+        meta_l = QVBoxLayout(meta_left)
+        meta_l.setContentsMargins(0, 0, 0, 0)
+        meta_l.setSpacing(6)
+        meta_l.addLayout(tags_row)
+        meta_l.addLayout(desc_row)
+
         actions = QHBoxLayout()
+        actions.setSpacing(12)
+        actions.addWidget(meta_left, 1)
         self.btn_save = QPushButton("Сохранить профиль")
         self.btn_save.setObjectName("secondary")
-        actions.addStretch(1)
-        actions.addWidget(self.btn_save)
+        actions.addWidget(self.btn_save, 0, Qt.AlignmentFlag.AlignTop)
         self.btn_save.clicked.connect(self._save_active_profile)
 
         l2 = QVBoxLayout()
@@ -848,7 +963,13 @@ class MainWindow(QMainWindow):
             row_l.setContentsMargins(10, 6, 10, 6)
             row_l.setSpacing(10)
 
-            lbl = QLabel(f"{p.name}  ({p.profile_id})")
+            tag_hint = ""
+            if p.tags:
+                joined = ", ".join(p.tags)
+                if len(joined) > 48:
+                    joined = joined[:45] + "…"
+                tag_hint = f"  [{joined}]"
+            lbl = QLabel(f"{p.name}{tag_hint}  ({p.profile_id})")
             lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             # Double-click on the row/label should open settings for that profile.
             row.installEventFilter(self)
@@ -969,9 +1090,17 @@ class MainWindow(QMainWindow):
     def _load_active_profile_into_form(self) -> None:
         p = self._active_profile()
         if not p:
+            self._editable_tags = []
+            self._rebuild_tag_chips()
+            self.ed_tag_add.clear()
+            self.ed_description.setPlainText("")
             self._sync_proxy_health_badge()
             return
         self.ed_name.setText(p.name)
+        self._editable_tags = list(p.tags)
+        self._rebuild_tag_chips()
+        self.ed_tag_add.clear()
+        self.ed_description.setPlainText((p.description or "").replace("\r\n", "\n"))
         self.ed_proxy_server.setText(p.proxy_server or "")
         self.ed_proxy_user.setText(p.proxy_username or "")
         self.ed_proxy_pass.setText(p.proxy_password or "")
@@ -1248,9 +1377,13 @@ class MainWindow(QMainWindow):
             or (p.proxy_username or None) != proxy_user
             or (p.proxy_password or None) != proxy_pass
         )
+        desc_raw = self.ed_description.toPlainText()
+        desc_stripped = desc_raw.strip()
         updated = replace(
             p,
             name=self.ed_name.text().strip() or p.name,
+            tags=list(self._editable_tags),
+            description=desc_stripped if desc_stripped else None,
             proxy_server=proxy_server,
             proxy_username=proxy_user,
             proxy_password=proxy_pass,

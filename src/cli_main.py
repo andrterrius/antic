@@ -11,7 +11,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Callable, Optional
 
-from profiles_store import BrowserProfile, load_profiles, save_profiles
+from profiles_store import BrowserProfile, load_profiles, save_profiles, tags_from_delimited_text
 from fingerprint_generator import generate_test_fingerprint
 from fingerprint_consistency import normalize_timezone_country
 from proxy_health import profile_with_recorded_proxy_health
@@ -93,7 +93,8 @@ def cmd_profiles_list(args: argparse.Namespace) -> int:
 
     for p in profiles:
         proxy = (p.proxy_server or "").strip() or "-"
-        print(f"{p.profile_id}\t{p.name}\tproxy={proxy}")
+        tags_s = ",".join(p.tags) if p.tags else "-"
+        print(f"{p.profile_id}\t{p.name}\ttags={tags_s}\tproxy={proxy}")
     return 0
 
 
@@ -111,7 +112,14 @@ def cmd_profiles_new(args: argparse.Namespace) -> int:
     if _find_profile(profiles, profile_id):
         raise SystemExit(f"Profile already exists: {profile_id}")
 
-    base = BrowserProfile(profile_id=profile_id, name=(args.name or "").strip() or f"Profile {len(profiles) + 1}")
+    tag_list = tags_from_delimited_text(args.tags) if args.tags is not None else []
+    desc_new = _blank_to_none(args.description) if args.description is not None else None
+    base = BrowserProfile(
+        profile_id=profile_id,
+        name=(args.name or "").strip() or f"Profile {len(profiles) + 1}",
+        tags=tag_list,
+        description=desc_new,
+    )
     p = generate_test_fingerprint(base)
 
     # Optional proxy-derived persona (like UI best-effort when proxy is edited).
@@ -221,9 +229,14 @@ def cmd_profiles_set(args: argparse.Namespace) -> int:
     proxy_server = _blank_to_none(args.proxy_server) if args.proxy_server is not None else p.proxy_server
     no_proxy = not (proxy_server or "").strip()
 
+    tags_next = tags_from_delimited_text(args.tags) if args.tags is not None else p.tags
+    desc_next = _blank_to_none(args.description) if args.description is not None else p.description
+
     updated = replace(
         p,
         name=(args.name.strip() if args.name else p.name),
+        tags=tags_next,
+        description=desc_next,
         proxy_server=proxy_server,
         proxy_username=(_blank_to_none(args.proxy_username) if args.proxy_username is not None else p.proxy_username),
         proxy_password=(_blank_to_none(args.proxy_password) if args.proxy_password is not None else p.proxy_password),
@@ -421,6 +434,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp_new = psub.add_parser("new", help="Create a new profile.")
     sp_new.add_argument("--profile-id", default=None)
     sp_new.add_argument("--name", default=None)
+    sp_new.add_argument(
+        "--tags",
+        default=None,
+        help="Теги через запятую, ; или | (напр. work,ads,EU).",
+    )
+    sp_new.add_argument("--description", default=None, help="Текстовое описание профиля.")
     sp_new.add_argument("--proxy-server", default=None, help="http://host:port or socks5://host:port (or host:port)")
     sp_new.add_argument("--proxy-username", default=None)
     sp_new.add_argument("--proxy-password", default=None)
@@ -454,6 +473,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp_set = psub.add_parser("set", help="Update profile fields.")
     sp_set.add_argument("profile_id")
     sp_set.add_argument("--name", default=None)
+    sp_set.add_argument("--tags", default=None, help="Заменить теги (через запятую, ; или |). Пустая строка — сбросить.")
+    sp_set.add_argument("--description", default=None, help="Новое описание; пустая строка — убрать.")
     sp_set.add_argument("--proxy-server", default=None)
     sp_set.add_argument("--proxy-username", default=None)
     sp_set.add_argument("--proxy-password", default=None)

@@ -215,5 +215,36 @@ QListWidget#profilesList::item:selected {
     background-color: rgba(99, 102, 241, 0.16);
     border: 1px solid #6366f1;
 }
+
+/* Теги профиля (чипы) */
+QFrame#tagChip {
+    background-color: #252836;
+    border: 1px solid #3d4258;
+    border-radius: 8px;
+}
+QFrame#tagChip QLabel {
+    color: #e4e6ef;
+    font-size: 12px;
+    border: none;
+    background: transparent;
+    padding: 0 2px;
+}
+QPushButton#tagChipClose {
+    background: transparent;
+    border: none;
+    color: #94a3b8;
+    font-weight: bold;
+    font-size: 14px;
+    min-width: 20px;
+    max-width: 22px;
+    min-height: 20px;
+    max-height: 22px;
+    padding: 0px;
+    border-radius: 4px;
+}
+QPushButton#tagChipClose:hover {
+    color: #f1f5f9;
+    background-color: rgba(239, 68, 68, 0.22);
+}
 """
 

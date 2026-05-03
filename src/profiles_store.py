@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +11,9 @@ from typing import Any
 class BrowserProfile:
     profile_id: str
     name: str
+    # Метаданные UI: произвольное число тегов, многострочное описание
+    tags: list[str] = field(default_factory=list)
+    description: str | None = None
     automation_enabled: bool = False
     proxy_server: str | None = None  # e.g. http://host:port
     proxy_username: str | None = None
@@ -72,6 +75,8 @@ def load_profiles() -> list[BrowserProfile]:
             BrowserProfile(
                 profile_id=str(item.get("profile_id", "")).strip(),
                 name=str(item.get("name", "")).strip() or "Profile",
+                tags=normalize_tags_list(item.get("tags")),
+                description=_none_if_blank(item.get("description")),
                 automation_enabled=bool(item.get("automation_enabled", False)),
                 proxy_server=_none_if_blank(item.get("proxy_server")),
                 proxy_username=_none_if_blank(item.get("proxy_username")),
@@ -105,6 +110,43 @@ def save_profiles(profiles: list[BrowserProfile]) -> None:
     p = profiles_path()
     payload: list[dict[str, Any]] = [asdict(x) for x in profiles]
     p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def normalize_tags_list(raw: Any) -> list[str]:
+    """Строки тегов без пустых и без повторов (порядок первого вхождения)."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in raw:
+        s = str(x).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def tags_from_delimited_text(text: str) -> list[str]:
+    """Разбор строки тегов: запятая, точка с запятой, вертикальная черта или перевод строки."""
+    if not (text or "").strip():
+        return []
+    parts: list[str] = []
+    buf: list[str] = []
+    for ch in text.replace("\r\n", "\n").replace("\r", "\n"):
+        if ch in ",;|\n":
+            piece = "".join(buf).strip()
+            if piece:
+                parts.append(piece)
+            buf = []
+        else:
+            buf.append(ch)
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return normalize_tags_list(parts)
 
 
 def _none_if_blank(v: Any) -> str | None:
