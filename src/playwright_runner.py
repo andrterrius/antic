@@ -34,6 +34,42 @@ class LaunchResult:
     message: str
 
 
+def fetch_chromium_cdp_browser_ws_url(debug_port: int, *, timeout_sec: float = 15.0, log: Callable[[str], None] | None = None) -> str | None:
+    """
+    After Chromium starts with --remote-debugging-port=<debug_port>, returns the browser-level
+    webSocketDebuggerUrl from http://127.0.0.1:<port>/json/version (for Playwright connect_over_cdp, Puppeteer, etc.).
+    """
+    import time
+
+    def _lg(s: str) -> None:
+        if log:
+            log(s)
+
+    deadline = time.monotonic() + max(0.5, timeout_sec)
+    try:
+        import requests
+    except Exception as e:
+        _lg(f"CDP: requests unavailable: {e}")
+        return None
+
+    url = f"http://127.0.0.1:{int(debug_port)}/json/version"
+    last_err = ""
+    while time.monotonic() < deadline:
+        try:
+            r = requests.get(url, timeout=1.5)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict):
+                    ws = data.get("webSocketDebuggerUrl")
+                    if isinstance(ws, str) and ws.strip():
+                        return ws.strip()
+        except Exception as e:
+            last_err = str(e).strip()[:200]
+        time.sleep(0.15)
+    _lg(f"CDP: could not read {url}: {last_err or 'timeout'}")
+    return None
+
+
 def _get_playwright_default_cache_path(log: Callable[[str], None]) -> Optional[Path]:
     """
     Get the default Playwright cache path for current OS.
@@ -516,6 +552,9 @@ def run_profile(
         protect_webrtc: bool = True,
         force_webrtc_proxy_ip: bool = True,  # Принудительно подменяем IP на прокси
         stop_requested: Callable[[], bool] | None = None,
+        headless: bool = False,
+        cdp_debug_port: int | None = None,
+        on_cdp_ready: Callable[[dict[str, object]], None] | None = None,
 ) -> LaunchResult:
     """
     Launches a persistent Chromium context for a profile.
@@ -600,6 +639,8 @@ def run_profile(
                     log(f"Error: {e}")
                 log("Launching args...")
                 launch_args = list(extra_args)
+                if cdp_debug_port is not None:
+                    launch_args.append(f"--remote-debugging-port={int(cdp_debug_port)}")
                 # Desktop: let CDP set window bounds after launch (work-area sized).
                 # For mobile presets we keep explicit viewport.
                 if not device_opts.get("is_mobile"):
@@ -608,7 +649,7 @@ def run_profile(
                 log("Getting context...")
                 context: BrowserContext = browser_type.launch_persistent_context(
                     user_data_dir=str(user_data_dir),
-                    headless=False,
+                    headless=headless,
                     proxy=proxy_settings,
                     viewport=(desktop_vp or _launch_viewport(profile, device_opts)),
                     user_agent=profile.user_agent or device_opts.get("user_agent"),
@@ -628,6 +669,21 @@ def run_profile(
                     page = context.pages[0]
                 else:
                     page = context.new_page()
+
+                if cdp_debug_port is not None and on_cdp_ready:
+                    ws = fetch_chromium_cdp_browser_ws_url(cdp_debug_port, log=log)
+                    if ws:
+                        payload: dict[str, object] = {
+                            "webSocketDebuggerUrl": ws,
+                            "debug_port": int(cdp_debug_port),
+                            "http_debugger": f"http://127.0.0.1:{int(cdp_debug_port)}",
+                        }
+                        try:
+                            on_cdp_ready(payload)
+                        except Exception:
+                            log("on_cdp_ready callback raised; continuing session.")
+                    else:
+                        log("CDP: remote debugging port open but browser WebSocket URL not available yet.")
 
                 # Keep any newly opened tabs/popups at the same size.
                 if desktop_vp:

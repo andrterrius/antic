@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -45,6 +45,16 @@ from fingerprint_generator import generate_test_fingerprint
 from proxy_health import probe_proxy_health_triple, update_all_profiles_matching_proxy_credentials
 from proxy_import import apply_proxy_and_sync_geo, parse_host_port_user_pass_line, proxy_server_url
 from playwright_runner import run_profile, profile_user_data_dir, get_proxy_ip, geoip_from_ip
+from api_server import (
+    append_ui_session_log,
+    apply_ui_session_cdp,
+    is_profile_running_via_api,
+    notify_ui_session_finished,
+    register_ui_session,
+    request_stop_by_profile_id,
+    set_api_ui_hooks,
+    start_profile_api_background,
+)
 from fingerprint_consistency import normalize_timezone_country
 from zaliver_theme import ZALIVER_DARK_QSS
 
@@ -53,25 +63,63 @@ class RunnerThread(QThread):
     log_line = pyqtSignal(str)
     finished_ok = pyqtSignal(bool, str)
 
-    def __init__(self, profile: BrowserProfile, start_url: str, script_path: Optional[str]) -> None:
+    def __init__(
+        self,
+        profile: BrowserProfile,
+        start_url: str,
+        script_path: Optional[str],
+        *,
+        tracked_session_id: Optional[str] = None,
+        headless: bool = False,
+        cdp_debug_port: Optional[int] = None,
+    ) -> None:
         super().__init__()
         self._profile = profile
         self._start_url = start_url
         self._script_path = script_path
         self._stop_evt = threading.Event()
+        self._tracked_session_id = tracked_session_id
+        self._headless = headless
+        self._cdp_debug_port = cdp_debug_port
 
     def request_stop(self) -> None:
         self._stop_evt.set()
 
     def run(self) -> None:
+        tid = self._tracked_session_id
+
+        def _log(line: str) -> None:
+            if tid:
+                append_ui_session_log(tid, line)
+            self.log_line.emit(line)
+
+        def _on_cdp(info: dict[str, object]) -> None:
+            if tid:
+                apply_ui_session_cdp(tid, info)
+
         res = run_profile(
             self._profile,
             start_url=self._start_url,
             script_path=self._script_path,
-            log=lambda s: self.log_line.emit(s),
+            log=_log,
             stop_requested=self._stop_evt.is_set,
+            headless=self._headless,
+            cdp_debug_port=self._cdp_debug_port,
+            on_cdp_ready=_on_cdp if self._cdp_debug_port is not None else None,
         )
         self.finished_ok.emit(res.ok, res.message)
+
+
+class ApiUiBridge(QObject):
+    """Проброс колбэков из потоков API/uvicorn в GUI через очередь Qt."""
+
+    log_line = pyqtSignal(str)
+    sync_profile_run_button = pyqtSignal(str)
+
+    def __init__(self, main: "MainWindow") -> None:
+        super().__init__(main)
+        self.log_line.connect(main._append_log)
+        self.sync_profile_run_button.connect(main._sync_run_button)
 
 
 class ProxyHealthCheckThread(QThread):
@@ -255,6 +303,13 @@ class MainWindow(QMainWindow):
         self.page_proxies = self._build_proxies_page()
         self.pages.addWidget(self.page_profiles)
         self.pages.addWidget(self.page_proxies)
+
+        self._api_bridge = ApiUiBridge(self)
+        set_api_ui_hooks(
+            log_line=self._api_bridge.log_line.emit,
+            sync_profile_button=self._api_bridge.sync_profile_run_button.emit,
+            is_profile_running_in_ui=self._is_runner_thread_active,
+        )
 
         splitter.addWidget(nav)
         splitter.addWidget(self.pages)
@@ -819,9 +874,14 @@ class MainWindow(QMainWindow):
                 self.profiles_list.setCurrentRow(idx)
         self._sync_proxy_health_badge()
 
-    def _is_profile_running(self, profile_id: str) -> bool:
+    def _is_runner_thread_active(self, profile_id: str) -> bool:
         r = self._runners.get(profile_id)
         return bool(r and r.isRunning())
+
+    def _is_profile_running(self, profile_id: str) -> bool:
+        if self._is_runner_thread_active(profile_id):
+            return True
+        return is_profile_running_via_api(profile_id)
 
     def _sync_run_button(self, profile_id: str) -> None:
         btn = self._run_buttons.get(profile_id)
@@ -841,12 +901,16 @@ class MainWindow(QMainWindow):
 
     def _stop_profile(self, profile_id: str) -> None:
         r = self._runners.get(profile_id)
-        if not r or not r.isRunning():
+        if r and r.isRunning():
+            self._append_log(f"[{profile_id}] stop requested")
+            r.request_stop()
             self._sync_run_button(profile_id)
             return
-        self._append_log(f"[{profile_id}] stop requested")
-        r.request_stop()
-        # keep button in "stop" state until runner finishes
+        if is_profile_running_via_api(profile_id):
+            if request_stop_by_profile_id(profile_id, from_ui=True):
+                self._append_log(f"[{profile_id}] stop requested (сессия через API)")
+            self._sync_run_button(profile_id)
+            return
         self._sync_run_button(profile_id)
 
     def _index_by_id(self, profile_id: str) -> Optional[int]:
@@ -1265,6 +1329,10 @@ class MainWindow(QMainWindow):
                 self._append_log(f"[{profile_id}] already running — skip")
                 self._sync_run_button(profile_id)
                 continue
+            if is_profile_running_via_api(profile_id):
+                self._append_log(f"[{profile_id}] уже запущен через API — пропуск")
+                self._sync_run_button(profile_id)
+                continue
 
             p = next((x for x in self._profiles if x.profile_id == profile_id), None)
             if not p:
@@ -1273,9 +1341,25 @@ class MainWindow(QMainWindow):
 
             prefix = f"[{p.name}:{p.profile_id}]"
             self._append_log(f"{prefix} launch")
-            runner = RunnerThread(p, url, script)
+            sid, ui_cdp = register_ui_session(
+                profile_id,
+                lambda pid=profile_id: self._stop_profile(pid),
+                headless=False,
+                start_url=url,
+                script_path=script,
+                expose_cdp=True,
+            )
+            runner = RunnerThread(
+                p,
+                url,
+                script,
+                tracked_session_id=sid,
+                headless=False,
+                cdp_debug_port=ui_cdp,
+            )
             runner.log_line.connect(lambda s, pref=prefix: self._append_log(f"{pref} {s}"))
             runner.finished_ok.connect(lambda ok, msg, pref=prefix, pid=profile_id: self._on_runner_finished(pid, pref, ok, msg))
+            setattr(runner, "api_tracked_session_id", sid)
             self._runners[profile_id] = runner
             runner.start()
             self._sync_run_button(profile_id)
@@ -1283,8 +1367,11 @@ class MainWindow(QMainWindow):
     def _on_runner_finished(self, profile_id: str, prefix: str, ok: bool, msg: str) -> None:
         self._append_log(f"{prefix} finished: {'OK' if ok else 'FAIL'} — {msg}")
         r = self._runners.get(profile_id)
+        tid = getattr(r, "api_tracked_session_id", None) if r else None
         if r and not r.isRunning():
             self._runners.pop(profile_id, None)
+        if isinstance(tid, str) and tid:
+            notify_ui_session_finished(tid, ok, msg)
         self._sync_run_button(profile_id)
 
     def _append_log(self, s: str) -> None:
@@ -1296,6 +1383,9 @@ def run_qt() -> None:
     app.setApplicationName("Antidetect UI")
     app.setStyleSheet(ZALIVER_DARK_QSS)
     w = MainWindow()
+    base = start_profile_api_background()
+    if base:
+        w._append_log(f"[API] локальный сервер: {base}/docs")
     # Open maximized ("full screen" for typical desktop usage).
     w.showMaximized()
     app.exec()

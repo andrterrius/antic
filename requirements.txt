@@ -3,3 +3,6 @@ PyQt6>=6.7.0
 playwright>=1.46.0
 requests>=2.33.1
 PySocks>=1.7.1
+fastapi>=0.115.0
+uvicorn>=0.32.0
+pydantic>=2.0.0
