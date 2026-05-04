@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QStyle,
     QTableWidget,
+    QToolButton,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -285,6 +286,46 @@ class _TagChip(QFrame):
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
 
 
+class CollapsibleSection(QWidget):
+    """Заголовок-кнопка и сворачиваемое тело с QFormLayout."""
+
+    def __init__(self, title: str, *, expanded: bool = True, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._btn = QToolButton()
+        self._btn.setText(title)
+        self._btn.setCheckable(True)
+        self._btn.setChecked(expanded)
+        self._btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._btn.setAutoRaise(True)
+        self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn.toggled.connect(self._on_toggled)
+
+        self._body = QWidget()
+        self._form = QFormLayout(self._body)
+        self._form.setContentsMargins(10, 4, 0, 10)
+        self._form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._form.setFormAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self._form.setHorizontalSpacing(12)
+        self._form.setVerticalSpacing(10)
+        self._form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        outer.addWidget(self._btn)
+        outer.addWidget(self._body)
+        self._on_toggled(expanded)
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._body.setVisible(checked)
+        self._btn.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
+
+    def form(self) -> QFormLayout:
+        return self._form
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -461,14 +502,39 @@ class MainWindow(QMainWindow):
 
         body.addWidget(list_box, 1)
 
-        # editor box
+        # editor box: прокрутка + сворачиваемые группы, чтобы поля не сжимались по высоте
         editor = QGroupBox("Настройки профиля")
-        form = QFormLayout(editor)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(10)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        editor_outer = QVBoxLayout(editor)
+        editor_outer.setContentsMargins(8, 12, 8, 8)
+        editor_outer.setSpacing(0)
+
+        profile_scroll = QScrollArea()
+        profile_scroll.setWidgetResizable(True)
+        profile_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        profile_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        profile_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        profile_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        profile_form_host = QWidget()
+        profile_form_layout = QVBoxLayout(profile_form_host)
+        profile_form_layout.setContentsMargins(0, 0, 4, 0)
+        profile_form_layout.setSpacing(6)
+        profile_form_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        sec_main = CollapsibleSection("Основное", expanded=True)
+        sec_browser = CollapsibleSection("Браузер и гео", expanded=True)
+        sec_webgl = CollapsibleSection("WebGL", expanded=False)
+        form_main = sec_main.form()
+        form_browser = sec_browser.form()
+        form_webgl = sec_webgl.form()
+
+        profile_form_layout.addWidget(sec_main)
+        profile_form_layout.addWidget(sec_browser)
+        profile_form_layout.addWidget(sec_webgl)
+        profile_form_layout.addStretch(1)
+
+        profile_scroll.setWidget(profile_form_host)
+        editor_outer.addWidget(profile_scroll, 1)
 
         self.ed_name = QLineEdit()
         self.ed_proxy_server = QLineEdit()
@@ -584,23 +650,25 @@ class MainWindow(QMainWindow):
         self._expand_field(self.sp_lat, min_w=220)
         self._expand_field(self.sp_lon, min_w=220)
 
-        form.addRow("Имя", self.ed_name)
-        form.addRow("Прокси (сервер)", self._proxy_server_row)
-        form.addRow("Прокси (логин)", self.ed_proxy_user)
-        form.addRow("Прокси (пароль)", self.ed_proxy_pass)
-        form.addRow(self._hr())
-        form.addRow("User-Agent", self.ed_ua)
-        form.addRow("Locale", self.ed_locale)
-        form.addRow("Часовой пояс", self.ed_tz)
-        form.addRow("Страна (ISO2)", self.ed_country)
-        form.addRow("Цветовая схема", self.cb_color)
-        form.addRow("Гео (широта)", self.sp_lat)
-        form.addRow("Гео (долгота)", self.sp_lon)
-        form.addRow(self._hr())
-        form.addRow("WebGL vendor", self.ed_webgl_vendor)
-        form.addRow("WebGL renderer", self.ed_webgl_renderer)
-        form.addRow("WebGL VERSION (GL1)", self.ed_webgl_version)
-        form.addRow("WebGL SHADING_LANGUAGE_VERSION (GL1)", self.ed_webgl_slv)
+        form_main.addRow("Имя", self.ed_name)
+        form_main.addRow("Прокси (сервер)", self._proxy_server_row)
+        form_main.addRow("Прокси (логин)", self.ed_proxy_user)
+        form_main.addRow("Прокси (пароль)", self.ed_proxy_pass)
+
+        form_browser.addRow(self._hr())
+        form_browser.addRow("User-Agent", self.ed_ua)
+        form_browser.addRow("Locale", self.ed_locale)
+        form_browser.addRow("Часовой пояс", self.ed_tz)
+        form_browser.addRow("Страна (ISO2)", self.ed_country)
+        form_browser.addRow("Цветовая схема", self.cb_color)
+        form_browser.addRow("Гео (широта)", self.sp_lat)
+        form_browser.addRow("Гео (долгота)", self.sp_lon)
+
+        form_webgl.addRow(self._hr())
+        form_webgl.addRow("WebGL vendor", self.ed_webgl_vendor)
+        form_webgl.addRow("WebGL renderer", self.ed_webgl_renderer)
+        form_webgl.addRow("WebGL VERSION (GL1)", self.ed_webgl_version)
+        form_webgl.addRow("WebGL SHADING_LANGUAGE_VERSION (GL1)", self.ed_webgl_slv)
 
         lbl_tags = QLabel("Теги")
         lbl_tags.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
