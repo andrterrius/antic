@@ -358,6 +358,28 @@ class MainWindow(QMainWindow):
         self._refresh_profiles_list()
         self._load_active_profile_into_form()
 
+    def _proxy_health_dot_ui(self, p: BrowserProfile) -> tuple[str, str, str]:
+        """
+        Returns: (text, stylesheet, tooltip)
+        text is usually "●" or "".
+        """
+        srv = (p.proxy_server or "").strip()
+        if not srv:
+            return "", "", "Прокси не задан"
+        if p.proxy_health_ok is True:
+            color = "#6c6"
+            tip = (p.proxy_health_message or "OK").strip() or "OK"
+        elif p.proxy_health_ok is False:
+            color = "#c66"
+            tip = (p.proxy_health_message or "Ошибка").strip() or "Ошибка"
+        else:
+            color = "#888"
+            tip = "Прокси не проверен"
+        if p.proxy_health_checked_at:
+            tip = f"{tip}\n{p.proxy_health_checked_at}"
+        tip = f"{srv}\n{tip}".strip()
+        return "●", f"color: {color};", tip
+
     def _expand_field(self, w: QWidget, *, min_w: int = 420) -> None:
         sp = w.sizePolicy()
         sp.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
@@ -1057,6 +1079,15 @@ class MainWindow(QMainWindow):
             self._profile_row_widget_to_id[id(row)] = p.profile_id
             self._profile_row_widget_to_id[id(lbl)] = p.profile_id
 
+            proxy_dot = QLabel("")
+            proxy_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            proxy_dot.setFixedWidth(18)
+            proxy_dot.setToolTip("")
+            dot_text, dot_css, dot_tip = self._proxy_health_dot_ui(p)
+            proxy_dot.setText(dot_text)
+            proxy_dot.setStyleSheet(dot_css)
+            proxy_dot.setToolTip(dot_tip)
+
             btn_run = QPushButton()
             self._run_buttons[p.profile_id] = btn_run
             btn_run.clicked.connect(lambda _checked=False, pid=p.profile_id: self._run_button_clicked(pid))
@@ -1064,6 +1095,7 @@ class MainWindow(QMainWindow):
 
             row_l.addWidget(cb, 0)
             row_l.addWidget(lbl, 1)
+            row_l.addWidget(proxy_dot, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             row_l.addWidget(btn_run, 0, Qt.AlignmentFlag.AlignRight)
 
             it.setSizeHint(row.sizeHint())
