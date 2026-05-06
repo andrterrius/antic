@@ -8,9 +8,11 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QComboBox,
@@ -34,7 +36,6 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QStyle,
     QTableWidget,
-    QToolButton,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -286,46 +287,6 @@ class _TagChip(QFrame):
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
 
 
-class CollapsibleSection(QWidget):
-    """Заголовок-кнопка и сворачиваемое тело с QFormLayout."""
-
-    def __init__(self, title: str, *, expanded: bool = True, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        self._btn = QToolButton()
-        self._btn.setText(title)
-        self._btn.setCheckable(True)
-        self._btn.setChecked(expanded)
-        self._btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self._btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._btn.setAutoRaise(True)
-        self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn.toggled.connect(self._on_toggled)
-
-        self._body = QWidget()
-        self._form = QFormLayout(self._body)
-        self._form.setContentsMargins(10, 4, 0, 10)
-        self._form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._form.setFormAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self._form.setHorizontalSpacing(12)
-        self._form.setVerticalSpacing(10)
-        self._form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-
-        outer.addWidget(self._btn)
-        outer.addWidget(self._body)
-        self._on_toggled(expanded)
-
-    def _on_toggled(self, checked: bool) -> None:
-        self._body.setVisible(checked)
-        self._btn.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
-
-    def form(self) -> QFormLayout:
-        return self._form
-
-
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -333,6 +294,12 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1060, 680)
 
         self._editable_tags: list[str] = []
+        self._checked_profile_ids: set[str] = set()
+        self._profile_id_to_checkbox: dict[str, QCheckBox] = {}
+        self._drag_check_active: bool = False
+        self._drag_check_value: bool = False
+        self._drag_check_touched: set[str] = set()
+        self._syncing_selection_check: bool = False
 
         root = QWidget()
         root.setObjectName("zaliverRoot")
@@ -351,10 +318,11 @@ class MainWindow(QMainWindow):
         self._proxy_single_check_dialog: QProgressDialog | None = None
 
         layout = QHBoxLayout(root)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(14)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(6)
         layout.addWidget(splitter)
 
         # left nav
@@ -434,14 +402,14 @@ class MainWindow(QMainWindow):
         w = QWidget()
         l = QVBoxLayout(w)
         l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(14)
+        l.setSpacing(10)
 
         title = QLabel("Профили")
         title.setObjectName("title")
         l.addWidget(title)
 
         body = QHBoxLayout()
-        body.setSpacing(14)
+        body.setSpacing(10)
         l.addLayout(body, 1)
 
         # list box
@@ -449,12 +417,21 @@ class MainWindow(QMainWindow):
         list_layout = QVBoxLayout(list_box)
         list_layout.setSpacing(10)
 
+        self.ed_profiles_search = QLineEdit()
+        self.ed_profiles_search.setPlaceholderText("Поиск: имя / описание / теги / ID…")
+        self._expand_field(self.ed_profiles_search, min_w=240)
+        self.ed_profiles_search.textChanged.connect(lambda _t: self._refresh_profiles_list())
+        list_layout.addWidget(self.ed_profiles_search, 0)
+
         self.profiles_list = QListWidget()
         self.profiles_list.setObjectName("profilesList")
         # Multi-select for batch launching; editing still follows "current" item.
         self.profiles_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.profiles_list.currentItemChanged.connect(self._on_profile_current_changed)
         self.profiles_list.itemClicked.connect(self._on_profile_item_clicked)
+        self.profiles_list.itemSelectionChanged.connect(self._on_profiles_list_selection_changed)
+        # Allow "paint" selection via checkboxes while holding LMB.
+        self.profiles_list.viewport().installEventFilter(self)
         list_layout.addWidget(self.profiles_list, 1)
 
         launch_box = QGroupBox("Запуск")
@@ -500,41 +477,17 @@ class MainWindow(QMainWindow):
         self.btn_import_proxies.clicked.connect(self._import_profiles_from_proxy_file)
         self.btn_delete.clicked.connect(self._delete_profile)
 
-        body.addWidget(list_box, 1)
+        # Make profiles list wider than the editor.
+        body.addWidget(list_box, 2)
 
-        # editor box: прокрутка + сворачиваемые группы, чтобы поля не сжимались по высоте
+        # editor box
         editor = QGroupBox("Настройки профиля")
-        editor_outer = QVBoxLayout(editor)
-        editor_outer.setContentsMargins(8, 12, 8, 8)
-        editor_outer.setSpacing(0)
-
-        profile_scroll = QScrollArea()
-        profile_scroll.setWidgetResizable(True)
-        profile_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        profile_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        profile_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        profile_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
-        profile_form_host = QWidget()
-        profile_form_layout = QVBoxLayout(profile_form_host)
-        profile_form_layout.setContentsMargins(0, 0, 4, 0)
-        profile_form_layout.setSpacing(6)
-        profile_form_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-
-        sec_main = CollapsibleSection("Основное", expanded=True)
-        sec_browser = CollapsibleSection("Браузер и гео", expanded=True)
-        sec_webgl = CollapsibleSection("WebGL", expanded=False)
-        form_main = sec_main.form()
-        form_browser = sec_browser.form()
-        form_webgl = sec_webgl.form()
-
-        profile_form_layout.addWidget(sec_main)
-        profile_form_layout.addWidget(sec_browser)
-        profile_form_layout.addWidget(sec_webgl)
-        profile_form_layout.addStretch(1)
-
-        profile_scroll.setWidget(profile_form_host)
-        editor_outer.addWidget(profile_scroll, 1)
+        form = QFormLayout(editor)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self.ed_name = QLineEdit()
         self.ed_proxy_server = QLineEdit()
@@ -650,25 +603,15 @@ class MainWindow(QMainWindow):
         self._expand_field(self.sp_lat, min_w=220)
         self._expand_field(self.sp_lon, min_w=220)
 
-        form_main.addRow("Имя", self.ed_name)
-        form_main.addRow("Прокси (сервер)", self._proxy_server_row)
-        form_main.addRow("Прокси (логин)", self.ed_proxy_user)
-        form_main.addRow("Прокси (пароль)", self.ed_proxy_pass)
-
-        form_browser.addRow(self._hr())
-        form_browser.addRow("User-Agent", self.ed_ua)
-        form_browser.addRow("Locale", self.ed_locale)
-        form_browser.addRow("Часовой пояс", self.ed_tz)
-        form_browser.addRow("Страна (ISO2)", self.ed_country)
-        form_browser.addRow("Цветовая схема", self.cb_color)
-        form_browser.addRow("Гео (широта)", self.sp_lat)
-        form_browser.addRow("Гео (долгота)", self.sp_lon)
-
-        form_webgl.addRow(self._hr())
-        form_webgl.addRow("WebGL vendor", self.ed_webgl_vendor)
-        form_webgl.addRow("WebGL renderer", self.ed_webgl_renderer)
-        form_webgl.addRow("WebGL VERSION (GL1)", self.ed_webgl_version)
-        form_webgl.addRow("WebGL SHADING_LANGUAGE_VERSION (GL1)", self.ed_webgl_slv)
+        form.addRow("Имя", self.ed_name)
+        form.addRow("Прокси (сервер)", self._proxy_server_row)
+        form.addRow("Прокси (логин)", self.ed_proxy_user)
+        form.addRow("Прокси (пароль)", self.ed_proxy_pass)
+        form.addRow(self._hr())
+        form.addRow("Отпечаток", self.ed_ua)
+        form.addRow("Страна прокси", self.ed_tz)
+        form.addRow(self._hr())
+        # WebGL parameters are stored in profiles, but intentionally hidden from UI.
 
         lbl_tags = QLabel("Теги")
         lbl_tags.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -708,14 +651,15 @@ class MainWindow(QMainWindow):
         l2 = QVBoxLayout()
         l2.addWidget(editor, 1)
         l2.addLayout(actions)
-        body.addLayout(l2, 2)
+        body.addLayout(l2, 1)
 
         logs_box = QGroupBox("Логи")
         logs_l = QVBoxLayout(logs_box)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         logs_l.addWidget(self.log, 1)
-        l.addWidget(logs_box, 1)
+        logs_box.setMaximumHeight(220)
+        l.addWidget(logs_box, 0)
 
         return w
 
@@ -1014,12 +958,74 @@ class MainWindow(QMainWindow):
         self._import_health_thread.start()
 
     def _refresh_profiles_list(self) -> None:
+        q_raw = (self.ed_profiles_search.text() if hasattr(self, "ed_profiles_search") else "") or ""
+        tokens = [t for t in q_raw.lower().strip().split() if t]
+
+        def matches(p: BrowserProfile) -> bool:
+            if not tokens:
+                return True
+            pid = (p.profile_id or "").lower()
+            name = (p.name or "").lower()
+            desc = (p.description or "").lower()
+            tags = ", ".join(p.tags or []).lower()
+            hay = " ".join([pid, name, desc, tags])
+            return all(t in hay for t in tokens)
+
+        def rank(p: BrowserProfile, original_index: int) -> tuple[int, int]:
+            """
+            Приоритет поиска:
+              0) profile_id
+              1) name
+              2) description/tags
+            Чем меньше — тем выше в списке. Второй ключ — стабильность (старый порядок).
+            """
+            if not tokens:
+                return (original_index, original_index)
+
+            q = q_raw.lower().strip()
+            pid = (p.profile_id or "").lower()
+            name = (p.name or "").lower()
+            desc = (p.description or "").lower()
+            tags = ", ".join(p.tags or []).lower()
+
+            # Предпочтение "как ввели" (целиком) если пользователь вставил кусок ID/имени.
+            if q and q in pid:
+                return (0, original_index)
+            if q and q in name:
+                return (1, original_index)
+            if q and (q in desc or q in tags):
+                return (2, original_index)
+
+            # Иначе — по токенам.
+            if all(t in pid for t in tokens):
+                return (0, original_index)
+            if all(t in name for t in tokens):
+                return (1, original_index)
+            if all((t in desc) or (t in tags) for t in tokens):
+                return (2, original_index)
+
+            # Совпало “смешанно” по разным полям — ставим в самый низ среди найденных.
+            return (3, original_index)
+
         self.profiles_list.blockSignals(True)
         self.profiles_list.clear()
         self._run_buttons.clear()
         self._profile_row_widget_to_id.clear()
         self._profile_id_to_item.clear()
-        for p in self._profiles:
+        self._profile_id_to_checkbox.clear()
+
+        # Drop checked ids that no longer exist.
+        existing_ids = {p.profile_id for p in self._profiles}
+        self._checked_profile_ids.intersection_update(existing_ids)
+
+        matched: list[tuple[int, BrowserProfile]] = []
+        for i, p in enumerate(self._profiles):
+            if matches(p):
+                matched.append((i, p))
+
+        matched.sort(key=lambda ip: rank(ip[1], ip[0]))
+
+        for _i, p in matched:
             it = QListWidgetItem()
             it.setData(Qt.ItemDataRole.UserRole, p.profile_id)
             it.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
@@ -1030,6 +1036,12 @@ class MainWindow(QMainWindow):
             row_l = QHBoxLayout(row)
             row_l.setContentsMargins(10, 6, 10, 6)
             row_l.setSpacing(10)
+
+            cb = QCheckBox()
+            cb.setChecked(p.profile_id in self._checked_profile_ids)
+            cb.setToolTip("Отметить профиль (множественный выбор)")
+            cb.stateChanged.connect(lambda state, pid=p.profile_id: self._on_profile_checkbox_state_changed(pid, state))
+            self._profile_id_to_checkbox[p.profile_id] = cb
 
             tag_hint = ""
             if p.tags:
@@ -1050,6 +1062,7 @@ class MainWindow(QMainWindow):
             btn_run.clicked.connect(lambda _checked=False, pid=p.profile_id: self._run_button_clicked(pid))
             self._sync_run_button(p.profile_id)
 
+            row_l.addWidget(cb, 0)
             row_l.addWidget(lbl, 1)
             row_l.addWidget(btn_run, 0, Qt.AlignmentFlag.AlignRight)
 
@@ -1057,10 +1070,130 @@ class MainWindow(QMainWindow):
             self.profiles_list.setItemWidget(it, row)
         self.profiles_list.blockSignals(False)
 
+    def _on_profile_checkbox_state_changed(self, profile_id: str, state: int) -> None:
+        if self._syncing_selection_check:
+            return
+        checked = state == Qt.CheckState.Checked.value
+        self._set_profile_selected(profile_id, checked)
+
+    def _set_profile_selected(self, profile_id: str, selected: bool) -> None:
+        it = self._profile_id_to_item.get(profile_id)
+        if not it:
+            return
+        if it.isSelected() == selected:
+            return
+        self._syncing_selection_check = True
+        try:
+            it.setSelected(selected)
+        finally:
+            self._syncing_selection_check = False
+
+    def _profile_id_at_viewport_pos(self, pos) -> str | None:
+        it = self.profiles_list.itemAt(pos)
+        if not it:
+            return None
+        pid = it.data(Qt.ItemDataRole.UserRole)
+        return str(pid) if pid else None
+
+    def _checkbox_at_viewport_pos(self, pos) -> QCheckBox | None:
+        it = self.profiles_list.itemAt(pos)
+        if not it:
+            return None
+        w = self.profiles_list.itemWidget(it)
+        if not w:
+            return None
+        local = w.mapFrom(self.profiles_list.viewport(), pos)
+        child = w.childAt(local)
+        if isinstance(child, QCheckBox):
+            return child
+        # Click can be on checkbox indicator area; use stored checkbox geometry as fallback.
+        pid = it.data(Qt.ItemDataRole.UserRole)
+        pid_s = str(pid) if pid else ""
+        cb = self._profile_id_to_checkbox.get(pid_s)
+        if cb:
+            cb_local = cb.mapFrom(self.profiles_list.viewport(), pos)
+            if cb.rect().contains(cb_local):
+                return cb
+        return None
+
+    def _set_profile_checked(self, profile_id: str, checked: bool) -> None:
+        cb = self._profile_id_to_checkbox.get(profile_id)
+        if not cb:
+            return
+        if cb.isChecked() == checked:
+            return
+        self._syncing_selection_check = True
+        try:
+            cb.setChecked(checked)
+        finally:
+            self._syncing_selection_check = False
+
+        if checked:
+            self._checked_profile_ids.add(profile_id)
+        else:
+            self._checked_profile_ids.discard(profile_id)
+
+    def _batch_profile_ids(self) -> list[str]:
+        if self._checked_profile_ids:
+            return list(self._checked_profile_ids)
+        return self._selected_profile_ids()
+
+    def _on_profiles_list_selection_changed(self) -> None:
+        if self._syncing_selection_check:
+            return
+
+        selected_ids: set[str] = set()
+        for it in self.profiles_list.selectedItems():
+            pid = it.data(Qt.ItemDataRole.UserRole)
+            if pid:
+                selected_ids.add(str(pid))
+
+        # Keep checked ids exactly equal to current selection.
+        self._checked_profile_ids = set(selected_ids)
+
+        self._syncing_selection_check = True
+        try:
+            for pid, cb in self._profile_id_to_checkbox.items():
+                cb.setChecked(pid in selected_ids)
+        finally:
+            self._syncing_selection_check = False
+
+    def eventFilter(self, watched: object, event: object) -> bool:  # type: ignore[override]
+        # Drag-select checkboxes by "painting" while holding LMB.
+        if hasattr(self, "profiles_list") and watched is self.profiles_list.viewport():
+            try:
+                if isinstance(event, QMouseEvent):
+                    if event.type() == event.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                        cb = self._checkbox_at_viewport_pos(event.position().toPoint())
+                        if cb:
+                            pid = self._profile_id_at_viewport_pos(event.position().toPoint())
+                            if pid:
+                                self._drag_check_active = True
+                                self._drag_check_value = not cb.isChecked()
+                                self._drag_check_touched = {pid}
+                                self._set_profile_selected(pid, self._drag_check_value)
+                                return True
+                    if event.type() == event.Type.MouseMove and (event.buttons() & Qt.MouseButton.LeftButton):
+                        if self._drag_check_active:
+                            pid = self._profile_id_at_viewport_pos(event.position().toPoint())
+                            if pid and pid not in self._drag_check_touched:
+                                self._drag_check_touched.add(pid)
+                                self._set_profile_selected(pid, self._drag_check_value)
+                            return True
+                    if event.type() == event.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                        if self._drag_check_active:
+                            self._drag_check_active = False
+                            self._drag_check_touched.clear()
+                            return True
+            except Exception:
+                # Never break list interaction.
+                pass
+        return super().eventFilter(watched, event)
+
         if self._active_profile_id:
-            idx = self._index_by_id(self._active_profile_id)
-            if idx is not None:
-                self.profiles_list.setCurrentRow(idx)
+            it = self._profile_id_to_item.get(self._active_profile_id)
+            if it is not None:
+                self.profiles_list.setCurrentItem(it)
         self._sync_proxy_health_badge()
 
     def _is_runner_thread_active(self, profile_id: str) -> bool:
@@ -1383,7 +1516,7 @@ class MainWindow(QMainWindow):
         return ids
 
     def _delete_profile(self) -> None:
-        ids = self._selected_profile_ids()
+        ids = self._batch_profile_ids()
         if not ids and self._active_profile_id:
             ids = [self._active_profile_id]
         if not ids:
@@ -1426,6 +1559,7 @@ class MainWindow(QMainWindow):
                 pass
 
         self._profiles = [x for x in self._profiles if x.profile_id not in remove_ids]
+        self._checked_profile_ids.difference_update(remove_ids)
         if self._active_profile_id in remove_ids:
             self._active_profile_id = self._profiles[0].profile_id if self._profiles else None
         save_profiles(self._profiles)
@@ -1504,13 +1638,13 @@ class MainWindow(QMainWindow):
         return float(v)
 
     def _launch_selected_from_profiles_list(self) -> None:
-        ids: list[str] = []
-        for it in self.profiles_list.selectedItems():
-            pid = it.data(Qt.ItemDataRole.UserRole)
-            if pid:
-                ids.append(str(pid))
+        ids = self._batch_profile_ids()
         if not ids:
-            QMessageBox.information(self, "Выбор профилей", "Выделите один или несколько профилей для запуска.")
+            QMessageBox.information(
+                self,
+                "Выбор профилей",
+                "Отметьте чекбоксами или выделите один/несколько профилей для запуска.",
+            )
             return
         self._launch_profiles(ids)
 
