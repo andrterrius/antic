@@ -647,7 +647,11 @@ def run_profile(
                     # Keep a stable top-left; CDP will adjust further.
                     launch_args.append("--window-position=0,0")
                 log("Getting context...")
-                context: BrowserContext = browser_type.launch_persistent_context(
+                # Playwright defaults headless=True to the stripped "chromium-headless-shell"
+                # binary, which is trivially fingerprinted (no window.chrome, empty plugins, etc.).
+                # channel="chromium" keeps the full Chromium build with --headless — same approach as
+                # Playwright's "new headless" / avoid-headless-shell guidance.
+                _launch_kw: dict = dict(
                     user_data_dir=str(user_data_dir),
                     headless=headless,
                     proxy=proxy_settings,
@@ -661,8 +665,11 @@ def run_profile(
                     device_scale_factor=device_opts.get("device_scale_factor"),
                     is_mobile=device_opts.get("is_mobile"),
                     has_touch=device_opts.get("has_touch"),
-                    args=launch_args
+                    args=launch_args,
                 )
+                if headless:
+                    _launch_kw["channel"] = "chromium"
+                context: BrowserContext = browser_type.launch_persistent_context(**_launch_kw)
 
                 page: Page
                 if context.pages:
