@@ -63,7 +63,7 @@ class LaunchProfileBody(BaseModel):
         description="Выделить порт remote debugging и заполнить cdp_ws_url в сессии (для connect_over_cdp)",
     )
     start_url: str = Field(
-        default="https://2ip.ru",
+        default="https://studio.youtube.com",
         max_length=4096,
         description="Первая открываемая страница после старта контекста",
     )
@@ -258,7 +258,7 @@ class UiRunSession:
     profile_id: str
     headless: bool
     _stop_cb: Callable[[], None] = field(repr=False)
-    start_url: str = "https://2ip.ru"
+    start_url: str = "https://studio.youtube.com"
     script_path: str | None = None
     cdp_debug_port: int | None = None
     cdp_ws_url: str | None = None
@@ -330,13 +330,13 @@ def register_ui_session(
     stop_cb: Callable[[], None],
     *,
     headless: bool = False,
-    start_url: str = "https://2ip.ru",
+    start_url: str = "https://studio.youtube.com",
     script_path: str | None = None,
     expose_cdp: bool = True,
 ) -> tuple[str, int | None]:
     """Вызывается из GUI при старте RunnerThread. Возвращает (session_id, cdp_debug_port | None)."""
     sid = "ui-" + uuid.uuid4().hex[:14]
-    su = (start_url or "https://2ip.ru").strip() or "https://2ip.ru"
+    su = (start_url or "https://studio.youtube.com").strip() or "https://studio.youtube.com"
     sp = (script_path or "").strip() or None
     cdp_port: int | None = _pick_free_loopback_port() if expose_cdp else None
     with _lock:
@@ -378,7 +378,7 @@ class ProfileRunSession:
     profile_id: str
     headless: bool
     cdp_debug_port: int | None
-    start_url: str = "https://2ip.ru"
+    start_url: str = "https://studio.youtube.com"
     script_path: str | None = None
     cdp_ws_url: str | None = None
     cdp_http: str | None = None
@@ -458,7 +458,7 @@ def _session_worker(sess: ProfileRunSession, profile: BrowserProfile, body: Laun
     try:
         res = run_profile(
             profile,
-            start_url=(body.start_url or "https://2ip.ru").strip() or "https://2ip.ru",
+            start_url=(body.start_url or "https://studio.youtube.com").strip() or "https://studio.youtube.com",
             script_path=(body.script_path or "").strip() or None,
             log=log,
             stop_requested=sess.stop_event.is_set,
@@ -609,7 +609,7 @@ def build_app() -> FastAPI:
                 )
             sid = uuid.uuid4().hex[:16]
             cdp_port: int | None = _pick_free_loopback_port() if body.expose_cdp else None
-            su = (body.start_url or "https://2ip.ru").strip() or "https://2ip.ru"
+            su = (body.start_url or "https://studio.youtube.com").strip() or "https://studio.youtube.com"
             sp = (body.script_path or "").strip() or None
             sess = ProfileRunSession(
                 session_id=sid,
@@ -633,7 +633,7 @@ def build_app() -> FastAPI:
         cdp_on = cdp_port is not None
         _ui_log(
             f"[API:{p.name}:{profile_id}] запуск по API: session={sid}, headless={bool(body.headless)}, "
-            f"CDP={'порт ' + str(cdp_port) if cdp_on else 'выкл.'}, url={((body.start_url or '')[:80] + '…') if len(body.start_url or '') > 80 else (body.start_url or 'https://2ip.ru')}"
+            f"CDP={'порт ' + str(cdp_port) if cdp_on else 'выкл.'}, url={((body.start_url or '')[:80] + '…') if len(body.start_url or '') > 80 else (body.start_url or 'https://studio.youtube.com')}"
         )
         _ui_sync_profile(profile_id)
         return LaunchProfileAccepted(

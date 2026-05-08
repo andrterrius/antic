@@ -500,7 +500,7 @@ def build_parser() -> argparse.ArgumentParser:
     # run
     sp_run = sub.add_parser("run", help="Run one or more profiles.")
     sp_run.add_argument("profile_ids", nargs="+")
-    sp_run.add_argument("--url", default="https://2ip.ru")
+    sp_run.add_argument("--url", default="https://studio.youtube.com")
     sp_run.add_argument("--script", default=None, help="Path to .py script with run(page, log=None).")
     sp_run.add_argument("--parallel", action="store_true", help="Run multiple profiles in parallel.")
     sp_run.add_argument("--no-protect-webrtc", action="store_true", help="Disable WebRTC protection flags.")
@@ -508,7 +508,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp_run.set_defaults(func=cmd_run)
 
     sp_run_all = sub.add_parser("run-all", help="Run all stored profiles.")
-    sp_run_all.add_argument("--url", default="https://2ip.ru")
+    sp_run_all.add_argument("--url", default="https://studio.youtube.com")
     sp_run_all.add_argument("--script", default=None)
     sp_run_all.add_argument("--parallel", action="store_true")
     sp_run_all.add_argument("--no-protect-webrtc", action="store_true")

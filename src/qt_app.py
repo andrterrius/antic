@@ -465,7 +465,7 @@ class MainWindow(QMainWindow):
         launch_form.setVerticalSpacing(10)
         launch_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
-        self.ed_url = QLineEdit("https://2ip.ru")
+        self.ed_url = QLineEdit("https://studio.youtube.com")
         self._expand_field(self.ed_url)
         launch_form.addRow("Стартовый URL", self.ed_url)
 
@@ -1717,7 +1717,7 @@ class MainWindow(QMainWindow):
         self._launch_profiles(ids)
 
     def _launch_profiles(self, ids: list[str]) -> None:
-        url = self.ed_url.text().strip() or "https://2ip.ru"
+        url = self.ed_url.text().strip() or "https://studio.youtube.com"
         script = None
 
         for profile_id in ids:
