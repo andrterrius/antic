@@ -60,6 +60,7 @@ from api_server import (
 )
 from fingerprint_consistency import normalize_timezone_country
 from zaliver_theme import ZALIVER_DARK_QSS
+from app_icon import build_app_icon
 
 
 class RunnerThread(QThread):
@@ -1777,8 +1778,11 @@ class MainWindow(QMainWindow):
 def run_qt() -> None:
     app = QApplication([])
     app.setApplicationName("Antidetect UI")
+    _ico = build_app_icon()
+    app.setWindowIcon(_ico)
     app.setStyleSheet(ZALIVER_DARK_QSS)
     w = MainWindow()
+    w.setWindowIcon(_ico)
     base = start_profile_api_background()
     if base:
         w._append_log(f"[API] локальный сервер: {base}/docs")
