@@ -539,6 +539,7 @@ def build_app() -> FastAPI:
         if not pid:
             raise HTTPException(status_code=404, detail="Profile not found")
         t = _require_non_empty_tag(tag)
+        out: ProfileOut
         with _lock:
             profiles = load_profiles()
             idx = next((i for i, p in enumerate(profiles) if p.profile_id == pid), -1)
@@ -548,7 +549,9 @@ def build_app() -> FastAPI:
             tags_next = normalize_tags_list([*p.tags, t])
             profiles[idx] = BrowserProfile(**{**asdict(p), "tags": tags_next})
             save_profiles(profiles)
-            return _profile_to_out(profiles[idx])
+            out = _profile_to_out(profiles[idx])
+        _ui_sync_profile(pid)
+        return out
 
     @app.delete(
         "/profiles/{profile_id}/tags/{tag}",
@@ -562,6 +565,7 @@ def build_app() -> FastAPI:
         if not pid:
             raise HTTPException(status_code=404, detail="Profile not found")
         t = _require_non_empty_tag(tag)
+        out: ProfileOut
         with _lock:
             profiles = load_profiles()
             idx = next((i for i, p in enumerate(profiles) if p.profile_id == pid), -1)
@@ -571,7 +575,9 @@ def build_app() -> FastAPI:
             tags_next = [x for x in p.tags if x != t]
             profiles[idx] = BrowserProfile(**{**asdict(p), "tags": tags_next})
             save_profiles(profiles)
-            return _profile_to_out(profiles[idx])
+            out = _profile_to_out(profiles[idx])
+        _ui_sync_profile(pid)
+        return out
 
     @app.post(
         "/profiles/{profile_id}/launch",

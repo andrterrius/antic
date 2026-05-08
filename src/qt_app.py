@@ -122,7 +122,9 @@ class ApiUiBridge(QObject):
     def __init__(self, main: "MainWindow") -> None:
         super().__init__(main)
         self.log_line.connect(main._append_log)
-        self.sync_profile_run_button.connect(main._sync_run_button)
+        # Called from API thread via set_api_ui_hooks(): we also refresh profile list/form,
+        # because API can update profile metadata (e.g., tags).
+        self.sync_profile_run_button.connect(main._sync_profile_from_disk)
 
 
 class ProxyHealthCheckThread(QThread):
@@ -1246,6 +1248,33 @@ class MainWindow(QMainWindow):
         btn.setObjectName("danger" if running else "secondary")
         btn.style().unpolish(btn)
         btn.style().polish(btn)
+
+    def _sync_profile_from_disk(self, profile_id: str) -> None:
+        """
+        UI-sync entrypoint used by the local API hook.
+        Refreshes run button state and reloads profiles from disk to reflect metadata updates (tags, description, etc).
+        """
+        # Fast path: update the Run/Stop button if it exists in the current list.
+        self._sync_run_button(profile_id)
+
+        # Reload profiles so the list (tag hint) and editor reflect the latest saved state.
+        prev_active = self._active_profile_id
+        prev_checked = set(self._checked_profile_ids)
+        self._profiles = load_profiles()
+
+        existing_ids = {p.profile_id for p in self._profiles}
+        self._checked_profile_ids = prev_checked.intersection(existing_ids)
+        if prev_active and prev_active in existing_ids:
+            self._active_profile_id = prev_active
+        else:
+            self._active_profile_id = self._profiles[0].profile_id if self._profiles else None
+
+        self._refresh_profiles_list()
+        if self._active_profile_id:
+            it = self._profile_id_to_item.get(self._active_profile_id)
+            if it is not None:
+                self.profiles_list.setCurrentItem(it)
+        self._load_active_profile_into_form()
 
     def _run_button_clicked(self, profile_id: str) -> None:
         if self._is_profile_running(profile_id):
