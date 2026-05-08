@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from collections.abc import Callable
 
-from profiles_store import BrowserProfile, load_profiles
+from profiles_store import BrowserProfile, load_profiles, normalize_tags_list, save_profiles
 from playwright_runner import run_profile
 
 
@@ -420,6 +420,15 @@ def _find_profile(profile_id: str) -> BrowserProfile | None:
     return None
 
 
+def _require_non_empty_tag(tag: str) -> str:
+    t = (tag or "").strip()
+    if not t:
+        raise HTTPException(status_code=400, detail="Tag must be non-empty")
+    if len(t) > 64:
+        raise HTTPException(status_code=400, detail="Tag is too long (max 64)")
+    return t
+
+
 def _session_worker(sess: ProfileRunSession, profile: BrowserProfile, body: LaunchProfileBody) -> None:
     prefix = f"[API:{profile.name}:{profile.profile_id}]"
 
@@ -517,6 +526,52 @@ def build_app() -> FastAPI:
         if not p:
             raise HTTPException(status_code=404, detail="Profile not found")
         return _profile_to_out(p)
+
+    @app.post(
+        "/profiles/{profile_id}/tags/{tag}",
+        response_model=ProfileOut,
+        tags=["Профили"],
+        summary="Добавить тег профилю",
+    )
+    def add_profile_tag(profile_id: str, tag: str) -> ProfileOut:
+        """Добавляет тег (без дублей) и сохраняет profiles.json."""
+        pid = (profile_id or "").strip()
+        if not pid:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        t = _require_non_empty_tag(tag)
+        with _lock:
+            profiles = load_profiles()
+            idx = next((i for i, p in enumerate(profiles) if p.profile_id == pid), -1)
+            if idx < 0:
+                raise HTTPException(status_code=404, detail="Profile not found")
+            p = profiles[idx]
+            tags_next = normalize_tags_list([*p.tags, t])
+            profiles[idx] = BrowserProfile(**{**asdict(p), "tags": tags_next})
+            save_profiles(profiles)
+            return _profile_to_out(profiles[idx])
+
+    @app.delete(
+        "/profiles/{profile_id}/tags/{tag}",
+        response_model=ProfileOut,
+        tags=["Профили"],
+        summary="Удалить тег у профиля",
+    )
+    def remove_profile_tag(profile_id: str, tag: str) -> ProfileOut:
+        """Удаляет тег (если есть) и сохраняет profiles.json."""
+        pid = (profile_id or "").strip()
+        if not pid:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        t = _require_non_empty_tag(tag)
+        with _lock:
+            profiles = load_profiles()
+            idx = next((i for i, p in enumerate(profiles) if p.profile_id == pid), -1)
+            if idx < 0:
+                raise HTTPException(status_code=404, detail="Profile not found")
+            p = profiles[idx]
+            tags_next = [x for x in p.tags if x != t]
+            profiles[idx] = BrowserProfile(**{**asdict(p), "tags": tags_next})
+            save_profiles(profiles)
+            return _profile_to_out(profiles[idx])
 
     @app.post(
         "/profiles/{profile_id}/launch",
