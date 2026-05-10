@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Callable
@@ -46,10 +47,20 @@ class BrowserProfile:
 
 
 def _data_dir() -> Path:
-    # Store state in %APPDATA% (Roaming) to keep project directory clean.
-    appdata = os.environ.get("APPDATA")
-    root = Path(appdata) / "AntidetectUI" if appdata else (Path(__file__).resolve().parent.parent / "data")
-    d = root
+    # Store state in %APPDATA% (Windows) или ~/Library/Application Support (macOS)
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            root = Path(appdata) / "AntidetectUI"
+        else:
+            root = Path(__file__).resolve().parent.parent / "data"
+    elif sys.platform == "darwin":
+        home = Path.home()
+        root = home / "Library" / "Application Support" / "AntidetectUI"
+    else:
+        root = Path(__file__).resolve().parent.parent / "data"
+
+    d = root / "data"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
