@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass(slots=True)
@@ -54,8 +54,35 @@ def _data_dir() -> Path:
     return d
 
 
+_profiles_ui_log: Callable[[str], None] | None = None
+_profiles_path_logged_resolved: str | None = None
+
+
+def set_profiles_ui_log_hook(fn: Callable[[str], None] | None) -> None:
+    """Проброс строки в лог UI (тот же колбэк, что и set_api_ui_hooks(log_line=…))."""
+    global _profiles_ui_log, _profiles_path_logged_resolved
+    _profiles_ui_log = fn
+    if fn is not None:
+        _profiles_path_logged_resolved = None
+        profiles_path()
+
+
 def profiles_path() -> Path:
-    return _data_dir() / "profiles.json"
+    p = _data_dir() / "profiles.json"
+    log_fn = _profiles_ui_log
+    if log_fn:
+        try:
+            resolved = str(p.resolve())
+        except OSError:
+            resolved = str(p)
+        global _profiles_path_logged_resolved
+        if _profiles_path_logged_resolved != resolved:
+            _profiles_path_logged_resolved = resolved
+            try:
+                log_fn(f"Хранилище профилей (profiles.json): {resolved}")
+            except Exception:
+                pass
+    return p
 
 
 def load_profiles() -> list[BrowserProfile]:

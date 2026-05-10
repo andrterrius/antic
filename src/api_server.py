@@ -14,7 +14,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from collections.abc import Callable
 
-from profiles_store import BrowserProfile, load_profiles, normalize_tags_list, save_profiles
+from profiles_store import (
+    BrowserProfile,
+    load_profiles,
+    normalize_tags_list,
+    save_profiles,
+    set_profiles_ui_log_hook,
+)
 from playwright_runner import run_profile
 
 
@@ -178,6 +184,7 @@ def set_api_ui_hooks(
         _log_hook = log_line
         _sync_hook = sync_profile_button
         _qt_runner_busy = is_profile_running_in_ui
+    set_profiles_ui_log_hook(log_line)
 
 
 def _ui_runner_blocks(profile_id: str) -> bool:
