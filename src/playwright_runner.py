@@ -19,7 +19,7 @@ from playwright.sync_api import ProxySettings, BrowserContext, Page, Playwright
 from patchright.sync_api import sync_playwright
 
 
-from profiles_store import BrowserProfile
+from profiles_store import BrowserProfile, app_state_root
 from fingerprint_consistency import (
     chromium_ua_metadata_from_user_agent,
     normalize_timezone_country,
@@ -253,15 +253,9 @@ def ensure_playwright_chromium_installed(log: Callable[[str], None]) -> bool:
         return False
 
 
-def antidetect_ui_root() -> Path:
-    """Корень данных приложения (как для user-data профилей Chromium)."""
-    appdata = os.environ.get("APPDATA")
-    return Path(appdata) / "AntidetectUI" if appdata else (Path(__file__).resolve().parent.parent / "data")
-
-
 def chromium_user_data_parent() -> Path:
-    """Родительский каталог: внутри него по одной папке на profile_id."""
-    return antidetect_ui_root() / "user-data"
+    """Родительский каталог: внутри него по одной папке на profile_id (рядом с data/profiles.json)."""
+    return app_state_root() / "user-data"
 
 
 def profile_user_data_dir(profile_id: str) -> Path:

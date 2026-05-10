@@ -544,16 +544,16 @@ class MainWindow(QMainWindow):
         self.btn_import_proxies = QPushButton("Из файла…")
         self.btn_import_proxies.setObjectName("secondary")
         self.btn_import_proxies.setToolTip("Текстовый файл: по одной строке host:port:user:pass")
-        self.btn_export_archive = QPushButton("Экспорт архива…")
+        self.btn_export_archive = QPushButton("Экспорт")
         self.btn_export_archive.setObjectName("secondary")
         self.btn_export_archive.setToolTip(
             "Сохранить ZIP с profiles.json и каталогами user-data (данные Chromium). "
             "Если отмечены профили — только они; иначе все профили."
         )
-        self.btn_import_archive = QPushButton("Импорт архива…")
+        self.btn_import_archive = QPushButton("Импорт")
         self.btn_import_archive.setObjectName("secondary")
         self.btn_import_archive.setToolTip(
-            "ZIP из «Экспорт архива»: профили добавятся к текущим; при совпадении ID будет назначен новый."
+            "ZIP из «Экспорт»: профили добавятся к текущим; при совпадении ID будет назначен новый."
         )
         self.btn_delete = QPushButton("Удалить")
         self.btn_delete.setObjectName("danger")

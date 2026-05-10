@@ -46,21 +46,23 @@ class BrowserProfile:
     webgl_shading_language_version: str | None = None
 
 
-def _data_dir() -> Path:
-    # Store state in %APPDATA% (Windows) или ~/Library/Application Support (macOS)
+def app_state_root() -> Path:
+    """
+    Корень данных приложения: рядом лежат подкаталоги `data/` (profiles.json) и `user-data/` (Chromium).
+    Windows: %APPDATA%\\AntidetectUI; macOS: ~/Library/Application Support/AntidetectUI; иначе ./data от репо.
+    """
     if sys.platform == "win32":
         appdata = os.environ.get("APPDATA")
         if appdata:
-            root = Path(appdata) / "AntidetectUI"
-        else:
-            root = Path(__file__).resolve().parent.parent / "data"
-    elif sys.platform == "darwin":
-        home = Path.home()
-        root = home / "Library" / "Application Support" / "AntidetectUI"
-    else:
-        root = Path(__file__).resolve().parent.parent / "data"
+            return Path(appdata) / "AntidetectUI"
+        return Path(__file__).resolve().parent.parent / "data"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "AntidetectUI"
+    return Path(__file__).resolve().parent.parent / "data"
 
-    d = root / "data"
+
+def _data_dir() -> Path:
+    d = app_state_root() / "data"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
