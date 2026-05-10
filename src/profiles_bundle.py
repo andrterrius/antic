@@ -131,7 +131,8 @@ def _compute_import_additions(
             new_id = uuid.uuid4().hex[:12]
             while new_id in existing_ids:
                 new_id = uuid.uuid4().hex[:12]
-            additions.append(replace(p, profile_id=new_id))
+            new_name = f"{p.name} [{orig}]"
+            additions.append(replace(p, profile_id=new_id, name=new_name))
             orig_to_final[orig] = new_id
             existing_ids.add(new_id)
             remapped += 1
