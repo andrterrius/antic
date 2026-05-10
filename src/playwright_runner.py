@@ -727,7 +727,7 @@ def run_profile(
                     log("Warning: WebRTC protection enabled but proxy IP not available")
 
                 log(f"Open: {start_url}")
-                page.goto(start_url, wait_until="domcontentloaded")
+                page.goto(start_url, wait_until="domcontentloaded", timeout=120_000)
                 # page.add_init_script(
                 #     webgl_override_script(
                 #         vendor=profile.webgl_vendor,
