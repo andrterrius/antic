@@ -21,7 +21,7 @@ from profiles_store import (
     save_profiles,
     set_profiles_ui_log_hook,
 )
-from playwright_runner import run_profile
+from playwright_runner import chromium_user_data_parent, run_profile
 
 
 # --- OpenAPI / Pydantic-схемы (документация в /docs) ---
@@ -185,6 +185,16 @@ def set_api_ui_hooks(
         _sync_hook = sync_profile_button
         _qt_runner_busy = is_profile_running_in_ui
     set_profiles_ui_log_hook(log_line)
+    if log_line:
+        try:
+            ud = chromium_user_data_parent()
+            try:
+                resolved_ud = str(ud.resolve())
+            except OSError:
+                resolved_ud = str(ud)
+            log_line(f"Каталог данных профилей Chromium (user-data): {resolved_ud}")
+        except Exception:
+            pass
 
 
 def _ui_runner_blocks(profile_id: str) -> bool:

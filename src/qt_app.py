@@ -266,6 +266,58 @@ class ImportProfilesBuildThread(QThread):
             self.failed.emit(str(e).strip() or "Ошибка при создании профилей")
 
 
+class ProfilesArchiveExportThread(QThread):
+    """ZIP: profiles.json + user-data (Chromium) для выбранных или всех профилей."""
+
+    progress = pyqtSignal(str)
+    finished_ok = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, dest_dir: str, profiles: list[BrowserProfile]) -> None:
+        super().__init__()
+        self._dest_dir = dest_dir
+        self._profiles = profiles
+
+    def run(self) -> None:
+        from profiles_bundle import export_profiles_zip
+
+        try:
+            path = export_profiles_zip(
+                Path(self._dest_dir),
+                self._profiles,
+                progress=lambda s: self.progress.emit(s),
+            )
+            self.finished_ok.emit(str(path))
+        except Exception as e:
+            self.failed.emit(str(e).strip() or "Ошибка экспорта архива")
+
+
+class ProfilesArchiveImportThread(QThread):
+    """Импорт ZIP: объединение с текущими профилями, при конфликте ID — новый profile_id."""
+
+    progress = pyqtSignal(str)
+    finished_ok = pyqtSignal(int, int)  # added_count, remapped_count
+    failed = pyqtSignal(str)
+
+    def __init__(self, zip_path: str, existing: list[BrowserProfile]) -> None:
+        super().__init__()
+        self._zip_path = zip_path
+        self._existing = existing
+
+    def run(self) -> None:
+        from profiles_bundle import import_profiles_zip
+
+        try:
+            _merged, added, remapped = import_profiles_zip(
+                Path(self._zip_path),
+                list(self._existing),
+                progress=lambda s: self.progress.emit(s),
+            )
+            self.finished_ok.emit(added, remapped)
+        except Exception as e:
+            self.failed.emit(str(e).strip() or "Ошибка импорта архива")
+
+
 class _TagChip(QFrame):
     """Отображение одного тега с кнопкой удаления."""
 
@@ -318,6 +370,8 @@ class MainWindow(QMainWindow):
         self._import_health_thread: BatchImportProxyHealthThread | None = None
         self._import_health_dialog: ProxyBatchCheckProgressDialog | None = None
         self._import_build_thread: ImportProfilesBuildThread | None = None
+        self._archive_export_thread: ProfilesArchiveExportThread | None = None
+        self._archive_import_thread: ProfilesArchiveImportThread | None = None
         self._proxy_single_check_dialog: QProgressDialog | None = None
 
         layout = QHBoxLayout(root)
@@ -490,16 +544,31 @@ class MainWindow(QMainWindow):
         self.btn_import_proxies = QPushButton("Из файла…")
         self.btn_import_proxies.setObjectName("secondary")
         self.btn_import_proxies.setToolTip("Текстовый файл: по одной строке host:port:user:pass")
+        self.btn_export_archive = QPushButton("Экспорт архива…")
+        self.btn_export_archive.setObjectName("secondary")
+        self.btn_export_archive.setToolTip(
+            "Сохранить ZIP с profiles.json и каталогами user-data (данные Chromium). "
+            "Если отмечены профили — только они; иначе все профили."
+        )
+        self.btn_import_archive = QPushButton("Импорт архива…")
+        self.btn_import_archive.setObjectName("secondary")
+        self.btn_import_archive.setToolTip(
+            "ZIP из «Экспорт архива»: профили добавятся к текущим; при совпадении ID будет назначен новый."
+        )
         self.btn_delete = QPushButton("Удалить")
         self.btn_delete.setObjectName("danger")
         self.btn_delete.setToolTip("Удалить все выделенные профили; если ничего не выделено — текущий открытый в форме")
         btn_row.addWidget(self.btn_new)
         btn_row.addWidget(self.btn_import_proxies)
+        btn_row.addWidget(self.btn_export_archive)
+        btn_row.addWidget(self.btn_import_archive)
         btn_row.addWidget(self.btn_delete)
         list_layout.addLayout(btn_row)
 
         self.btn_new.clicked.connect(self._create_profile)
         self.btn_import_proxies.clicked.connect(self._import_profiles_from_proxy_file)
+        self.btn_export_archive.clicked.connect(self._export_profiles_archive)
+        self.btn_import_archive.clicked.connect(self._import_profiles_archive)
         self.btn_delete.clicked.connect(self._delete_profile)
 
         # Make profiles list wider than the editor.
@@ -1563,6 +1632,133 @@ class MainWindow(QMainWindow):
         self._import_build_thread.finished_ok.connect(on_build_done)
         self._import_build_thread.failed.connect(on_build_failed)
         self._import_build_thread.start()
+
+    def _export_profiles_archive(self) -> None:
+        if self._archive_export_thread and self._archive_export_thread.isRunning():
+            return
+        if self._archive_import_thread and self._archive_import_thread.isRunning():
+            QMessageBox.information(self, "Экспорт", "Дождитесь завершения импорта архива.")
+            return
+
+        ids = self._batch_profile_ids()
+        if ids:
+            want: set[str] = set(ids)
+            to_export = [p for p in self._profiles if p.profile_id in want]
+        else:
+            to_export = list(self._profiles)
+
+        if not to_export:
+            QMessageBox.information(self, "Экспорт", "Нет профилей для экспорта.")
+            return
+
+        running = [p.profile_id for p in to_export if self._is_profile_running(p.profile_id)]
+        if running:
+            QMessageBox.warning(
+                self,
+                "Экспорт",
+                "Закройте браузер для профилей, которые попадут в архив, и повторите попытку:\n"
+                + "\n".join(running[:15])
+                + ("\n…" if len(running) > 15 else ""),
+            )
+            return
+
+        dest = QFileDialog.getExistingDirectory(self, "Папка для сохранения архива")
+        if not dest:
+            return
+
+        dlg = QProgressDialog("Создание архива…", None, 0, 0, self)
+        dlg.setWindowTitle("Экспорт профилей")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setCancelButton(None)
+        dlg.show()
+        QApplication.processEvents()
+
+        self._archive_export_thread = ProfilesArchiveExportThread(dest, list(to_export))
+
+        def on_prog(msg: str) -> None:
+            dlg.setLabelText(msg)
+            QApplication.processEvents()
+
+        def on_ok(path: str) -> None:
+            self._archive_export_thread = None
+            dlg.reset()
+            dlg.deleteLater()
+            QMessageBox.information(self, "Экспорт", f"Архив сохранён:\n{path}")
+
+        def on_fail(msg: str) -> None:
+            self._archive_export_thread = None
+            dlg.reset()
+            dlg.deleteLater()
+            QMessageBox.warning(self, "Экспорт", msg)
+
+        self._archive_export_thread.progress.connect(on_prog)
+        self._archive_export_thread.finished_ok.connect(on_ok)
+        self._archive_export_thread.failed.connect(on_fail)
+        self._archive_export_thread.start()
+
+    def _import_profiles_archive(self) -> None:
+        if self._archive_import_thread and self._archive_import_thread.isRunning():
+            return
+        if self._archive_export_thread and self._archive_export_thread.isRunning():
+            QMessageBox.information(self, "Импорт", "Дождитесь завершения экспорта архива.")
+            return
+        if self._import_build_thread and self._import_build_thread.isRunning():
+            QMessageBox.information(self, "Импорт", "Дождитесь завершения другого импорта.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Архив профилей",
+            "",
+            "ZIP архив (*.zip)",
+        )
+        if not path:
+            return
+
+        dlg = QProgressDialog("Импорт архива…", None, 0, 0, self)
+        dlg.setWindowTitle("Импорт профилей")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setCancelButton(None)
+        dlg.show()
+        QApplication.processEvents()
+
+        self._archive_import_thread = ProfilesArchiveImportThread(path, list(self._profiles))
+
+        def on_prog(msg: str) -> None:
+            dlg.setLabelText(msg)
+            QApplication.processEvents()
+
+        def on_ok(added: int, remapped: int) -> None:
+            self._archive_import_thread = None
+            dlg.reset()
+            dlg.deleteLater()
+            self._profiles = load_profiles()
+            if self._profiles:
+                if self._active_profile_id not in {p.profile_id for p in self._profiles}:
+                    self._active_profile_id = self._profiles[0].profile_id
+            else:
+                self._active_profile_id = None
+            self._refresh_profiles_list()
+            self._load_active_profile_into_form()
+            extra = f"\n\nПрофилей с новым ID из‑за конфликта имён: {remapped}." if remapped else ""
+            QMessageBox.information(
+                self,
+                "Импорт",
+                f"Добавлено профилей: {added}.{extra}",
+            )
+
+        def on_fail(msg: str) -> None:
+            self._archive_import_thread = None
+            dlg.reset()
+            dlg.deleteLater()
+            QMessageBox.warning(self, "Импорт", msg)
+
+        self._archive_import_thread.progress.connect(on_prog)
+        self._archive_import_thread.finished_ok.connect(on_ok)
+        self._archive_import_thread.failed.connect(on_fail)
+        self._archive_import_thread.start()
 
     def _selected_profile_ids(self) -> list[str]:
         ids: list[str] = []

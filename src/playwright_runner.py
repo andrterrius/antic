@@ -253,10 +253,19 @@ def ensure_playwright_chromium_installed(log: Callable[[str], None]) -> bool:
         return False
 
 
-def profile_user_data_dir(profile_id: str) -> Path:
+def antidetect_ui_root() -> Path:
+    """Корень данных приложения (как для user-data профилей Chromium)."""
     appdata = os.environ.get("APPDATA")
-    root = Path(appdata) / "AntidetectUI" if appdata else (Path(__file__).resolve().parent.parent / "data")
-    d = root / "user-data" / profile_id
+    return Path(appdata) / "AntidetectUI" if appdata else (Path(__file__).resolve().parent.parent / "data")
+
+
+def chromium_user_data_parent() -> Path:
+    """Родительский каталог: внутри него по одной папке на profile_id."""
+    return antidetect_ui_root() / "user-data"
+
+
+def profile_user_data_dir(profile_id: str) -> Path:
+    d = chromium_user_data_parent() / profile_id
     d.mkdir(parents=True, exist_ok=True)
     return d
 

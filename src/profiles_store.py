@@ -96,12 +96,8 @@ def profiles_path() -> Path:
     return p
 
 
-def load_profiles() -> list[BrowserProfile]:
-    p = profiles_path()
-    if not p.exists():
-        return []
-
-    raw = json.loads(p.read_text(encoding="utf-8"))
+def profiles_from_json_list(raw: Any) -> list[BrowserProfile]:
+    """Разбор списка словарей (как в profiles.json) в модели профиля."""
     if not isinstance(raw, list):
         return []
 
@@ -140,8 +136,16 @@ def load_profiles() -> list[BrowserProfile]:
             )
         )
 
-    # drop invalid ids
     return [x for x in out if x.profile_id]
+
+
+def load_profiles() -> list[BrowserProfile]:
+    p = profiles_path()
+    if not p.exists():
+        return []
+
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    return profiles_from_json_list(raw)
 
 
 def save_profiles(profiles: list[BrowserProfile]) -> None:
