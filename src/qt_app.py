@@ -47,7 +47,13 @@ from profiles_store import BrowserProfile, load_profiles, save_profiles, tags_fr
 from fingerprint_generator import generate_test_fingerprint
 from proxy_health import probe_proxy_health_triple, update_all_profiles_matching_proxy_credentials
 from proxy_import import apply_proxy_and_sync_geo, parse_host_port_user_pass_line, proxy_server_url
-from playwright_runner import run_profile, profile_user_data_dir, get_proxy_ip, geoip_from_ip
+from playwright_runner import (
+    run_profile,
+    profile_user_data_dir,
+    get_proxy_ip,
+    geoip_from_ip,
+    normalize_proxy_server_url,
+)
 from api_server import (
     append_ui_session_log,
     apply_ui_session_cdp,
@@ -585,7 +591,7 @@ class MainWindow(QMainWindow):
 
         self.ed_name = QLineEdit()
         self.ed_proxy_server = QLineEdit()
-        self.ed_proxy_server.setPlaceholderText("http://host:port or socks5://host:port")
+        self.ed_proxy_server.setPlaceholderText("1.2.3.4:8080 или http://host:port / socks5://…")
         self.ed_proxy_user = QLineEdit()
         self.ed_proxy_pass = QLineEdit()
         self.ed_proxy_pass.setEchoMode(QLineEdit.EchoMode.Password)
@@ -1466,11 +1472,22 @@ class MainWindow(QMainWindow):
             if self.ed_tz.text():
                 self.ed_tz.setText("")
 
+    def _normalize_proxy_server_field_in_place(self) -> None:
+        raw = (self.ed_proxy_server.text() or "").strip()
+        if not raw:
+            return
+        canon = normalize_proxy_server_url(raw)
+        if canon != raw:
+            self.ed_proxy_server.blockSignals(True)
+            self.ed_proxy_server.setText(canon)
+            self.ed_proxy_server.blockSignals(False)
+
     def _on_proxy_fields_edited(self) -> None:
         """
         When proxy changes, regenerate fingerprint/persona fields in the form.
         Changes are not persisted until user clicks 'Save profile'.
         """
+        self._normalize_proxy_server_field_in_place()
         self._sync_locale_tz_system_mode()
         p = self._active_profile()
         if not p:
@@ -1828,7 +1845,12 @@ class MainWindow(QMainWindow):
         p = self._active_profile()
         if not p:
             return
-        proxy_server = self._blank_to_none(self.ed_proxy_server.text())
+        pr = (self.ed_proxy_server.text() or "").strip()
+        proxy_server = normalize_proxy_server_url(pr) if pr else None
+        if proxy_server and proxy_server != pr:
+            self.ed_proxy_server.blockSignals(True)
+            self.ed_proxy_server.setText(proxy_server)
+            self.ed_proxy_server.blockSignals(False)
         no_proxy = not proxy_server
         proxy_user = self._blank_to_none(self.ed_proxy_user.text())
         proxy_pass = self._blank_to_none(self.ed_proxy_pass.text())

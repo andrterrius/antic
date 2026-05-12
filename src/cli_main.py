@@ -20,6 +20,7 @@ from playwright_runner import (
     ensure_playwright_chromium_installed,
     geoip_from_ip,
     get_proxy_ip,
+    normalize_proxy_server_url,
     profile_user_data_dir,
     run_profile,
 )
@@ -227,6 +228,8 @@ def cmd_profiles_set(args: argparse.Namespace) -> int:
 
     # Mirror UI constraints: engine is chromium; viewport is system-default unless user wants otherwise.
     proxy_server = _blank_to_none(args.proxy_server) if args.proxy_server is not None else p.proxy_server
+    if proxy_server:
+        proxy_server = normalize_proxy_server_url(proxy_server)
     no_proxy = not (proxy_server or "").strip()
 
     tags_next = tags_from_delimited_text(args.tags) if args.tags is not None else p.tags

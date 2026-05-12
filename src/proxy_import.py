@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from fingerprint_consistency import normalize_timezone_country
-from playwright_runner import geoip_from_ip, get_proxy_ip
+from playwright_runner import geoip_from_ip, get_proxy_ip, normalize_proxy_server_url
 from profiles_store import BrowserProfile
 
 
@@ -41,13 +41,15 @@ def apply_proxy_and_sync_geo(
     proxy_password: str | None,
 ) -> BrowserProfile:
     """Set proxy fields and align country/tz/geo with proxy exit IP (same idea as CLI/UI on new profile)."""
+    ps_raw = (proxy_server or "").strip()
+    server_val = normalize_proxy_server_url(ps_raw) if ps_raw else None
     p = replace(
         p,
-        proxy_server=proxy_server,
+        proxy_server=server_val,
         proxy_username=proxy_username,
         proxy_password=proxy_password,
     )
-    proxy_ip = get_proxy_ip(proxy_server, proxy_username, proxy_password)
+    proxy_ip = get_proxy_ip(server_val, proxy_username, proxy_password) if server_val else None
     geo = geoip_from_ip(proxy_ip) if proxy_ip else None
     if geo:
         p = replace(

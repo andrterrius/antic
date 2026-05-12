@@ -13,6 +13,8 @@ import io
 import contextlib
 import sys
 import json
+import hashlib
+import time
 
 import patchright
 from playwright.sync_api import ProxySettings, BrowserContext, Page, Playwright
@@ -262,6 +264,448 @@ def profile_user_data_dir(profile_id: str) -> Path:
     d = chromium_user_data_parent() / profile_id
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _write_unpacked_profile_id_extension(user_data_dir: Path, profile_name: str) -> Path:
+    """
+    Unpacked MV3 extension: popup shows profile name + id (id = user_data_dir name).
+    Separate buttons copy name and id to the clipboard.
+    """
+    ext_root = user_data_dir / "_antidetect_profile_id_ext"
+    ext_root.mkdir(parents=True, exist_ok=True)
+    current_profile_id = (user_data_dir.name or "").strip()
+    display_name = (profile_name or "").strip() or "—"
+    tip = f"{display_name} · {current_profile_id}" if current_profile_id else display_name
+    if len(tip) > 120:
+        tip = tip[:117] + "..."
+    manifest = {
+        "manifest_version": 3,
+        "name": "Antic",
+        "version": "1.0",
+        "description": "Полоска: название и ID профиля; клик копирует отдельно.",
+        "permissions": ["clipboardWrite"],
+        "content_scripts": [
+            {
+                "matches": ["http://*/*", "https://*/*"],
+                "js": ["profile_strip.js"],
+                "css": ["profile_strip.css"],
+                "run_at": "document_idle",
+                "all_frames": False,
+            }
+        ],
+        "action": {
+            "default_popup": "popup.html",
+            "default_title": tip,
+        },
+    }
+    (ext_root / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    name_js = json.dumps(display_name, ensure_ascii=False)
+    id_js = json.dumps(current_profile_id, ensure_ascii=False)
+    popup_js = f"""(() => {{
+  const PROFILE_NAME = {name_js};
+  const PROFILE_ID = {id_js};
+
+  const elName = document.getElementById("pname");
+  const elId = document.getElementById("pid");
+  const btnName = document.getElementById("btn-name");
+  const btnId = document.getElementById("btn-id");
+
+  elName.textContent = PROFILE_NAME;
+  elId.textContent = PROFILE_ID;
+
+  function fallbackCopy(text) {{
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    try {{
+      document.execCommand("copy");
+    }} finally {{
+      document.body.removeChild(ta);
+    }}
+  }}
+
+  async function copyText(text, btn) {{
+    const idle = btn.textContent;
+    try {{
+      if (navigator.clipboard && navigator.clipboard.writeText) {{
+        await navigator.clipboard.writeText(text);
+      }} else {{
+        fallbackCopy(text);
+      }}
+      btn.textContent = "Скопировано";
+      setTimeout(() => {{ btn.textContent = idle; }}, 1400);
+    }} catch (e) {{
+      try {{ fallbackCopy(text); btn.textContent = "Скопировано"; }} catch (_) {{ btn.textContent = "Ошибка"; }}
+      setTimeout(() => {{ btn.textContent = idle; }}, 1400);
+    }}
+  }}
+
+  btnName.addEventListener("click", () => copyText(PROFILE_NAME, btnName));
+  btnId.addEventListener("click", () => copyText(PROFILE_ID, btnId));
+}})();
+"""
+    (ext_root / "popup.js").write_text(popup_js, encoding="utf-8")
+    popup = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Профиль</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 12px; min-width: 220px; max-width: 380px; }
+    .label { color: #666; font-size: 12px; margin-bottom: 4px; }
+    .value { word-break: break-word; font-weight: 600; margin-bottom: 8px; }
+    .mono { font-family: ui-monospace, monospace; font-size: 13px; }
+    .row { margin-bottom: 14px; }
+    button {
+      font: 13px system-ui, sans-serif;
+      padding: 6px 10px;
+      border-radius: 6px;
+      border: 1px solid #ccc;
+      background: #f5f5f5;
+      cursor: pointer;
+    }
+    button:hover { background: #eaeaea; }
+  </style>
+</head>
+<body>
+  <div class="row">
+    <div class="label">Название</div>
+    <div id="pname" class="value"></div>
+    <button type="button" id="btn-name">Копировать название</button>
+  </div>
+  <div class="row">
+    <div class="label">ID</div>
+    <div id="pid" class="value mono"></div>
+    <button type="button" id="btn-id">Копировать ID</button>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
+"""
+    (ext_root / "popup.html").write_text(popup, encoding="utf-8")
+
+    strip_css = """#__antic_prof_strip {
+  position: fixed;
+  top: -28px;
+  left: 0;
+  right: 0;
+  width: 100%;
+  height: 28px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: row;
+  justify-content: flex-start;
+  align-items: center;
+  gap: 10px;
+  padding: 0 16px;
+  margin: 0;
+  font: 13px system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: #f1f3f4;
+  background: #35363a;
+  border-bottom: 1px solid #202124;
+  z-index: 2147483646;
+  pointer-events: auto;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.35);
+}
+#__antic_prof_strip .__antic_name {
+  cursor: pointer;
+  user-select: none;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 42vw;
+}
+#__antic_prof_strip .__antic_name:hover { text-decoration: underline; }
+#__antic_prof_strip .__antic_id {
+  cursor: pointer;
+  user-select: none;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  color: #bdc1c6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 42vw;
+}
+#__antic_prof_strip .__antic_id:hover { color: #e8eaed; text-decoration: underline; }
+#__antic_prof_strip.__antic_flash_name .__antic_name,
+#__antic_prof_strip.__antic_flash_id .__antic_id {
+  outline: 2px solid #8ab4f8;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+"""
+    (ext_root / "profile_strip.css").write_text(strip_css, encoding="utf-8")
+
+    strip_js = f"""(() => {{
+  if (window !== window.top) return;
+  if (document.body && document.body.dataset.anticProfileStrip) return;
+
+  const PROFILE_NAME = {name_js};
+  const PROFILE_ID = {id_js};
+
+  function fallbackCopy(text) {{
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    try {{ document.execCommand("copy"); }} finally {{ document.body.removeChild(ta); }}
+  }}
+
+  async function copyText(text) {{
+    try {{
+      if (navigator.clipboard && navigator.clipboard.writeText) {{
+        await navigator.clipboard.writeText(text);
+      }} else {{
+        fallbackCopy(text);
+      }}
+      return true;
+    }} catch (e) {{
+      try {{ fallbackCopy(text); return true; }} catch (_) {{ return false; }}
+    }}
+  }}
+
+  function flash(strip, cls) {{
+    strip.classList.remove("__antic_flash_name", "__antic_flash_id");
+    void strip.offsetWidth;
+    strip.classList.add(cls);
+    setTimeout(() => strip.classList.remove(cls), 700);
+  }}
+
+  function mount() {{
+    if (!document.body) return;
+    if (document.body.dataset.anticProfileStrip) return;
+    document.body.dataset.anticProfileStrip = "1";
+
+    const strip = document.createElement("div");
+    strip.id = "__antic_prof_strip";
+    strip.setAttribute("role", "toolbar");
+
+    const nameEl = document.createElement("span");
+    nameEl.className = "__antic_name";
+    nameEl.textContent = PROFILE_NAME;
+    nameEl.title = "Нажмите, чтобы скопировать название профиля";
+
+    const idEl = document.createElement("span");
+    idEl.className = "__antic_id";
+    idEl.textContent = PROFILE_ID;
+    idEl.title = "Нажмите, чтобы скопировать ID профиля";
+
+    nameEl.addEventListener("click", (e) => {{
+      e.preventDefault();
+      e.stopPropagation();
+      copyText(PROFILE_NAME).then((ok) => {{ if (ok) flash(strip, "__antic_flash_name"); }});
+    }});
+    idEl.addEventListener("click", (e) => {{
+      e.preventDefault();
+      e.stopPropagation();
+      copyText(PROFILE_ID).then((ok) => {{ if (ok) flash(strip, "__antic_flash_id"); }});
+    }});
+
+    strip.appendChild(nameEl);
+    strip.appendChild(idEl);
+    document.body.insertBefore(strip, document.body.firstChild);
+
+    const SHIFT = "28px";
+    let shiftEl = document.body;
+    try {{
+      if (getComputedStyle(document.body).display === "contents") {{
+        shiftEl = document.documentElement;
+      }}
+    }} catch (e) {{
+      shiftEl = document.documentElement;
+    }}
+    shiftEl.style.setProperty("transform", "translateY(" + SHIFT + ")", "important");
+    shiftEl.style.setProperty("transform-origin", "top center", "important");
+  }}
+
+  if (document.body) mount();
+  else document.addEventListener("DOMContentLoaded", () => mount(), {{ once: true }});
+}})();
+"""
+    (ext_root / "profile_strip.js").write_text(strip_js, encoding="utf-8")
+
+    return ext_root
+
+
+def _chromium_unpacked_extension_id(extension_dir: Path) -> str:
+    """
+    crx_file::id_util::GenerateIdForPath: SHA256 of path bytes, first 16 bytes,
+    lowercase hex (32 chars), each hex digit mapped to a..p (Chrome extension id).
+    """
+    resolved = extension_dir.resolve()
+    if platform.system().lower() == "windows":
+        s = str(resolved)
+        if len(s) >= 2 and s[1] == ":" and "a" <= s[0] <= "z":
+            s = s[0].upper() + s[1:]
+        path_bytes = s.encode("utf-16-le")
+    else:
+        path_bytes = str(resolved).encode("utf-8")
+    digest16 = hashlib.sha256(path_bytes).digest()[:16]
+    return "".join(chr(int(c, 16) + ord("a")) for c in digest16.hex())
+
+
+def _extension_id_from_prefs_settings(prefs: dict, extension_dir: Path) -> str | None:
+    """After Chromium loads the unpacked extension, its id is in extensions.settings[path]."""
+    ex = prefs.get("extensions")
+    if not isinstance(ex, dict):
+        return None
+    st = ex.get("settings")
+    if not isinstance(st, dict):
+        return None
+    try:
+        want = extension_dir.resolve()
+    except OSError:
+        want = extension_dir
+    want_s = os.path.normcase(os.path.normpath(str(want)))
+    leaf = os.path.normcase(os.path.normpath(str(want.name)))
+    for eid, meta in st.items():
+        if not isinstance(eid, str) or len(eid) != 32:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        raw = meta.get("path")
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        raw_n = os.path.normcase(os.path.normpath(raw.replace("/", "\\")))
+        try:
+            if Path(raw).resolve() == want:
+                return eid
+        except OSError:
+            pass
+        if raw_n == want_s:
+            return eid
+        # First-run: Chromium may record a slightly different path shape; leaf + parent match.
+        if raw_n.endswith(leaf) and want_s.endswith(leaf):
+            parent_w = os.path.dirname(want_s)
+            parent_r = os.path.dirname(raw_n)
+            if parent_w == parent_r:
+                return eid
+    return None
+
+
+def _apply_extension_pin_merge(prefs: dict, ext_id: str) -> bool:
+    """Mutate prefs dict; return True if toolbar or pinned_extensions changed."""
+    changed = False
+
+    toolbar = prefs.get("toolbar")
+    if not isinstance(toolbar, dict):
+        toolbar = {}
+        prefs["toolbar"] = toolbar
+    pinned_tb = toolbar.get("pinned_actions")
+    if not isinstance(pinned_tb, list):
+        pinned_tb = []
+    if ext_id not in pinned_tb:
+        toolbar["pinned_actions"] = [*pinned_tb, ext_id]
+        changed = True
+
+    if isinstance(prefs.get("extensions"), dict):
+        ext_block = prefs["extensions"]
+        pinned_ex = ext_block.get("pinned_extensions")
+        if not isinstance(pinned_ex, list):
+            pinned_ex = []
+        if ext_id not in pinned_ex:
+            ext_block["pinned_extensions"] = [*pinned_ex, ext_id]
+            changed = True
+
+    return changed
+
+
+def _write_preferences_with_retries(prefs_path: Path, prefs: dict) -> None:
+    payload = json.dumps(prefs, separators=(",", ":"), ensure_ascii=False)
+    for attempt in range(12):
+        try:
+            prefs_path.write_text(payload, encoding="utf-8")
+            return
+        except OSError:
+            if attempt == 11:
+                raise
+            time.sleep(0.12)
+
+
+def _ensure_extension_pinned_in_preferences(
+    user_data_dir: Path,
+    extension_dir: Path,
+    log: Callable[[str], None],
+    *,
+    wait_for_preferences_sec: float = 0.0,
+) -> None:
+    """
+    Pin Antic on the toolbar via Preferences:
+    - toolbar.pinned_actions (unified toolbar model)
+    - extensions.pinned_extensions (extensions-specific list; still honored on many builds)
+
+    When wait_for_preferences_sec > 0 (after browser start), polls until Chromium writes
+    extensions.settings for this unpacked path so the first session pins correctly.
+    """
+    try:
+        default_dir = user_data_dir / "Default"
+        default_dir.mkdir(parents=True, exist_ok=True)
+        prefs_path = default_dir / "Preferences"
+
+        def _load_prefs() -> dict:
+            if not prefs_path.is_file():
+                return {}
+            raw = prefs_path.read_text(encoding="utf-8")
+            loaded = json.loads(raw) if raw.strip() else {}
+            return loaded if isinstance(loaded, dict) else {}
+
+        # --- Post-launch: wait for Preferences, then poll for extensions.settings ---
+        if wait_for_preferences_sec > 0:
+            deadline = time.monotonic() + wait_for_preferences_sec
+            while not prefs_path.is_file():
+                if time.monotonic() >= deadline:
+                    log("Warning: Preferences not found; Antic pin skipped.")
+                    return
+                time.sleep(0.1)
+
+            poll = 0.18
+            while time.monotonic() < deadline:
+                prefs = _load_prefs()
+                ext_from = _extension_id_from_prefs_settings(prefs, extension_dir)
+                if ext_from is None:
+                    time.sleep(poll)
+                    continue
+                if not _apply_extension_pin_merge(prefs, ext_from):
+                    return
+                _write_preferences_with_retries(prefs_path, prefs)
+                return
+
+            # Deadline hit without seeing settings (slow disk); best-effort with hash id.
+            prefs = _load_prefs()
+            ext_id = _extension_id_from_prefs_settings(prefs, extension_dir) or _chromium_unpacked_extension_id(
+                extension_dir
+            )
+            if _apply_extension_pin_merge(prefs, ext_id):
+                _write_preferences_with_retries(prefs_path, prefs)
+            return
+
+        # --- Pre-launch or immediate single pass (wait == 0) ---
+        prefs = _load_prefs()
+        ext_id = _extension_id_from_prefs_settings(prefs, extension_dir) or _chromium_unpacked_extension_id(
+            extension_dir
+        )
+        if not _apply_extension_pin_merge(prefs, ext_id):
+            return
+        _write_preferences_with_retries(prefs_path, prefs)
+    except Exception as e:
+        log(f"Warning: could not pin Antic on toolbar (Preferences): {e}")
 
 
 def _canonical_proxy_scheme(scheme: str) -> str:
@@ -617,6 +1061,8 @@ def run_profile(
 
             profile = normalize_timezone_country(profile)
             user_data_dir = profile_user_data_dir(profile.profile_id)
+            profile_ext_dir = _write_unpacked_profile_id_extension(user_data_dir, profile.name)
+            _ensure_extension_pinned_in_preferences(user_data_dir, profile_ext_dir, log)
 
             log("Success getted profile")
 
@@ -642,6 +1088,7 @@ def run_profile(
                     log(f"Error: {e}")
                 log("Launching args...")
                 launch_args = list(extra_args)
+                launch_args.append(f"--load-extension={profile_ext_dir.resolve()}")
                 if cdp_debug_port is not None:
                     launch_args.append(f"--remote-debugging-port={int(cdp_debug_port)}")
                 # Desktop: let CDP set window bounds after launch (work-area sized).
@@ -673,6 +1120,11 @@ def run_profile(
                 if headless:
                     _launch_kw["channel"] = "chromium"
                 context: BrowserContext = browser_type.launch_persistent_context(**_launch_kw)
+
+                # Poll until extensions.settings exists (first cold profile); then pin once.
+                _ensure_extension_pinned_in_preferences(
+                    user_data_dir, profile_ext_dir, log
+                )
 
                 page: Page
                 if context.pages:
