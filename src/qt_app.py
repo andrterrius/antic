@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QItemSelectionModel, QObject, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QPoint, QItemSelectionModel, QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import (
     QApplication,
@@ -365,6 +365,10 @@ class MainWindow(QMainWindow):
         self._lmb_select_base: set[str] = set()
         self._lmb_select_visited: set[str] = set()
         self._lmb_select_last_row: int | None = None
+        # Клик по подписи (имя+id): без выделения открывает редактор; с перетаскиванием — «краска» выделения.
+        self._title_row_pending: int | None = None
+        self._title_press_global: QPoint | None = None
+        self._title_press_modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier
 
         root = QWidget()
         root.setObjectName("zaliverRoot")
@@ -511,9 +515,19 @@ class MainWindow(QMainWindow):
         self.ed_profiles_search.textChanged.connect(lambda _t: self._refresh_profiles_list())
         list_layout.addWidget(self.ed_profiles_search, 0)
 
+        list_sel_row = QHBoxLayout()
+        list_sel_row.addStretch(1)
+        self.btn_clear_profile_selection = QPushButton("Снять выделение")
+        self.btn_clear_profile_selection.setObjectName("secondary")
+        self.btn_clear_profile_selection.setToolTip("Убрать все отметки и выделение в списке профилей")
+        self.btn_clear_profile_selection.clicked.connect(self._clear_profiles_list_selection)
+        list_sel_row.addWidget(self.btn_clear_profile_selection)
+        list_layout.addLayout(list_sel_row)
+
         self.profiles_list = QListWidget()
         self.profiles_list.setObjectName("profilesList")
-        # Выделение: ЛКМ-«краска» (eventFilter) и обычный мультивыбор Qt; чекбоксы слева синхронизируются с выделением.
+        # Выделение: ЛКМ с перетаскиванием по строке (не по подписи — см. eventFilter); Ctrl — добавить.
+        # Клик по подписи (имя+id): только открыть настройки без выделения; с движением — «краска».
         self.profiles_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
         self.profiles_list.setMouseTracking(True)
         self.profiles_list.viewport().setMouseTracking(True)
@@ -1160,7 +1174,9 @@ class MainWindow(QMainWindow):
                     joined = joined[:45] + "…"
                 tag_hint = f"  [{joined}]"
             lbl = QLabel(f"{p.name}{tag_hint}  ({p.profile_id})")
-            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            lbl.setObjectName("profileRowTitle")
+            # Только клавиатура: мышью — клик открывает настройки, перетаскивание — групповое выделение.
+            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByKeyboard)
 
             proxy_dot = QLabel("")
             proxy_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1264,6 +1280,28 @@ class MainWindow(QMainWindow):
             return ch
         return None
 
+    def _checkbox_at_viewport_pos(self, pos) -> bool:
+        it = self.profiles_list.itemAt(pos)
+        if not it:
+            return False
+        w = self.profiles_list.itemWidget(it)
+        if not w:
+            return False
+        local = w.mapFrom(self.profiles_list.viewport(), pos)
+        ch = w.childAt(local)
+        return isinstance(ch, QCheckBox)
+
+    def _title_label_at_viewport_pos(self, pos) -> bool:
+        it = self.profiles_list.itemAt(pos)
+        if not it:
+            return False
+        w = self.profiles_list.itemWidget(it)
+        if not w:
+            return False
+        local = w.mapFrom(self.profiles_list.viewport(), pos)
+        ch = w.childAt(local)
+        return isinstance(ch, QLabel) and ch.objectName() == "profileRowTitle"
+
     def _profile_row_at_viewport_pos(self, pos) -> int | None:
         idx = self.profiles_list.indexAt(pos)
         if not idx.isValid():
@@ -1310,13 +1348,8 @@ class MainWindow(QMainWindow):
         if changed:
             self._lmb_select_recompute()
 
-    def _lmb_select_try_begin(self, viewport_pos, modifiers: Qt.KeyboardModifier) -> bool:
+    def _lmb_select_begin_at_row(self, row: int, modifiers: Qt.KeyboardModifier) -> bool:
         if self._lmb_select_active:
-            return False
-        if self._run_button_at_viewport_pos(viewport_pos):
-            return False
-        row = self._profile_row_at_viewport_pos(viewport_pos)
-        if row is None:
             return False
         pid = self._pid_at_list_row(row)
         if not pid:
@@ -1329,6 +1362,16 @@ class MainWindow(QMainWindow):
         self.profiles_list.viewport().grabMouse()
         self._lmb_select_visit_row_range(row, row)
         return True
+
+    def _lmb_select_try_begin(self, viewport_pos, modifiers: Qt.KeyboardModifier) -> bool:
+        if self._run_button_at_viewport_pos(viewport_pos):
+            return False
+        if self._checkbox_at_viewport_pos(viewport_pos):
+            return False
+        row = self._profile_row_at_viewport_pos(viewport_pos)
+        if row is None:
+            return False
+        return self._lmb_select_begin_at_row(row, modifiers)
 
     def _lmb_select_update_hover(self, viewport_pos) -> None:
         if not self._lmb_select_active:
@@ -1368,6 +1411,36 @@ class MainWindow(QMainWindow):
                 it = self._profile_id_to_item[pid]
                 self.profiles_list.setCurrentItem(it, QItemSelectionModel.SelectionFlag.Current)
                 self.profiles_list.scrollToItem(it)
+
+    def _clear_profile_title_click_pending(self) -> None:
+        self._title_row_pending = None
+        self._title_press_global = None
+        self._title_press_modifiers = Qt.KeyboardModifier.NoModifier
+
+    def _finish_profile_title_click_without_drag(self) -> None:
+        try:
+            self.profiles_list.viewport().releaseMouse()
+        except Exception:
+            pass
+        row = self._title_row_pending
+        self._clear_profile_title_click_pending()
+        if row is None or self._lmb_select_active:
+            return
+        self._open_profile_row_editor(row)
+
+    def _open_profile_row_editor(self, row: int) -> None:
+        pid = self._pid_at_list_row(row)
+        if not pid:
+            return
+        it = self._profile_id_to_item.get(pid)
+        if it is None:
+            return
+        self._active_profile_id = pid
+        self.profiles_list.blockSignals(True)
+        self.profiles_list.setCurrentItem(it, QItemSelectionModel.SelectionFlag.Current)
+        self.profiles_list.blockSignals(False)
+        self._load_active_profile_into_form()
+        self.profiles_list.scrollToItem(it)
 
     def _batch_profile_ids(self) -> list[str]:
         """
@@ -1476,7 +1549,7 @@ class MainWindow(QMainWindow):
         self._load_active_profile_into_form()
 
     def eventFilter(self, watched: object, event: object) -> bool:  # type: ignore[override]
-        # LMB-only "paint" selection over profile rows (Ctrl = add to existing). Run/scroll bar pass through.
+        # LMB paint on rows (Ctrl = add). Title label: click opens editor without selection; drag paints. Run/scrollbar pass through.
         try:
             if not hasattr(self, "profiles_list"):
                 return super().eventFilter(watched, event)
@@ -1499,21 +1572,67 @@ class MainWindow(QMainWindow):
                 if self._lmb_select_active:
                     self._lmb_select_end(vp_pos)
                     return True
+                if self._title_row_pending is not None:
+                    self._finish_profile_title_click_without_drag()
+                    return True
                 return False
 
             if et == event.Type.MouseMove and (event.buttons() & Qt.MouseButton.LeftButton):
                 if self._lmb_select_active:
                     self._lmb_select_update_hover(vp_pos)
                     return True
+                if self._title_row_pending is not None and self._title_press_global is not None:
+                    dg = event.globalPosition().toPoint() - self._title_press_global
+                    if abs(dg.x()) + abs(dg.y()) >= 5:
+                        row = self._title_row_pending
+                        mods = self._title_press_modifiers
+                        self._clear_profile_title_click_pending()
+                        self._lmb_select_begin_at_row(row, mods)
+                    return True
                 return False
 
             if et == event.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                if self._title_label_at_viewport_pos(vp_pos):
+                    row = self._profile_row_at_viewport_pos(vp_pos)
+                    if row is not None:
+                        self._title_row_pending = row
+                        self._title_press_global = event.globalPosition().toPoint()
+                        self._title_press_modifiers = event.modifiers()
+                        try:
+                            vp.grabMouse()
+                        except Exception:
+                            pass
+                        return True
                 if self._lmb_select_try_begin(vp_pos, event.modifiers()):
                     return True
                 return False
         except Exception:
             pass
         return super().eventFilter(watched, event)
+
+    def _clear_profiles_list_selection(self) -> None:
+        """Снять все отметки и выделение строк; прервать «краску» / ожидание клика по подписи, если были."""
+        if self._lmb_select_active:
+            self._lmb_select_active = False
+            self._lmb_select_additive = False
+            self._lmb_select_base.clear()
+            self._lmb_select_visited.clear()
+            self._lmb_select_last_row = None
+            try:
+                self.profiles_list.viewport().releaseMouse()
+            except Exception:
+                pass
+        if self._title_row_pending is not None:
+            try:
+                self.profiles_list.viewport().releaseMouse()
+            except Exception:
+                pass
+            self._clear_profile_title_click_pending()
+        self._checked_profile_ids.clear()
+        self.profiles_list.blockSignals(True)
+        self.profiles_list.clearSelection()
+        self.profiles_list.blockSignals(False)
+        self._apply_profile_list_selection_visuals()
 
     def _load_active_profile_into_form(self) -> None:
         p = self._active_profile()
