@@ -154,10 +154,34 @@ def _session_dict_to_out(d: dict[str, Any]) -> BrowserSessionOut:
     return BrowserSessionOut.model_validate(d)
 
 
-def _pick_free_loopback_port() -> int:
+def _pick_free_loopback_port_once() -> int:
+    """Bind to an ephemeral loopback port, then release it (port may be reused immediately by OS)."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
+
+
+def _reserved_cdp_ports_locked() -> set[int]:
+    """CDP ports already handed out to active sessions (caller must hold _lock)."""
+    used: set[int] = set()
+    for s in _sessions.values():
+        if not s.finished and s.cdp_debug_port is not None:
+            used.add(int(s.cdp_debug_port))
+    for u in _ui_sessions.values():
+        if u.cdp_debug_port is not None:
+            used.add(int(u.cdp_debug_port))
+    return used
+
+
+def _pick_free_loopback_port_avoiding(used: set[int]) -> int:
+    """Pick a port not already assigned to another session (avoids duplicate ephemeral picks)."""
+    avoided = set(used)
+    for _ in range(256):
+        p = _pick_free_loopback_port_once()
+        if p not in avoided:
+            return p
+        avoided.add(p)
+    raise RuntimeError("Could not allocate a unique CDP debug port")
 
 
 # RLock: to_public_dict() takes the same lock as list_sessions() while iterating — plain Lock deadlocks.
@@ -358,12 +382,13 @@ def register_ui_session(
     sid = "ui-" + uuid.uuid4().hex[:14]
     su = (start_url or "https://studio.youtube.com").strip() or "https://studio.youtube.com"
     sp = (script_path or "").strip() or None
-    cdp_port: int | None = _pick_free_loopback_port() if expose_cdp else None
     with _lock:
         if profile_id in _ui_profile_busy:
             sid0 = _ui_profile_busy[profile_id]
             u0 = _ui_sessions.get(sid0)
             return sid0, (u0.cdp_debug_port if u0 else None)
+        denied = _reserved_cdp_ports_locked()
+        cdp_port: int | None = _pick_free_loopback_port_avoiding(denied) if expose_cdp else None
         sess = UiRunSession(
             session_id=sid,
             profile_id=profile_id,
@@ -628,7 +653,9 @@ def build_app() -> FastAPI:
                     detail=f"Profile already running in session {_profile_busy[profile_id]}",
                 )
             sid = uuid.uuid4().hex[:16]
-            cdp_port: int | None = _pick_free_loopback_port() if body.expose_cdp else None
+            cdp_port: int | None = (
+                _pick_free_loopback_port_avoiding(_reserved_cdp_ports_locked()) if body.expose_cdp else None
+            )
             su = (body.start_url or "https://studio.youtube.com").strip() or "https://studio.youtube.com"
             sp = (body.script_path or "").strip() or None
             sess = ProfileRunSession(

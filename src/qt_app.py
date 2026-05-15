@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QItemSelectionModel, QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import (
     QApplication,
@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QPlainTextEdit,
+    QScrollBar,
     QScrollArea,
     QSplitter,
     QStackedWidget,
@@ -357,10 +358,13 @@ class MainWindow(QMainWindow):
         self._editable_tags: list[str] = []
         self._checked_profile_ids: set[str] = set()
         self._profile_id_to_checkbox: dict[str, QCheckBox] = {}
-        self._drag_check_active: bool = False
-        self._drag_check_value: bool = False
-        self._drag_check_touched: set[str] = set()
         self._syncing_selection_check: bool = False
+        # LMB "paint" selection: only rows visited while left button is held (Ctrl = add to prior selection).
+        self._lmb_select_active: bool = False
+        self._lmb_select_additive: bool = False
+        self._lmb_select_base: set[str] = set()
+        self._lmb_select_visited: set[str] = set()
+        self._lmb_select_last_row: int | None = None
 
         root = QWidget()
         root.setObjectName("zaliverRoot")
@@ -370,7 +374,6 @@ class MainWindow(QMainWindow):
         self._active_profile_id: Optional[str] = self._profiles[0].profile_id if self._profiles else None
         self._runners: dict[str, RunnerThread] = {}
         self._run_buttons: dict[str, QPushButton] = {}
-        self._profile_row_widget_to_id: dict[int, str] = {}
         self._profile_id_to_item: dict[str, QListWidgetItem] = {}
         self._proxy_health_thread: ProxyHealthCheckThread | None = None
         self._import_health_thread: BatchImportProxyHealthThread | None = None
@@ -510,13 +513,13 @@ class MainWindow(QMainWindow):
 
         self.profiles_list = QListWidget()
         self.profiles_list.setObjectName("profilesList")
-        # Multi-select for batch launching; editing still follows "current" item.
-        self.profiles_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        # Выделение: ЛКМ-«краска» (eventFilter) и обычный мультивыбор Qt; чекбоксы слева синхронизируются с выделением.
+        self.profiles_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        self.profiles_list.setMouseTracking(True)
+        self.profiles_list.viewport().setMouseTracking(True)
         self.profiles_list.currentItemChanged.connect(self._on_profile_current_changed)
-        self.profiles_list.itemClicked.connect(self._on_profile_item_clicked)
-        self.profiles_list.itemSelectionChanged.connect(self._on_profiles_list_selection_changed)
-        # Allow "paint" selection via checkboxes while holding LMB.
-        self.profiles_list.viewport().installEventFilter(self)
+        self.profiles_list.itemSelectionChanged.connect(self._on_profiles_list_item_selection_changed)
+        self.profiles_list.installEventFilter(self)
         list_layout.addWidget(self.profiles_list, 1)
 
         launch_box = QGroupBox("Запуск")
@@ -1107,16 +1110,23 @@ class MainWindow(QMainWindow):
             # Совпало “смешанно” по разным полям — ставим в самый низ среди найденных.
             return (3, original_index)
 
+        existing_ids = {p.profile_id for p in self._profiles}
+        # Preserve row selection across rebuild (clear() drops Qt item state; we restore from _checked_profile_ids).
+        preserve_sel: set[str] = set(self._checked_profile_ids)
+        for it in self.profiles_list.selectedItems():
+            pid = it.data(Qt.ItemDataRole.UserRole)
+            if pid is not None:
+                s = str(pid).strip()
+                if s:
+                    preserve_sel.add(s)
+        preserve_sel.intersection_update(existing_ids)
+        self._checked_profile_ids = preserve_sel
+
         self.profiles_list.blockSignals(True)
         self.profiles_list.clear()
         self._run_buttons.clear()
-        self._profile_row_widget_to_id.clear()
         self._profile_id_to_item.clear()
         self._profile_id_to_checkbox.clear()
-
-        # Drop checked ids that no longer exist.
-        existing_ids = {p.profile_id for p in self._profiles}
-        self._checked_profile_ids.intersection_update(existing_ids)
 
         matched: list[tuple[int, BrowserProfile]] = []
         for i, p in enumerate(self._profiles):
@@ -1139,9 +1149,9 @@ class MainWindow(QMainWindow):
 
             cb = QCheckBox()
             cb.setChecked(p.profile_id in self._checked_profile_ids)
-            cb.setToolTip("Отметить профиль (множественный выбор)")
-            cb.stateChanged.connect(lambda state, pid=p.profile_id: self._on_profile_checkbox_state_changed(pid, state))
+            cb.setToolTip("Отражает выделение; выделяйте строки, удерживая ЛКМ и ведя курсор по списку (Ctrl — добавить к выделению).")
             self._profile_id_to_checkbox[p.profile_id] = cb
+            cb.stateChanged.connect(lambda _state, pid=p.profile_id: self._on_profile_checkbox_state_changed(pid))
 
             tag_hint = ""
             if p.tags:
@@ -1151,11 +1161,6 @@ class MainWindow(QMainWindow):
                 tag_hint = f"  [{joined}]"
             lbl = QLabel(f"{p.name}{tag_hint}  ({p.profile_id})")
             lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            # Double-click on the row/label should open settings for that profile.
-            row.installEventFilter(self)
-            lbl.installEventFilter(self)
-            self._profile_row_widget_to_id[id(row)] = p.profile_id
-            self._profile_row_widget_to_id[id(lbl)] = p.profile_id
 
             proxy_dot = QLabel("")
             proxy_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1178,34 +1183,75 @@ class MainWindow(QMainWindow):
 
             it.setSizeHint(row.sizeHint())
             self.profiles_list.setItemWidget(it, row)
+
         self.profiles_list.blockSignals(False)
+        self._apply_profile_list_selection_visuals()
 
-    def _on_profile_checkbox_state_changed(self, profile_id: str, state: int) -> None:
-        if self._syncing_selection_check:
-            return
-        checked = state == Qt.CheckState.Checked.value
-        self._set_profile_selected(profile_id, checked)
+        if self._active_profile_id:
+            ac_it = self._profile_id_to_item.get(self._active_profile_id)
+            if ac_it is not None:
+                self.profiles_list.setCurrentItem(ac_it, QItemSelectionModel.SelectionFlag.Current)
+        self._sync_proxy_health_badge()
 
-    def _set_profile_selected(self, profile_id: str, selected: bool) -> None:
-        it = self._profile_id_to_item.get(profile_id)
-        if not it:
-            return
-        if it.isSelected() == selected:
-            return
+    def _apply_profile_list_selection_visuals(self) -> None:
+        existing = {p.profile_id for p in self._profiles}
+        self._checked_profile_ids.intersection_update(existing)
         self._syncing_selection_check = True
         try:
-            it.setSelected(selected)
+            for pid, it in self._profile_id_to_item.items():
+                it.setSelected(pid in self._checked_profile_ids)
+            for _pid, cb in self._profile_id_to_checkbox.items():
+                cb.blockSignals(True)
+                cb.setChecked(_pid in self._checked_profile_ids)
+                cb.blockSignals(False)
         finally:
             self._syncing_selection_check = False
 
-    def _profile_id_at_viewport_pos(self, pos) -> str | None:
-        it = self.profiles_list.itemAt(pos)
-        if not it:
-            return None
-        pid = it.data(Qt.ItemDataRole.UserRole)
-        return str(pid) if pid else None
+    def _on_profile_checkbox_state_changed(self, profile_id: str) -> None:
+        if self._syncing_selection_check:
+            return
+        cb = self._profile_id_to_checkbox.get(profile_id)
+        if cb is None:
+            return
+        if cb.isChecked():
+            self._checked_profile_ids.add(profile_id)
+        else:
+            self._checked_profile_ids.discard(profile_id)
+        it = self._profile_id_to_item.get(profile_id)
+        self._syncing_selection_check = True
+        try:
+            if it is not None:
+                it.setSelected(cb.isChecked())
+        finally:
+            self._syncing_selection_check = False
 
-    def _checkbox_at_viewport_pos(self, pos) -> QCheckBox | None:
+    def _on_profiles_list_item_selection_changed(self) -> None:
+        """Строка выделена в списке — отметить соответствующие чекбоксы (и наоборот снять при снятии выделения)."""
+        if self._syncing_selection_check:
+            return
+        existing = {p.profile_id for p in self._profiles}
+        visible = set(self._profile_ids_in_list_widget_order())
+        qt_sel: set[str] = set()
+        for it in self.profiles_list.selectedItems():
+            raw = it.data(Qt.ItemDataRole.UserRole)
+            if raw is None:
+                continue
+            s = str(raw).strip()
+            if s:
+                qt_sel.add(s)
+        qt_sel &= existing
+        # Профили «вне» текущего отфильтрованного списка оставляем в наборе; видимые строки берём из Qt.
+        self._checked_profile_ids = ((self._checked_profile_ids & existing) - visible) | qt_sel
+        self._syncing_selection_check = True
+        try:
+            for _pid, cb in self._profile_id_to_checkbox.items():
+                cb.blockSignals(True)
+                cb.setChecked(_pid in self._checked_profile_ids)
+                cb.blockSignals(False)
+        finally:
+            self._syncing_selection_check = False
+
+    def _run_button_at_viewport_pos(self, pos) -> QPushButton | None:
         it = self.profiles_list.itemAt(pos)
         if not it:
             return None
@@ -1213,98 +1259,130 @@ class MainWindow(QMainWindow):
         if not w:
             return None
         local = w.mapFrom(self.profiles_list.viewport(), pos)
-        child = w.childAt(local)
-        if isinstance(child, QCheckBox):
-            return child
-        # Click can be on checkbox indicator area; use stored checkbox geometry as fallback.
-        pid = it.data(Qt.ItemDataRole.UserRole)
-        pid_s = str(pid) if pid else ""
-        cb = self._profile_id_to_checkbox.get(pid_s)
-        if cb:
-            cb_local = cb.mapFrom(self.profiles_list.viewport(), pos)
-            if cb.rect().contains(cb_local):
-                return cb
+        ch = w.childAt(local)
+        if isinstance(ch, QPushButton):
+            return ch
         return None
 
-    def _set_profile_checked(self, profile_id: str, checked: bool) -> None:
-        cb = self._profile_id_to_checkbox.get(profile_id)
-        if not cb:
-            return
-        if cb.isChecked() == checked:
-            return
-        self._syncing_selection_check = True
-        try:
-            cb.setChecked(checked)
-        finally:
-            self._syncing_selection_check = False
+    def _profile_row_at_viewport_pos(self, pos) -> int | None:
+        idx = self.profiles_list.indexAt(pos)
+        if not idx.isValid():
+            return None
+        return int(idx.row())
 
-        if checked:
-            self._checked_profile_ids.add(profile_id)
+    def _pid_at_list_row(self, row: int) -> str | None:
+        if row < 0 or row >= self.profiles_list.count():
+            return None
+        it = self.profiles_list.item(row)
+        if not it:
+            return None
+        pid = it.data(Qt.ItemDataRole.UserRole)
+        if pid is None:
+            return None
+        s = str(pid).strip()
+        return s if s else None
+
+    def _profile_id_at_viewport_pos(self, pos) -> str | None:
+        r = self._profile_row_at_viewport_pos(pos)
+        return self._pid_at_list_row(r) if r is not None else None
+
+    def _lmb_select_recompute(self) -> None:
+        existing = {p.profile_id for p in self._profiles}
+        if self._lmb_select_additive:
+            self._checked_profile_ids = (self._lmb_select_base | self._lmb_select_visited) & existing
         else:
-            self._checked_profile_ids.discard(profile_id)
+            self._checked_profile_ids = set(self._lmb_select_visited) & existing
+        self._apply_profile_list_selection_visuals()
+
+    def _lmb_select_visit_row_range(self, r0: int, r1: int) -> None:
+        lo, hi = (r0, r1) if r0 <= r1 else (r1, r0)
+        n = self.profiles_list.count()
+        lo = max(0, lo)
+        hi = min(n - 1, hi)
+        if lo > hi:
+            return
+        changed = False
+        for r in range(lo, hi + 1):
+            pid = self._pid_at_list_row(r)
+            if pid and pid not in self._lmb_select_visited:
+                self._lmb_select_visited.add(pid)
+                changed = True
+        if changed:
+            self._lmb_select_recompute()
+
+    def _lmb_select_try_begin(self, viewport_pos, modifiers: Qt.KeyboardModifier) -> bool:
+        if self._lmb_select_active:
+            return False
+        if self._run_button_at_viewport_pos(viewport_pos):
+            return False
+        row = self._profile_row_at_viewport_pos(viewport_pos)
+        if row is None:
+            return False
+        pid = self._pid_at_list_row(row)
+        if not pid:
+            return False
+        self._lmb_select_active = True
+        self._lmb_select_additive = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        self._lmb_select_base = set(self._checked_profile_ids) if self._lmb_select_additive else set()
+        self._lmb_select_visited = set()
+        self._lmb_select_last_row = row
+        self.profiles_list.viewport().grabMouse()
+        self._lmb_select_visit_row_range(row, row)
+        return True
+
+    def _lmb_select_update_hover(self, viewport_pos) -> None:
+        if not self._lmb_select_active:
+            return
+        # Do not skip over the "Run" column here: indexAt still maps to the row; otherwise fast
+        # diagonal drags miss rows. Run is ignored only on press (try_begin).
+        cur = self._profile_row_at_viewport_pos(viewport_pos)
+        if cur is None:
+            return
+        last = self._lmb_select_last_row
+        self._lmb_select_last_row = cur
+        if last is None:
+            self._lmb_select_visit_row_range(cur, cur)
+        else:
+            self._lmb_select_visit_row_range(last, cur)
+
+    def _lmb_select_end(self, viewport_pos) -> None:
+        if not self._lmb_select_active:
+            return
+        self._lmb_select_active = False
+        self._lmb_select_additive = False
+        self._lmb_select_base.clear()
+        self._lmb_select_visited.clear()
+        self._lmb_select_last_row = None
+        try:
+            self.profiles_list.viewport().releaseMouse()
+        except Exception:
+            pass
+        vp = self.profiles_list.viewport()
+        if vp.rect().contains(viewport_pos):
+            row = self._profile_row_at_viewport_pos(viewport_pos)
+        else:
+            row = None
+        if row is not None:
+            pid = self._pid_at_list_row(row)
+            if pid and self._profile_id_to_item.get(pid):
+                it = self._profile_id_to_item[pid]
+                self.profiles_list.setCurrentItem(it, QItemSelectionModel.SelectionFlag.Current)
+                self.profiles_list.scrollToItem(it)
 
     def _batch_profile_ids(self) -> list[str]:
-        if self._checked_profile_ids:
-            return list(self._checked_profile_ids)
-        return self._selected_profile_ids()
-
-    def _on_profiles_list_selection_changed(self) -> None:
-        if self._syncing_selection_check:
-            return
-
-        selected_ids: set[str] = set()
-        for it in self.profiles_list.selectedItems():
-            pid = it.data(Qt.ItemDataRole.UserRole)
-            if pid:
-                selected_ids.add(str(pid))
-
-        # Keep checked ids exactly equal to current selection.
-        self._checked_profile_ids = set(selected_ids)
-
-        self._syncing_selection_check = True
-        try:
-            for pid, cb in self._profile_id_to_checkbox.items():
-                cb.setChecked(pid in selected_ids)
-        finally:
-            self._syncing_selection_check = False
-
-    def eventFilter(self, watched: object, event: object) -> bool:  # type: ignore[override]
-        # Drag-select checkboxes by "painting" while holding LMB.
-        if hasattr(self, "profiles_list") and watched is self.profiles_list.viewport():
-            try:
-                if isinstance(event, QMouseEvent):
-                    if event.type() == event.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
-                        cb = self._checkbox_at_viewport_pos(event.position().toPoint())
-                        if cb:
-                            pid = self._profile_id_at_viewport_pos(event.position().toPoint())
-                            if pid:
-                                self._drag_check_active = True
-                                self._drag_check_value = not cb.isChecked()
-                                self._drag_check_touched = {pid}
-                                self._set_profile_selected(pid, self._drag_check_value)
-                                return True
-                    if event.type() == event.Type.MouseMove and (event.buttons() & Qt.MouseButton.LeftButton):
-                        if self._drag_check_active:
-                            pid = self._profile_id_at_viewport_pos(event.position().toPoint())
-                            if pid and pid not in self._drag_check_touched:
-                                self._drag_check_touched.add(pid)
-                                self._set_profile_selected(pid, self._drag_check_value)
-                            return True
-                    if event.type() == event.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
-                        if self._drag_check_active:
-                            self._drag_check_active = False
-                            self._drag_check_touched.clear()
-                            return True
-            except Exception:
-                # Never break list interaction.
-                pass
-        return super().eventFilter(watched, event)
-
-        if self._active_profile_id:
-            it = self._profile_id_to_item.get(self._active_profile_id)
-            if it is not None:
-                self.profiles_list.setCurrentItem(it)
-        self._sync_proxy_health_badge()
+        """
+        IDs for batch actions (launch / delete / export): union of checked rows and Qt list selection.
+        Order follows the visible list top-to-bottom, then any ids not currently visible (e.g. search filter).
+        """
+        want: set[str] = set(self._checked_profile_ids)
+        want.update(self._selected_profile_ids())
+        if not want:
+            return []
+        ordered = [pid for pid in self._profile_ids_in_list_widget_order() if pid in want]
+        for pid in want:
+            if pid not in ordered:
+                ordered.append(pid)
+        return ordered
 
     def _is_runner_thread_active(self, profile_id: str) -> bool:
         r = self._runners.get(profile_id)
@@ -1349,7 +1427,7 @@ class MainWindow(QMainWindow):
         if self._active_profile_id:
             it = self._profile_id_to_item.get(self._active_profile_id)
             if it is not None:
-                self.profiles_list.setCurrentItem(it)
+                self.profiles_list.setCurrentItem(it, QItemSelectionModel.SelectionFlag.Current)
         self._load_active_profile_into_form()
 
     def _run_button_clicked(self, profile_id: str) -> None:
@@ -1397,32 +1475,44 @@ class MainWindow(QMainWindow):
         self._active_profile_id = str(pid)
         self._load_active_profile_into_form()
 
-    def _on_profile_item_clicked(self, item: QListWidgetItem) -> None:
-        pid = item.data(Qt.ItemDataRole.UserRole)
-        if not pid:
-            return
-        self._select_profile(str(pid))
-
-    def _select_profile(self, profile_id: str) -> None:
-        it = self._profile_id_to_item.get(profile_id)
-        if not it:
-            return
-        self.profiles_list.setCurrentItem(it)
-        self.profiles_list.scrollToItem(it)
-        self._active_profile_id = profile_id
-        self._load_active_profile_into_form()
-
     def eventFilter(self, watched: object, event: object) -> bool:  # type: ignore[override]
-        # Forward click from embedded row widgets to the list selection.
+        # LMB-only "paint" selection over profile rows (Ctrl = add to existing). Run/scroll bar pass through.
         try:
-            if getattr(event, "type", None) and event.type() == event.Type.MouseButtonPress:  # type: ignore[attr-defined]
-                pid = self._profile_row_widget_to_id.get(id(watched))
-                if pid:
-                    self._select_profile(pid)
+            if not hasattr(self, "profiles_list"):
+                return super().eventFilter(watched, event)
+            if not isinstance(watched, QWidget):
+                return super().eventFilter(watched, event)
+            if not self.profiles_list.isAncestorOf(watched):
+                return super().eventFilter(watched, event)
+            if isinstance(watched, QScrollBar):
+                return super().eventFilter(watched, event)
+            if isinstance(watched, QPushButton) and self._run_buttons and any(watched is b for b in self._run_buttons.values()):
+                return super().eventFilter(watched, event)
+            if not isinstance(event, QMouseEvent):
+                return super().eventFilter(watched, event)
+
+            vp = self.profiles_list.viewport()
+            vp_pos = vp.mapFromGlobal(event.globalPosition().toPoint())
+            et = event.type()
+
+            if et == event.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                if self._lmb_select_active:
+                    self._lmb_select_end(vp_pos)
                     return True
+                return False
+
+            if et == event.Type.MouseMove and (event.buttons() & Qt.MouseButton.LeftButton):
+                if self._lmb_select_active:
+                    self._lmb_select_update_hover(vp_pos)
+                    return True
+                return False
+
+            if et == event.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                if self._lmb_select_try_begin(vp_pos, event.modifiers()):
+                    return True
+                return False
         except Exception:
-            # Best-effort; never break UI interaction.
-            return False
+            pass
         return super().eventFilter(watched, event)
 
     def _load_active_profile_into_form(self) -> None:
@@ -1782,13 +1872,30 @@ class MainWindow(QMainWindow):
         seen: set[str] = set()
         for it in self.profiles_list.selectedItems():
             pid = it.data(Qt.ItemDataRole.UserRole)
-            if not pid:
+            if pid is None:
                 continue
-            s = str(pid)
+            s = str(pid).strip()
+            if not s:
+                continue
             if s not in seen:
                 seen.add(s)
                 ids.append(s)
         return ids
+
+    def _profile_ids_in_list_widget_order(self) -> list[str]:
+        out: list[str] = []
+        for i in range(self.profiles_list.count()):
+            it = self.profiles_list.item(i)
+            if not it:
+                continue
+            raw = it.data(Qt.ItemDataRole.UserRole)
+            if raw is None:
+                continue
+            s = str(raw).strip()
+            if not s:
+                continue
+            out.append(s)
+        return out
 
     def _delete_profile(self) -> None:
         ids = self._batch_profile_ids()
