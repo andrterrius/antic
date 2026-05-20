@@ -5,10 +5,10 @@ import threading
 import uuid
 from dataclasses import replace
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-from PyQt6.QtCore import QPoint, QItemSelectionModel, QObject, Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtCore import QPoint, QItemSelectionModel, QObject, QSize, Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QFont, QFontMetrics, QMouseEvent, QTextDocument, QTextOption
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -325,28 +326,193 @@ class ProfilesArchiveImportThread(QThread):
             self.failed.emit(str(e).strip() or "Ошибка импорта архива")
 
 
+def _tag_chip_object_name(tag: str) -> str:
+    """Имя objectName для QSS: ошибка — красный, успех — зелёный, иначе дефолт."""
+    t = tag.casefold()
+    if "ошибка" in t:
+        return "tagChipError"
+    if "успех" in t or "успешный" in t:
+        return "tagChipSuccess"
+    return "tagChip"
+
+
 class _TagChip(QFrame):
-    """Отображение одного тега с кнопкой удаления."""
+    """Отображение одного тега; в редакторе — с кнопкой удаления."""
 
     removed = pyqtSignal(str)
 
-    def __init__(self, tag: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        tag: str,
+        parent: QWidget | None = None,
+        *,
+        removable: bool = True,
+        fixed_width: int | None = None,
+    ) -> None:
         super().__init__(parent)
         self._tag = tag
-        self.setObjectName("tagChip")
+        self.setObjectName(_tag_chip_object_name(tag))
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(8, 2, 2, 2)
         lay.setSpacing(0)
         lbl = QLabel(tag)
-        close_btn = QPushButton("×")
-        close_btn.setObjectName("tagChipClose")
-        close_btn.setFixedSize(22, 22)
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.setToolTip("Удалить тег")
-        close_btn.clicked.connect(lambda: self.removed.emit(self._tag))
-        lay.addWidget(lbl, 0)
-        lay.addWidget(close_btn, 0)
-        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        lbl.setWordWrap(True)
+        lbl.setToolTip(tag)
+        lbl.ensurePolished()
+        chip_font = lbl.font()
+        if fixed_width is not None:
+            inner = max(1, fixed_width - _tag_chip_horizontal_pad(removable=removable))
+            text_w = max(1, inner - _TAG_CHIP_LBL_PAD_H * 2)
+            lbl.setMinimumWidth(inner)
+            lbl.setMaximumWidth(inner)
+            lbl.setMinimumHeight(_tag_chip_text_height(tag, text_w, chip_font))
+            lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.MinimumExpanding)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+            need_h = _tag_chip_content_height(tag, fixed_width, chip_font, removable=removable)
+            self.setMinimumHeight(need_h)
+        if removable:
+            lay.setContentsMargins(
+                _TAG_CHIP_MARGIN_H, _TAG_CHIP_MARGIN_V, 6, _TAG_CHIP_MARGIN_V
+            )
+            close_btn = QPushButton("×")
+            close_btn.setObjectName("tagChipClose")
+            close_btn.setFixedSize(22, 22)
+            close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            close_btn.setToolTip("Удалить тег")
+            close_btn.clicked.connect(lambda: self.removed.emit(self._tag))
+            lay.addWidget(lbl, 1)
+            lay.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignTop)
+        else:
+            lay.setContentsMargins(
+                _TAG_CHIP_MARGIN_H,
+                _TAG_CHIP_MARGIN_V,
+                _TAG_CHIP_MARGIN_H,
+                _TAG_CHIP_MARGIN_V,
+            )
+            lay.addWidget(lbl, 1)
+        if fixed_width is None:
+            self.setMinimumHeight(_tag_chip_min_height(lbl.font()))
+        if fixed_width is not None:
+            self.setFixedWidth(fixed_width)
+            self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
+        else:
+            self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Minimum)
+
+
+_PROFILE_TAGS_PER_ROW = 2
+_PROFILE_TAG_CHIP_MIN_WIDTH = 88
+_PROFILE_TAG_CHIP_MAX_WIDTH = 200
+_PROFILE_TAG_ROW_SPACING = 6
+_PROFILE_TAGS_SCROLL_MAX_H = 220
+_TAG_CHIP_MARGIN_H = 12
+_TAG_CHIP_MARGIN_V = 5
+_TAG_CHIP_LBL_PAD_H = 10
+_TAG_CHIP_LBL_PAD_V = 4
+_TAG_CHIP_BORDER_W = 2
+_TAG_CHIP_HEIGHT_SLACK = 2
+
+
+def _tag_chip_horizontal_pad(*, removable: bool) -> int:
+    """Сумма отступов слева/справа + padding QLabel + рамка QFrame."""
+    side = _TAG_CHIP_MARGIN_H * 2 + _TAG_CHIP_LBL_PAD_H * 2 + _TAG_CHIP_BORDER_W
+    if removable:
+        return side + 22 + 6
+    return side
+
+
+def _tag_chip_text_height(tag: str, text_w: int, font: QFont) -> int:
+    doc = QTextDocument()
+    doc.setDefaultFont(font)
+    doc.setDocumentMargin(0)
+    opt = QTextOption()
+    opt.setWrapMode(QTextOption.WrapMode.WrapAnywhere)
+    doc.setDefaultTextOption(opt)
+    doc.setPlainText(tag)
+    doc.setTextWidth(float(max(1, text_w)))
+    return int(doc.size().height())
+
+
+def _tag_chip_vertical_extras() -> int:
+    return 2 * (_TAG_CHIP_LBL_PAD_V + _TAG_CHIP_MARGIN_V) + _TAG_CHIP_HEIGHT_SLACK
+
+
+def _tag_chip_min_height(font) -> int:
+    return QFontMetrics(font).height() + _tag_chip_vertical_extras()
+
+
+def _profile_list_tag_chip_width(tags: list[str], font, *, removable: bool = False) -> int:
+    fm = QFontMetrics(font)
+    pad = _tag_chip_horizontal_pad(removable=removable)
+    max_text = max((fm.horizontalAdvance(t) for t in tags), default=0)
+    natural = max_text + pad
+    capped = min(natural, _PROFILE_TAG_CHIP_MAX_WIDTH)
+    return max(_PROFILE_TAG_CHIP_MIN_WIDTH, capped)
+
+
+def _tag_chip_content_height(tag: str, chip_w: int, font: QFont, *, removable: bool) -> int:
+    inner = max(1, chip_w - _tag_chip_horizontal_pad(removable=removable))
+    text_w = max(1, inner - _TAG_CHIP_LBL_PAD_H * 2)
+    return _tag_chip_text_height(tag, text_w, font) + _tag_chip_vertical_extras()
+
+
+def _make_profile_tags_widget(
+    tags: list[str],
+    parent: QWidget | None = None,
+    *,
+    removable: bool = False,
+    on_removed: Callable[[str], None] | None = None,
+) -> QWidget:
+    """Чипы тегов: 2 колонки, одинаковая ширина, перенос по рядам."""
+    w = QWidget(parent)
+    cols = _PROFILE_TAGS_PER_ROW
+    grid = QGridLayout(w)
+    grid.setContentsMargins(0, 0, 0, 0)
+    grid.setHorizontalSpacing(_PROFILE_TAG_ROW_SPACING)
+    grid.setVerticalSpacing(4)
+    chip_w = _profile_list_tag_chip_width(tags, w.font(), removable=removable)
+    for c in range(cols):
+        grid.setColumnMinimumWidth(c, chip_w)
+        grid.setColumnStretch(c, 1)
+    block_w = cols * chip_w + (cols - 1) * _PROFILE_TAG_ROW_SPACING
+    w.setFixedWidth(block_w)
+    row_heights: dict[int, int] = {}
+    pending: list[tuple[int, int, _TagChip]] = []
+    for idx, tag in enumerate(tags):
+        row_i = idx // cols
+        col_i = idx % cols
+        chip = _TagChip(tag, w, removable=removable, fixed_width=chip_w)
+        if removable and on_removed is not None:
+            chip.removed.connect(on_removed)
+        row_heights[row_i] = max(row_heights.get(row_i, 0), chip.minimumHeight())
+        pending.append((row_i, col_i, chip))
+    for row_i, col_i, chip in pending:
+        chip.setMinimumHeight(row_heights[row_i])
+        grid.addWidget(chip, row_i, col_i, Qt.AlignmentFlag.AlignTop)
+    for row_i, mh in row_heights.items():
+        grid.setRowMinimumHeight(row_i, mh)
+    grid_h = sum(row_heights.values()) + max(0, len(row_heights) - 1) * grid.verticalSpacing()
+    w.setMinimumHeight(grid_h)
+    w.adjustSize()
+    return w
+
+
+def _profile_tags_grid_height(
+    tags: list[str],
+    font,
+    chip_w: int,
+    *,
+    removable: bool = False,
+) -> int:
+    if not tags:
+        return 36
+    cols = _PROFILE_TAGS_PER_ROW
+    total = 4
+    for i in range(0, len(tags), cols):
+        row_tags = tags[i : i + cols]
+        row_h = max(_tag_chip_content_height(t, chip_w, font, removable=removable) for t in row_tags)
+        total += row_h
+        if i + cols < len(tags):
+            total += 4
+    return max(36, total)
 
 
 class MainWindow(QMainWindow):
@@ -462,11 +628,21 @@ class MainWindow(QMainWindow):
             it = lay.takeAt(0)
             if w := it.widget():
                 w.deleteLater()
-        for tag in self._editable_tags:
-            chip = _TagChip(tag, self)
-            chip.removed.connect(self._on_tag_chip_removed)
-            lay.addWidget(chip)
-        lay.addStretch(1)
+        if self._editable_tags:
+            lay.addWidget(
+                _make_profile_tags_widget(
+                    self._editable_tags,
+                    self._tags_chips_host,
+                    removable=True,
+                    on_removed=self._on_tag_chip_removed,
+                ),
+                0,
+            )
+        chip_w = _profile_list_tag_chip_width(self._editable_tags, self._tags_chips_host.font(), removable=True)
+        h = _profile_tags_grid_height(
+            self._editable_tags, self._tags_chips_host.font(), chip_w, removable=True
+        )
+        self._tags_scroll.setFixedHeight(min(h, _PROFILE_TAGS_SCROLL_MAX_H))
 
     def _on_tag_chip_removed(self, tag: str) -> None:
         try:
@@ -629,18 +805,18 @@ class MainWindow(QMainWindow):
         self.ed_webgl_slv = QLineEdit()
         self.ed_webgl_slv.setPlaceholderText("WebGL GLSL ES 1.0 … — по умолчанию")
 
-        chips_inner = QWidget()
-        self._tags_chips_layout = QHBoxLayout(chips_inner)
+        self._tags_chips_host = QWidget()
+        self._tags_chips_layout = QVBoxLayout(self._tags_chips_host)
         self._tags_chips_layout.setContentsMargins(0, 0, 0, 0)
-        self._tags_chips_layout.setSpacing(6)
+        self._tags_chips_layout.setSpacing(0)
 
         self._tags_scroll = QScrollArea()
         self._tags_scroll.setWidgetResizable(True)
-        self._tags_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._tags_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._tags_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._tags_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._tags_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._tags_scroll.setFixedHeight(36)
-        self._tags_scroll.setWidget(chips_inner)
+        self._tags_scroll.setWidget(self._tags_chips_host)
 
         self.ed_tag_add = QLineEdit()
         self.ed_tag_add.setPlaceholderText("Новый тег — Enter; несколько через запятую")
@@ -1167,16 +1343,29 @@ class MainWindow(QMainWindow):
             self._profile_id_to_checkbox[p.profile_id] = cb
             cb.stateChanged.connect(lambda _state, pid=p.profile_id: self._on_profile_checkbox_state_changed(pid))
 
-            tag_hint = ""
-            if p.tags:
-                joined = ", ".join(p.tags)
-                if len(joined) > 48:
-                    joined = joined[:45] + "…"
-                tag_hint = f"  [{joined}]"
-            lbl = QLabel(f"{p.name}{tag_hint}  ({p.profile_id})")
-            lbl.setObjectName("profileRowTitle")
+            title_lbl = QLabel(f"{p.name}  ({p.profile_id})")
+            title_lbl.setObjectName("profileRowTitle")
             # Только клавиатура: мышью — клик открывает настройки, перетаскивание — групповое выделение.
-            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByKeyboard)
+            title_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByKeyboard)
+
+            info = QWidget()
+            info_l = QVBoxLayout(info)
+            info_l.setContentsMargins(0, 0, 0, 0)
+            info_l.setSpacing(4)
+            info_l.addWidget(title_lbl, 0)
+            desc_text = (p.description or "").strip()
+            if desc_text:
+                desc_lbl = QLabel(desc_text)
+                desc_lbl.setObjectName("profileRowDesc")
+                desc_lbl.setWordWrap(True)
+                desc_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByKeyboard)
+                info_l.addWidget(desc_lbl, 0)
+            if p.tags:
+                tags_w = _make_profile_tags_widget(p.tags, info)
+                tags_w.adjustSize()
+                info_l.addWidget(tags_w, 0, Qt.AlignmentFlag.AlignLeft)
+            info_l.addStretch(0)
+            info.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
 
             proxy_dot = QLabel("")
             proxy_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1193,11 +1382,14 @@ class MainWindow(QMainWindow):
             self._sync_run_button(p.profile_id)
 
             row_l.addWidget(cb, 0)
-            row_l.addWidget(lbl, 1)
+            row_l.addWidget(info, 1)
             row_l.addWidget(proxy_dot, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             row_l.addWidget(btn_run, 0, Qt.AlignmentFlag.AlignRight)
 
-            it.setSizeHint(row.sizeHint())
+            info.adjustSize()
+            row.adjustSize()
+            hint = row.minimumSizeHint()
+            it.setSizeHint(QSize(hint.width(), hint.height() + 6))
             self.profiles_list.setItemWidget(it, row)
 
         self.profiles_list.blockSignals(False)

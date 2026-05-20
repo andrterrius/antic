@@ -137,6 +137,11 @@ QLabel#hint {
     font-size: 11px;
 }
 
+QLabel#profileRowDesc {
+    color: #94a3b8;
+    font-size: 12px;
+}
+
 QScrollArea {
     background-color: transparent;
 }
@@ -227,7 +232,31 @@ QFrame#tagChip QLabel {
     font-size: 12px;
     border: none;
     background: transparent;
-    padding: 0 2px;
+    padding: 4px 10px;
+}
+QFrame#tagChipError {
+    background-color: rgba(190, 18, 60, 0.18);
+    border: 1px solid #be123c;
+    border-radius: 8px;
+}
+QFrame#tagChipError QLabel {
+    color: #fda4af;
+    font-size: 12px;
+    border: none;
+    background: transparent;
+    padding: 4px 10px;
+}
+QFrame#tagChipSuccess {
+    background-color: rgba(22, 163, 74, 0.18);
+    border: 1px solid #16a34a;
+    border-radius: 8px;
+}
+QFrame#tagChipSuccess QLabel {
+    color: #86efac;
+    font-size: 12px;
+    border: none;
+    background: transparent;
+    padding: 4px 10px;
 }
 QPushButton#tagChipClose {
     background: transparent;
