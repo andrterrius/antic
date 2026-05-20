@@ -232,7 +232,7 @@ QFrame#tagChip QLabel {
     font-size: 12px;
     border: none;
     background: transparent;
-    padding: 4px 10px;
+    padding: 4px 6px;
 }
 QFrame#tagChipError {
     background-color: rgba(190, 18, 60, 0.18);
@@ -244,7 +244,7 @@ QFrame#tagChipError QLabel {
     font-size: 12px;
     border: none;
     background: transparent;
-    padding: 4px 10px;
+    padding: 4px 6px;
 }
 QFrame#tagChipSuccess {
     background-color: rgba(22, 163, 74, 0.18);
@@ -256,7 +256,7 @@ QFrame#tagChipSuccess QLabel {
     font-size: 12px;
     border: none;
     background: transparent;
-    padding: 4px 10px;
+    padding: 4px 6px;
 }
 QPushButton#tagChipClose {
     background: transparent;
