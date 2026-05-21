@@ -137,6 +137,33 @@ QLabel#hint {
     font-size: 11px;
 }
 
+QLabel#profileRowTitle {
+    color: #e4e6ef;
+    font-weight: 400;
+    border: none;
+    background: transparent;
+}
+
+QLabel#profileRowTitleActive {
+    color: #f1f5f9;
+    font-weight: 700;
+    border: none;
+    background: transparent;
+}
+
+/* Строка списка: обычная / открыта в редакторе (клик по строке, не чекбокс) */
+QWidget#profileRow {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 10px;
+}
+
+QWidget#profileRowActive {
+    background-color: rgba(139, 92, 246, 0.12);
+    border: 2px solid #8b5cf6;
+    border-radius: 10px;
+}
+
 QLabel#profileRowDesc {
     color: #94a3b8;
     font-size: 12px;
@@ -217,8 +244,8 @@ QListWidget#profilesList::item:hover {
 }
 
 QListWidget#profilesList::item:selected {
-    background-color: rgba(99, 102, 241, 0.16);
-    border: 1px solid #6366f1;
+    background: transparent;
+    border: none;
 }
 
 /* Теги профиля (чипы) */

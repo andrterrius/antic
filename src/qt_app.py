@@ -644,6 +644,8 @@ class MainWindow(QMainWindow):
         self._editable_tags: list[str] = []
         self._checked_profile_ids: set[str] = set()
         self._profile_id_to_checkbox: dict[str, QCheckBox] = {}
+        self._profile_id_to_row: dict[str, QWidget] = {}
+        self._profile_id_to_title_label: dict[str, QLabel] = {}
         self._profile_row_filter_widgets: set[QWidget] = set()
         self._syncing_selection_check: bool = False
         # LMB «краска» по чекбоксам (Ctrl — добавить к уже отмеченным).
@@ -840,6 +842,10 @@ class MainWindow(QMainWindow):
 
         list_sel_row = QHBoxLayout()
         list_sel_row.addStretch(1)
+        self.lbl_checked_profiles_count = QLabel("Выделено: 0")
+        self.lbl_checked_profiles_count.setObjectName("hint")
+        self.lbl_checked_profiles_count.setToolTip("Число профилей с отмеченным квадратиком в списке")
+        list_sel_row.addWidget(self.lbl_checked_profiles_count)
         self.btn_clear_profile_selection = QPushButton("Снять выделение")
         self.btn_clear_profile_selection.setObjectName("secondary")
         self.btn_clear_profile_selection.setToolTip("Убрать все отметки и выделение в списке профилей")
@@ -1515,6 +1521,8 @@ class MainWindow(QMainWindow):
         self._run_buttons.clear()
         self._profile_id_to_item.clear()
         self._profile_id_to_checkbox.clear()
+        self._profile_id_to_row.clear()
+        self._profile_id_to_title_label.clear()
         self._profile_row_filter_widgets.clear()
 
         matched: list[tuple[int, BrowserProfile]] = []
@@ -1532,6 +1540,10 @@ class MainWindow(QMainWindow):
             self._profile_id_to_item[p.profile_id] = it
 
             row = QWidget()
+            row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            is_active_row = p.profile_id == self._active_profile_id
+            row.setObjectName("profileRowActive" if is_active_row else "profileRow")
+            self._profile_id_to_row[p.profile_id] = row
             row_l = QHBoxLayout(row)
             row_l.setContentsMargins(10, 6, 10, 6)
             row_l.setSpacing(10)
@@ -1546,7 +1558,10 @@ class MainWindow(QMainWindow):
             cb.installEventFilter(self)
 
             title_lbl = QLabel(f"{p.name}  ({p.profile_id})")
-            title_lbl.setObjectName("profileRowTitle")
+            title_lbl.setObjectName(
+                "profileRowTitleActive" if is_active_row else "profileRowTitle"
+            )
+            self._profile_id_to_title_label[p.profile_id] = title_lbl
             # Только клавиатура: мышью — клик открывает настройки, перетаскивание — групповое выделение.
             title_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByKeyboard)
 
@@ -1597,6 +1612,7 @@ class MainWindow(QMainWindow):
 
         self.profiles_list.blockSignals(False)
         self._apply_profile_list_selection_visuals()
+        self._apply_active_profile_row_visuals()
 
         if self._active_profile_id:
             ac_it = self._profile_id_to_item.get(self._active_profile_id)
@@ -1629,19 +1645,41 @@ class MainWindow(QMainWindow):
             return True
         return watched in self._profile_row_filter_widgets
 
+    @staticmethod
+    def _repolish_widget(w: QWidget) -> None:
+        st = w.style()
+        st.unpolish(w)
+        st.polish(w)
+        w.update()
+
+    def _apply_active_profile_row_visuals(self) -> None:
+        """Подсветка профиля, открытого в редакторе (не путать с отметками чекбоксов)."""
+        active = self._active_profile_id
+        for pid, row in self._profile_id_to_row.items():
+            is_active = pid == active
+            row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            row.setObjectName("profileRowActive" if is_active else "profileRow")
+            self._repolish_widget(row)
+        for pid, lbl in self._profile_id_to_title_label.items():
+            lbl.setObjectName("profileRowTitleActive" if pid == active else "profileRowTitle")
+            self._repolish_widget(lbl)
+
+    def _update_checked_profiles_count_label(self) -> None:
+        n = len(self._checked_profile_ids)
+        self.lbl_checked_profiles_count.setText(f"Выделено: {n}")
+
     def _apply_profile_list_selection_visuals(self) -> None:
         existing = {p.profile_id for p in self._profiles}
         self._checked_profile_ids.intersection_update(existing)
         self._syncing_selection_check = True
         try:
-            for pid, it in self._profile_id_to_item.items():
-                it.setSelected(pid in self._checked_profile_ids)
             for _pid, cb in self._profile_id_to_checkbox.items():
                 cb.blockSignals(True)
                 cb.setChecked(_pid in self._checked_profile_ids)
                 cb.blockSignals(False)
         finally:
             self._syncing_selection_check = False
+        self._update_checked_profiles_count_label()
 
     def _on_profile_checkbox_state_changed(self, profile_id: str) -> None:
         if self._syncing_selection_check:
@@ -1653,13 +1691,7 @@ class MainWindow(QMainWindow):
             self._checked_profile_ids.add(profile_id)
         else:
             self._checked_profile_ids.discard(profile_id)
-        it = self._profile_id_to_item.get(profile_id)
-        self._syncing_selection_check = True
-        try:
-            if it is not None:
-                it.setSelected(cb.isChecked())
-        finally:
-            self._syncing_selection_check = False
+        self._update_checked_profiles_count_label()
 
     def _on_profiles_list_item_selection_changed(self) -> None:
         """Синхронизировать подсветку строк только с чекбоксами (клик по строке не меняет отметки)."""
@@ -1868,6 +1900,7 @@ class MainWindow(QMainWindow):
         if it is None:
             return
         self._active_profile_id = pid
+        self._apply_active_profile_row_visuals()
         self._set_current_profile_list_item(it)
         self._load_active_profile_into_form()
 
@@ -1969,12 +2002,15 @@ class MainWindow(QMainWindow):
     def _on_profile_current_changed(self, current: QListWidgetItem | None, _prev: QListWidgetItem | None) -> None:
         if not current:
             self._active_profile_id = None
+            self._apply_active_profile_row_visuals()
             return
         pid = current.data(Qt.ItemDataRole.UserRole)
         if not pid:
             self._active_profile_id = None
+            self._apply_active_profile_row_visuals()
             return
         self._active_profile_id = str(pid)
+        self._apply_active_profile_row_visuals()
         self._load_active_profile_into_form()
 
     def _profiles_list_mouse_vp_pos(self, watched: QWidget, event: QMouseEvent) -> QPoint:
