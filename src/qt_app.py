@@ -644,14 +644,18 @@ class MainWindow(QMainWindow):
         self._editable_tags: list[str] = []
         self._checked_profile_ids: set[str] = set()
         self._profile_id_to_checkbox: dict[str, QCheckBox] = {}
+        self._profile_row_filter_widgets: set[QWidget] = set()
         self._syncing_selection_check: bool = False
-        # LMB "paint" selection: only rows visited while left button is held (Ctrl = add to prior selection).
+        # LMB «краска» по чекбоксам (Ctrl — добавить к уже отмеченным).
         self._lmb_select_active: bool = False
         self._lmb_select_additive: bool = False
         self._lmb_select_base: set[str] = set()
         self._lmb_select_visited: set[str] = set()
         self._lmb_select_last_row: int | None = None
-        # Клик по подписи (имя+id): без выделения открывает редактор; с перетаскиванием — «краска» выделения.
+        self._checkbox_row_pending: int | None = None
+        self._checkbox_press_global: QPoint | None = None
+        self._checkbox_press_modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier
+        # Клик по строке (не чекбокс): открыть настройки без отметки.
         self._title_row_pending: int | None = None
         self._title_press_global: QPoint | None = None
         self._title_press_modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier
@@ -845,14 +849,15 @@ class MainWindow(QMainWindow):
 
         self.profiles_list = QListWidget()
         self.profiles_list.setObjectName("profilesList")
-        # Выделение: ЛКМ с перетаскиванием по строке (не по подписи — см. eventFilter); Ctrl — добавить.
-        # Клик по подписи (имя+id): только открыть настройки без выделения; с движением — «краска».
+        # Отметка — только чекбокс (клики по строке перехватывает eventFilter).
         self.profiles_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
         self.profiles_list.setMouseTracking(True)
         self.profiles_list.viewport().setMouseTracking(True)
         self.profiles_list.currentItemChanged.connect(self._on_profile_current_changed)
         self.profiles_list.itemSelectionChanged.connect(self._on_profiles_list_item_selection_changed)
         self.profiles_list.installEventFilter(self)
+        # После grabMouse() события идут во viewport, не в QListWidget.
+        self.profiles_list.viewport().installEventFilter(self)
         list_layout.addWidget(self.profiles_list, 1)
 
         launch_box = QGroupBox("Запуск")
@@ -969,6 +974,7 @@ class MainWindow(QMainWindow):
 
         self.btn_tag_add = QPushButton("Добавить")
         self.btn_tag_add.setObjectName("secondary")
+        self.btn_tag_add.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.btn_tag_add.clicked.connect(self._on_commit_new_tags)
         self.ed_tag_add.returnPressed.connect(self._on_commit_new_tags)
         tag_add_row = QHBoxLayout()
@@ -1104,7 +1110,17 @@ class MainWindow(QMainWindow):
         l2.addWidget(editor, 0)
         profile_settings_col = QWidget()
         profile_settings_col.setLayout(l2)
-        profile_settings_col.setMinimumWidth(280)
+        # Строка тегов (подпись + поле + «Добавить») и поля формы — не уже их minimumWidth.
+        _form_label_w = max(
+            _fm.horizontalAdvance(t)
+            for t in ("Прокси (пароль)", "Прокси (сервер)", "Страна прокси", "Отпечаток")
+        )
+        _settings_min_w = max(
+            _lab_w + tags_row.spacing() + self._tags_input_block.minimumWidth() + 24,
+            _form_label_w + form.horizontalSpacing() + 420 + 24,
+        )
+        profile_settings_col.setMinimumWidth(_settings_min_w)
+        editor.setMinimumWidth(_settings_min_w)
         self._profiles_splitter.addWidget(profile_settings_col)
         self._profiles_splitter.setStretchFactor(0, 2)
         self._profiles_splitter.setStretchFactor(1, 1)
@@ -1415,7 +1431,24 @@ class MainWindow(QMainWindow):
         self._import_health_thread.finished_payload.connect(on_done)
         self._import_health_thread.start()
 
+    def _profiles_list_vscroll(self) -> int:
+        return int(self.profiles_list.verticalScrollBar().value())
+
+    def _set_profiles_list_vscroll(self, value: int) -> None:
+        self.profiles_list.verticalScrollBar().setValue(value)
+
+    def _set_current_profile_list_item(self, it: QListWidgetItem) -> None:
+        """Текущий профиль в списке без смены позиции прокрутки."""
+        scroll = self._profiles_list_vscroll()
+        self.profiles_list.blockSignals(True)
+        try:
+            self.profiles_list.setCurrentItem(it, QItemSelectionModel.SelectionFlag.Current)
+        finally:
+            self.profiles_list.blockSignals(False)
+        self._set_profiles_list_vscroll(scroll)
+
     def _refresh_profiles_list(self) -> None:
+        list_scroll = self._profiles_list_vscroll()
         q_raw = (self.ed_profiles_search.text() if hasattr(self, "ed_profiles_search") else "") or ""
         tokens = [t for t in q_raw.lower().strip().split() if t]
 
@@ -1482,6 +1515,7 @@ class MainWindow(QMainWindow):
         self._run_buttons.clear()
         self._profile_id_to_item.clear()
         self._profile_id_to_checkbox.clear()
+        self._profile_row_filter_widgets.clear()
 
         matched: list[tuple[int, BrowserProfile]] = []
         for i, p in enumerate(self._profiles):
@@ -1504,9 +1538,12 @@ class MainWindow(QMainWindow):
 
             cb = QCheckBox()
             cb.setChecked(p.profile_id in self._checked_profile_ids)
-            cb.setToolTip("Отражает выделение; выделяйте строки, удерживая ЛКМ и ведя курсор по списку (Ctrl — добавить к выделению).")
+            cb.setToolTip(
+                "Отметить профиль. Удерживайте ЛКМ и ведите по квадратам — отметятся все на пути (Ctrl — добавить)."
+            )
             self._profile_id_to_checkbox[p.profile_id] = cb
             cb.stateChanged.connect(lambda _state, pid=p.profile_id: self._on_profile_checkbox_state_changed(pid))
+            cb.installEventFilter(self)
 
             title_lbl = QLabel(f"{p.name}  ({p.profile_id})")
             title_lbl.setObjectName("profileRowTitle")
@@ -1556,6 +1593,7 @@ class MainWindow(QMainWindow):
             hint = row.minimumSizeHint()
             it.setSizeHint(QSize(hint.width(), hint.height() + 6))
             self.profiles_list.setItemWidget(it, row)
+            self._register_profile_row_mouse_targets(row, cb, btn_run)
 
         self.profiles_list.blockSignals(False)
         self._apply_profile_list_selection_visuals()
@@ -1563,8 +1601,33 @@ class MainWindow(QMainWindow):
         if self._active_profile_id:
             ac_it = self._profile_id_to_item.get(self._active_profile_id)
             if ac_it is not None:
-                self.profiles_list.setCurrentItem(ac_it, QItemSelectionModel.SelectionFlag.Current)
+                self._set_current_profile_list_item(ac_it)
+        self._set_profiles_list_vscroll(list_scroll)
         self._sync_proxy_health_badge()
+
+    def _register_profile_row_mouse_targets(
+        self, row: QWidget, cb: QCheckBox, btn_run: QPushButton
+    ) -> None:
+        """Фильтр на виджеты строки: клики по тексту не должны попадать в QListWidget как выделение."""
+        targets: list[QWidget] = [row]
+        for ch in row.findChildren(QWidget):
+            if ch is cb or ch is btn_run:
+                continue
+            targets.append(ch)
+        for w in targets:
+            w.installEventFilter(self)
+            self._profile_row_filter_widgets.add(w)
+
+    def _profiles_list_mouse_filter_active(self, watched: object) -> bool:
+        if not hasattr(self, "profiles_list") or not isinstance(watched, QWidget):
+            return False
+        if watched is self.profiles_list.viewport():
+            return True
+        if isinstance(watched, QCheckBox) and watched in self._profile_id_to_checkbox.values():
+            return True
+        if watched is self.profiles_list:
+            return True
+        return watched in self._profile_row_filter_widgets
 
     def _apply_profile_list_selection_visuals(self) -> None:
         existing = {p.profile_id for p in self._profiles}
@@ -1599,30 +1662,10 @@ class MainWindow(QMainWindow):
             self._syncing_selection_check = False
 
     def _on_profiles_list_item_selection_changed(self) -> None:
-        """Строка выделена в списке — отметить соответствующие чекбоксы (и наоборот снять при снятии выделения)."""
+        """Синхронизировать подсветку строк только с чекбоксами (клик по строке не меняет отметки)."""
         if self._syncing_selection_check:
             return
-        existing = {p.profile_id for p in self._profiles}
-        visible = set(self._profile_ids_in_list_widget_order())
-        qt_sel: set[str] = set()
-        for it in self.profiles_list.selectedItems():
-            raw = it.data(Qt.ItemDataRole.UserRole)
-            if raw is None:
-                continue
-            s = str(raw).strip()
-            if s:
-                qt_sel.add(s)
-        qt_sel &= existing
-        # Профили «вне» текущего отфильтрованного списка оставляем в наборе; видимые строки берём из Qt.
-        self._checked_profile_ids = ((self._checked_profile_ids & existing) - visible) | qt_sel
-        self._syncing_selection_check = True
-        try:
-            for _pid, cb in self._profile_id_to_checkbox.items():
-                cb.blockSignals(True)
-                cb.setChecked(_pid in self._checked_profile_ids)
-                cb.blockSignals(False)
-        finally:
-            self._syncing_selection_check = False
+        self._apply_profile_list_selection_visuals()
 
     def _run_button_at_viewport_pos(self, pos) -> QPushButton | None:
         it = self.profiles_list.itemAt(pos)
@@ -1720,14 +1763,46 @@ class MainWindow(QMainWindow):
         self._lmb_select_visit_row_range(row, row)
         return True
 
-    def _lmb_select_try_begin(self, viewport_pos, modifiers: Qt.KeyboardModifier) -> bool:
-        if self._run_button_at_viewport_pos(viewport_pos):
-            return False
-        if self._checkbox_at_viewport_pos(viewport_pos):
-            return False
-        row = self._profile_row_at_viewport_pos(viewport_pos)
+    def _row_for_profile_checkbox(self, cb: QCheckBox) -> int | None:
+        for pid, box in self._profile_id_to_checkbox.items():
+            if box is cb:
+                it = self._profile_id_to_item.get(pid)
+                if it is not None:
+                    return self.profiles_list.row(it)
+        return None
+
+    def _toggle_profile_checkbox_row(self, row: int) -> None:
+        pid = self._pid_at_list_row(row)
+        if not pid:
+            return
+        if pid in self._checked_profile_ids:
+            self._checked_profile_ids.discard(pid)
+        else:
+            self._checked_profile_ids.add(pid)
+        self._apply_profile_list_selection_visuals()
+
+    def _clear_checkbox_click_pending(self) -> None:
+        self._checkbox_row_pending = None
+        self._checkbox_press_global = None
+        self._checkbox_press_modifiers = Qt.KeyboardModifier.NoModifier
+
+    def _begin_checkbox_click_pending(
+        self, row: int, global_pos: QPoint, modifiers: Qt.KeyboardModifier
+    ) -> None:
+        self._clear_checkbox_click_pending()
+        self._checkbox_row_pending = row
+        self._checkbox_press_global = global_pos
+        self._checkbox_press_modifiers = modifiers
+        try:
+            self.profiles_list.viewport().grabMouse()
+        except Exception:
+            pass
+
+    def _try_begin_checkbox_paint_from_pending(self, modifiers: Qt.KeyboardModifier) -> bool:
+        row = self._checkbox_row_pending
         if row is None:
             return False
+        self._clear_checkbox_click_pending()
         return self._lmb_select_begin_at_row(row, modifiers)
 
     def _lmb_select_update_hover(self, viewport_pos) -> None:
@@ -1757,17 +1832,17 @@ class MainWindow(QMainWindow):
             self.profiles_list.viewport().releaseMouse()
         except Exception:
             pass
-        vp = self.profiles_list.viewport()
-        if vp.rect().contains(viewport_pos):
-            row = self._profile_row_at_viewport_pos(viewport_pos)
-        else:
-            row = None
-        if row is not None:
-            pid = self._pid_at_list_row(row)
-            if pid and self._profile_id_to_item.get(pid):
-                it = self._profile_id_to_item[pid]
-                self.profiles_list.setCurrentItem(it, QItemSelectionModel.SelectionFlag.Current)
-                self.profiles_list.scrollToItem(it)
+
+    def _finish_checkbox_click_without_drag(self) -> None:
+        try:
+            self.profiles_list.viewport().releaseMouse()
+        except Exception:
+            pass
+        row = self._checkbox_row_pending
+        self._clear_checkbox_click_pending()
+        if row is None or self._lmb_select_active:
+            return
+        self._toggle_profile_checkbox_row(row)
 
     def _clear_profile_title_click_pending(self) -> None:
         self._title_row_pending = None
@@ -1793,11 +1868,8 @@ class MainWindow(QMainWindow):
         if it is None:
             return
         self._active_profile_id = pid
-        self.profiles_list.blockSignals(True)
-        self.profiles_list.setCurrentItem(it, QItemSelectionModel.SelectionFlag.Current)
-        self.profiles_list.blockSignals(False)
+        self._set_current_profile_list_item(it)
         self._load_active_profile_into_form()
-        self.profiles_list.scrollToItem(it)
 
     def _batch_profile_ids(self) -> list[str]:
         """
@@ -1857,7 +1929,7 @@ class MainWindow(QMainWindow):
         if self._active_profile_id:
             it = self._profile_id_to_item.get(self._active_profile_id)
             if it is not None:
-                self.profiles_list.setCurrentItem(it, QItemSelectionModel.SelectionFlag.Current)
+                self._set_current_profile_list_item(it)
         self._load_active_profile_into_form()
 
     def _run_button_clicked(self, profile_id: str) -> None:
@@ -1905,14 +1977,42 @@ class MainWindow(QMainWindow):
         self._active_profile_id = str(pid)
         self._load_active_profile_into_form()
 
+    def _profiles_list_mouse_vp_pos(self, watched: QWidget, event: QMouseEvent) -> QPoint:
+        vp = self.profiles_list.viewport()
+        return vp.mapFrom(watched, event.position().toPoint())
+
+    def _profiles_list_handle_lmb_release(self, vp_pos: QPoint) -> bool:
+        if self._lmb_select_active:
+            self._lmb_select_end(vp_pos)
+            return True
+        if self._checkbox_row_pending is not None:
+            self._finish_checkbox_click_without_drag()
+            return True
+        if self._title_row_pending is not None:
+            self._finish_profile_title_click_without_drag()
+            return True
+        return False
+
+    def _profiles_list_handle_lmb_move(self, event: QMouseEvent, vp_pos: QPoint) -> bool:
+        if self._lmb_select_active:
+            self._lmb_select_update_hover(vp_pos)
+            return True
+        if self._checkbox_row_pending is not None and self._checkbox_press_global is not None:
+            dg = event.globalPosition().toPoint() - self._checkbox_press_global
+            if abs(dg.x()) + abs(dg.y()) >= 5:
+                self._try_begin_checkbox_paint_from_pending(self._checkbox_press_modifiers)
+            return True
+        if self._title_row_pending is not None and self._title_press_global is not None:
+            dg = event.globalPosition().toPoint() - self._title_press_global
+            if abs(dg.x()) + abs(dg.y()) >= 5:
+                self._clear_profile_title_click_pending()
+            return True
+        return False
+
     def eventFilter(self, watched: object, event: object) -> bool:  # type: ignore[override]
-        # LMB paint on rows (Ctrl = add). Title label: click opens editor without selection; drag paints. Run/scrollbar pass through.
+        # Чекбокс: клик — переключить; с перетаскиванием — «краска». Строка — открыть настройки.
         try:
-            if not hasattr(self, "profiles_list"):
-                return super().eventFilter(watched, event)
-            if not isinstance(watched, QWidget):
-                return super().eventFilter(watched, event)
-            if not self.profiles_list.isAncestorOf(watched):
+            if not self._profiles_list_mouse_filter_active(watched):
                 return super().eventFilter(watched, event)
             if isinstance(watched, QScrollBar):
                 return super().eventFilter(watched, event)
@@ -1921,46 +2021,53 @@ class MainWindow(QMainWindow):
             if not isinstance(event, QMouseEvent):
                 return super().eventFilter(watched, event)
 
-            vp = self.profiles_list.viewport()
-            vp_pos = vp.mapFromGlobal(event.globalPosition().toPoint())
+            if not isinstance(watched, QWidget):
+                return super().eventFilter(watched, event)
+            vp_pos = self._profiles_list_mouse_vp_pos(watched, event)
             et = event.type()
 
+            profile_cb = (
+                isinstance(watched, QCheckBox) and watched in self._profile_id_to_checkbox.values()
+            )
+
             if et == event.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
-                if self._lmb_select_active:
-                    self._lmb_select_end(vp_pos)
-                    return True
-                if self._title_row_pending is not None:
-                    self._finish_profile_title_click_without_drag()
+                if self._profiles_list_handle_lmb_release(vp_pos):
                     return True
                 return False
 
             if et == event.Type.MouseMove and (event.buttons() & Qt.MouseButton.LeftButton):
-                if self._lmb_select_active:
-                    self._lmb_select_update_hover(vp_pos)
-                    return True
-                if self._title_row_pending is not None and self._title_press_global is not None:
-                    dg = event.globalPosition().toPoint() - self._title_press_global
-                    if abs(dg.x()) + abs(dg.y()) >= 5:
-                        row = self._title_row_pending
-                        mods = self._title_press_modifiers
-                        self._clear_profile_title_click_pending()
-                        self._lmb_select_begin_at_row(row, mods)
+                if self._profiles_list_handle_lmb_move(event, vp_pos):
                     return True
                 return False
 
             if et == event.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
-                if self._title_label_at_viewport_pos(vp_pos):
+                if profile_cb:
+                    row = self._row_for_profile_checkbox(watched)
+                    if row is not None:
+                        self._begin_checkbox_click_pending(
+                            row, event.globalPosition().toPoint(), event.modifiers()
+                        )
+                        return True
+                    return False
+                if self._run_button_at_viewport_pos(vp_pos):
+                    return False
+                if self._checkbox_at_viewport_pos(vp_pos):
                     row = self._profile_row_at_viewport_pos(vp_pos)
                     if row is not None:
-                        self._title_row_pending = row
-                        self._title_press_global = event.globalPosition().toPoint()
-                        self._title_press_modifiers = event.modifiers()
-                        try:
-                            vp.grabMouse()
-                        except Exception:
-                            pass
+                        self._begin_checkbox_click_pending(
+                            row, event.globalPosition().toPoint(), event.modifiers()
+                        )
                         return True
-                if self._lmb_select_try_begin(vp_pos, event.modifiers()):
+                    return False
+                row = self._profile_row_at_viewport_pos(vp_pos)
+                if row is not None:
+                    self._title_row_pending = row
+                    self._title_press_global = event.globalPosition().toPoint()
+                    self._title_press_modifiers = event.modifiers()
+                    try:
+                        self.profiles_list.viewport().grabMouse()
+                    except Exception:
+                        pass
                     return True
                 return False
         except Exception:
@@ -1985,6 +2092,12 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._clear_profile_title_click_pending()
+        if self._checkbox_row_pending is not None:
+            try:
+                self.profiles_list.viewport().releaseMouse()
+            except Exception:
+                pass
+            self._clear_checkbox_click_pending()
         self._checked_profile_ids.clear()
         self.profiles_list.blockSignals(True)
         self.profiles_list.clearSelection()
