@@ -3,12 +3,13 @@ from __future__ import annotations
 import shutil
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Optional
 
-from PyQt6.QtCore import QEvent, QPoint, QItemSelectionModel, QObject, QSize, Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QFontMetrics, QMouseEvent, QTextDocument, QTextOption
+from PyQt6.QtCore import QEvent, QPoint, QItemSelectionModel, QObject, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor, QCursor, QFont, QFontMetrics, QMouseEvent, QTextDocument, QTextOption
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -37,8 +38,11 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
+    QToolTip,
     QVBoxLayout,
     QWidget,
     QDoubleSpinBox,
@@ -55,6 +59,7 @@ from playwright_runner import (
     get_proxy_ip,
     geoip_from_ip,
     normalize_proxy_server_url,
+    canonical_proxy_key,
 )
 from api_server import (
     append_ui_session_log,
@@ -153,23 +158,55 @@ class ProxyHealthCheckThread(QThread):
         self.finished_for_profile.emit(self._rid, ok, msg, ts)
 
 
+PROXY_HEALTH_BATCH_MAX_WORKERS = 12
+
+# Колонки таблицы на вкладке «Прокси»
+_PROXY_COL_SERVER = 0
+_PROXY_COL_LOGIN = 1
+_PROXY_COL_PASSWORD = 2
+_PROXY_COL_IDS = 3
+_PROXY_COL_STATUS = 4
+_PROXY_COL_CHECKED = 5
+_PROXY_COL_COUNT = 6
+_PROXY_COL_REFRESH = 7
+
+
 class BatchImportProxyHealthThread(QThread):
     progress = pyqtSignal(int, int)
     finished_payload = pyqtSignal(dict)  # profile_id -> (ok, msg, ts)
 
-    def __init__(self, jobs: list[tuple[str, str, str | None, str | None]]) -> None:
+    def __init__(
+        self,
+        jobs: list[tuple[str, str, str | None, str | None]],
+        *,
+        max_workers: int | None = None,
+    ) -> None:
         super().__init__()
         self._jobs = jobs
+        self._max_workers = max_workers
 
     def run(self) -> None:
         payload: dict[str, tuple[bool, str, str]] = {}
         n = len(self._jobs)
-        if n:
-            self.progress.emit(0, n)
-        for i, (pid, srv, u, pw) in enumerate(self._jobs):
+        if not n:
+            self.finished_payload.emit(payload)
+            return
+        self.progress.emit(0, n)
+        workers = self._max_workers
+        if workers is None:
+            workers = min(PROXY_HEALTH_BATCH_MAX_WORKERS, n)
+
+        def _probe_job(job: tuple[str, str, str | None, str | None]) -> tuple[str, bool, str, str]:
+            pid, srv, u, pw = job
             ok, msg, ts = probe_proxy_health_triple(srv, u, pw)
-            payload[pid] = (ok, msg, ts)
-            self.progress.emit(i + 1, n)
+            return pid, ok, msg, ts
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_probe_job, job) for job in self._jobs]
+            for done, fut in enumerate(as_completed(futures), start=1):
+                pid, ok, msg, ts = fut.result()
+                payload[pid] = (ok, msg, ts)
+                self.progress.emit(done, n)
         self.finished_payload.emit(payload)
 
 
@@ -226,6 +263,119 @@ class ProxyStatusTableItem(QTableWidgetItem):
             except (TypeError, ValueError):
                 pass
         return super().__lt__(other)
+
+
+class ProxyPasswordDelegate(QStyledItemDelegate):
+    """В ячейке — звёздочки; при редактировании — открытый текст пароля."""
+
+    REAL_PASSWORD_ROLE = Qt.ItemDataRole.UserRole + 10
+
+    @staticmethod
+    def mask_password(password: str | None) -> str:
+        n = len((password or "").strip())
+        return "•" * n if n else ""
+
+    def createEditor(self, parent: QWidget, option: QStyleOptionViewItem, index) -> QLineEdit:  # type: ignore[no-untyped-def]
+        editor = QLineEdit(parent)
+        editor.setEchoMode(QLineEdit.EchoMode.Normal)
+        editor.setPlaceholderText("Пароль прокси")
+        return editor
+
+    def setEditorData(self, editor: QLineEdit, index) -> None:  # type: ignore[no-untyped-def]
+        raw = index.data(self.REAL_PASSWORD_ROLE)
+        editor.setText("" if raw is None else str(raw))
+
+    def setModelData(self, editor: QLineEdit, model, index) -> None:  # type: ignore[no-untyped-def]
+        password = editor.text()
+        model.setData(index, self.mask_password(password), Qt.ItemDataRole.EditRole)
+        model.setData(index, password, self.REAL_PASSWORD_ROLE)
+
+    def initStyleOption(self, option: QStyleOptionViewItem, index) -> None:  # type: ignore[no-untyped-def]
+        super().initStyleOption(option, index)
+        real = index.data(self.REAL_PASSWORD_ROLE)
+        if real is not None:
+            option.text = self.mask_password(str(real))
+
+
+class _ProxyProfileIdChip(QFrame):
+    """Один profile_id: клик по ID — открыть профиль, ⧉ — копировать ID."""
+
+    def __init__(
+        self,
+        profile_id: str,
+        profile_name: str,
+        *,
+        on_open: Callable[[str], None],
+        on_copy: Callable[[str], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("proxyProfileIdChip")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 4, 4, 4)
+        lay.setSpacing(4)
+        open_btn = QPushButton(profile_id)
+        open_btn.setObjectName("proxyProfileIdOpenBtn")
+        open_btn.setFlat(True)
+        open_btn.setFont(QFont("Consolas", 9))
+        open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        open_btn.setToolTip(
+            f"{profile_id}\n{profile_name or 'без имени'}\n\nКлик — открыть профиль во вкладке «Профили»"
+        )
+        open_btn.clicked.connect(lambda _c=False, pid=profile_id: on_open(pid))
+        copy_btn = QPushButton()
+        copy_btn.setObjectName("proxyIdCopyBtn")
+        copy_btn.setFixedSize(24, 24)
+        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_btn.setToolTip("Копировать ID в буфер")
+        copy_btn.setText("⧉")
+        copy_btn.setFont(QFont("Segoe UI Symbol", 10))
+        copy_btn.clicked.connect(lambda _c=False, pid=profile_id: on_copy(pid))
+        lay.addWidget(open_btn, 0)
+        lay.addWidget(copy_btn, 0)
+
+
+class _ProxyProfileIdsCell(QWidget):
+    """Список profile_id в строке таблицы (без QScrollArea — стабильнее в QTableWidget)."""
+
+    def __init__(
+        self,
+        members: list[BrowserProfile],
+        *,
+        on_open: Callable[[str], None],
+        on_copy: Callable[[str], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        ordered = sorted(members, key=lambda m: ((m.name or "").lower(), m.profile_id))
+        self.setToolTip("\n".join(f"{p.profile_id} — {p.name or 'без имени'}" for p in ordered))
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(2, 2, 2, 2)
+        outer.setSpacing(4)
+        row_w: QWidget | None = None
+        row_l: QHBoxLayout | None = None
+        per_row = 2
+        for i, p in enumerate(ordered):
+            if i % per_row == 0:
+                row_w = QWidget(self)
+                row_l = QHBoxLayout(row_w)
+                row_l.setContentsMargins(0, 0, 0, 0)
+                row_l.setSpacing(6)
+                outer.addWidget(row_w)
+            assert row_l is not None
+            row_l.addWidget(
+                _ProxyProfileIdChip(
+                    p.profile_id,
+                    p.name or "",
+                    on_open=on_open,
+                    on_copy=on_copy,
+                    parent=row_w,
+                ),
+                0,
+            )
+        if row_l is not None:
+            row_l.addStretch(1)
 
 
 class ImportProfilesBuildThread(QThread):
@@ -678,6 +828,8 @@ class MainWindow(QMainWindow):
         self._archive_export_thread: ProfilesArchiveExportThread | None = None
         self._archive_import_thread: ProfilesArchiveImportThread | None = None
         self._proxy_single_check_dialog: QProgressDialog | None = None
+        self._proxies_table_refreshing = False
+        self._pending_open_profile_id: str | None = None
 
         layout = QHBoxLayout(root)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -688,13 +840,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._main_splitter)
 
         # left nav (ширину меняют перетаскиванием разделителя)
-        nav = QListWidget()
-        nav.setObjectName("sideNav")
-        nav.addItem("Профили")
-        nav.addItem("Прокси")
-        nav.setMinimumWidth(56)
-        nav.setMaximumWidth(360)
-        nav.setCurrentRow(0)
+        self._side_nav = QListWidget()
+        self._side_nav.setObjectName("sideNav")
+        self._side_nav.addItem("Профили")
+        self._side_nav.addItem("Прокси")
+        self._side_nav.setMinimumWidth(56)
+        self._side_nav.setMaximumWidth(360)
+        self._side_nav.setCurrentRow(0)
 
         # pages
         self.pages = QStackedWidget()
@@ -710,7 +862,7 @@ class MainWindow(QMainWindow):
             is_profile_running_in_ui=self._is_runner_thread_active,
         )
 
-        self._main_splitter.addWidget(nav)
+        self._main_splitter.addWidget(self._side_nav)
         self._main_splitter.addWidget(self.pages)
         self._main_splitter.setStretchFactor(0, 0)
         self._main_splitter.setStretchFactor(1, 1)
@@ -718,7 +870,7 @@ class MainWindow(QMainWindow):
         self._main_splitter.setCollapsible(1, False)
         self._main_splitter.setSizes([180, 880])
 
-        nav.currentRowChanged.connect(self._on_nav_changed)
+        self._side_nav.currentRowChanged.connect(self._on_nav_changed)
 
         self._apply_theme()
         self._setup_proxy_refresh_icon()
@@ -1157,51 +1309,206 @@ class MainWindow(QMainWindow):
         if row == 1:
             self._refresh_proxies_page_table()
 
+    def _release_profiles_list_mouse_grab(self) -> None:
+        """Снять grab с viewport списка профилей (иначе возможен краш Qt при смене вкладки)."""
+        self._clear_profile_title_click_pending()
+        self._clear_checkbox_click_pending()
+        if self._lmb_select_active:
+            self._lmb_select_active = False
+            self._lmb_select_additive = False
+            self._lmb_select_base.clear()
+            self._lmb_select_visited.clear()
+            self._lmb_select_last_row = None
+        try:
+            self.profiles_list.viewport().releaseMouse()
+        except Exception:
+            pass
+
+    def _focus_profile_in_list(self, profile_id: str) -> bool:
+        """Выделить профиль в списке и загрузить его в редактор (без смены вкладки)."""
+        if not any(p.profile_id == profile_id for p in self._profiles):
+            return False
+        if hasattr(self, "ed_profiles_search") and (self.ed_profiles_search.text() or "").strip():
+            self.ed_profiles_search.blockSignals(True)
+            try:
+                self.ed_profiles_search.clear()
+            finally:
+                self.ed_profiles_search.blockSignals(False)
+            self._refresh_profiles_list()
+        elif profile_id not in self._profile_id_to_item:
+            self._refresh_profiles_list()
+        it = self._profile_id_to_item.get(profile_id)
+        if it is None:
+            return False
+        self._active_profile_id = profile_id
+        self._apply_active_profile_row_visuals()
+        self._set_current_profile_list_item(it)
+        self.profiles_list.scrollToItem(it, QAbstractItemView.ScrollHint.EnsureVisible)
+        self._load_active_profile_into_form()
+        return True
+
+    def _copy_profile_id_to_clipboard(self, profile_id: str) -> None:
+        QApplication.clipboard().setText(profile_id)
+
+    def _open_profile_from_proxies_tab(self, profile_id: str) -> None:
+        """Отложенный переход с главного окна (не с виджета в ячейке таблицы)."""
+        self._pending_open_profile_id = profile_id
+        QTimer.singleShot(0, self._open_pending_profile_from_proxies_tab)
+
+    def _open_pending_profile_from_proxies_tab(self) -> None:
+        profile_id = self._pending_open_profile_id
+        self._pending_open_profile_id = None
+        if not profile_id:
+            return
+        if not any(p.profile_id == profile_id for p in self._profiles):
+            QMessageBox.information(self, "Профили", f"Профиль «{profile_id}» не найден.")
+            return
+        self._release_profiles_list_mouse_grab()
+        self._side_nav.setCurrentRow(0)
+        if not self._focus_profile_in_list(profile_id):
+            QMessageBox.information(self, "Профили", f"Профиль «{profile_id}» не найден в списке.")
+
+    def _proxies_stat_card(
+        self,
+        label: str,
+        *,
+        frame_name: str,
+        value_name: str,
+    ) -> tuple[QFrame, QLabel]:
+        card = QFrame()
+        card.setObjectName(frame_name)
+        card_l = QVBoxLayout(card)
+        card_l.setContentsMargins(14, 12, 14, 12)
+        card_l.setSpacing(4)
+        value_lbl = QLabel("0")
+        value_lbl.setObjectName(value_name)
+        value_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_lbl = QLabel(label)
+        title_lbl.setObjectName("proxiesStatLabel")
+        title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_l.addWidget(value_lbl)
+        card_l.addWidget(title_lbl)
+        return card, value_lbl
+
     def _build_proxies_page(self) -> QWidget:
         w = QWidget()
         l = QVBoxLayout(w)
         l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(12)
+        l.setSpacing(14)
+
+        header = QFrame()
+        header.setObjectName("proxiesHeader")
+        header_l = QVBoxLayout(header)
+        header_l.setContentsMargins(18, 16, 18, 16)
+        header_l.setSpacing(6)
         title = QLabel("Прокси")
         title.setObjectName("title")
-        l.addWidget(title)
         hint = QLabel(
-            "Сводка по всем прокси из профилей. Статус обновляется при импорте списка, "
-            "по кнопке обновления здесь или у поля «Прокси (сервер)» в карточке профиля — не пересчитывается при каждом редактировании."
+            ""
         )
+        hint.setObjectName("proxiesHeaderHint")
         hint.setWordWrap(True)
-        l.addWidget(hint)
+        header_l.addWidget(title)
+        header_l.addWidget(hint)
+        l.addWidget(header)
 
-        self.table_proxies = QTableWidget(0, 6)
+        stats_row = QHBoxLayout()
+        stats_row.setSpacing(10)
+        card_total, self.lbl_proxies_stat_total = self._proxies_stat_card(
+            "Всего",
+            frame_name="proxiesStatCard",
+            value_name="proxiesStatValue",
+        )
+        card_ok, self.lbl_proxies_stat_ok = self._proxies_stat_card(
+            "Рабочие",
+            frame_name="proxiesStatCardOk",
+            value_name="proxiesStatValueOk",
+        )
+        card_fail, self.lbl_proxies_stat_fail = self._proxies_stat_card(
+            "Нерабочие",
+            frame_name="proxiesStatCardFail",
+            value_name="proxiesStatValueFail",
+        )
+        card_unknown, self.lbl_proxies_stat_unknown = self._proxies_stat_card(
+            "Не проверены",
+            frame_name="proxiesStatCardUnknown",
+            value_name="proxiesStatValueUnknown",
+        )
+        for card in (card_total, card_ok, card_fail, card_unknown):
+            stats_row.addWidget(card, 1)
+        l.addLayout(stats_row)
+
+        self.ed_proxies_search = QLineEdit()
+        self.ed_proxies_search.setPlaceholderText(
+            "Поиск: адрес сервера, логин или ID профиля"
+        )
+        self.ed_proxies_search.textChanged.connect(lambda _t: self._refresh_proxies_page_table())
+        l.addWidget(self.ed_proxies_search, 0)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(10)
+        self.btn_check_all_proxies = QPushButton("Проверить все прокси")
+        self.btn_check_all_proxies.setToolTip(
+            f"Параллельно проверить каждый уникальный прокси (до {PROXY_HEALTH_BATCH_MAX_WORKERS} одновременно)"
+        )
+        self.btn_check_all_proxies.clicked.connect(self._on_check_all_proxies_click)
+        self.btn_refresh_proxies_table = QPushButton("Обновить список")
+        self.btn_refresh_proxies_table.setObjectName("secondary")
+        self.btn_refresh_proxies_table.setToolTip("Перечитать таблицу из сохранённых профилей")
+        self.btn_refresh_proxies_table.clicked.connect(self._refresh_proxies_page_table)
+        toolbar.addWidget(self.btn_check_all_proxies)
+        toolbar.addWidget(self.btn_refresh_proxies_table)
+        toolbar.addStretch(1)
+        l.addLayout(toolbar)
+
+        table_frame = QFrame()
+        table_frame.setObjectName("proxiesTableFrame")
+        table_l = QVBoxLayout(table_frame)
+        table_l.setContentsMargins(10, 10, 10, 10)
+        self.table_proxies = QTableWidget(0, 8)
         self.table_proxies.setObjectName("proxiesTable")
         self.table_proxies.setHorizontalHeaderLabels(
-            ["Сервер", "Логин", "Статус", "Проверено", "Профилей", ""],
+            ["Сервер", "Логин", "Пароль", "ID профилей", "Статус", "Проверено", "Профилей", "↻"],
         )
         self.table_proxies.verticalHeader().setVisible(False)
         self.table_proxies.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table_proxies.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table_proxies.setSortingEnabled(True)
+        self.table_proxies.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.SelectedClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed,
+        )
+        self.table_proxies.setAlternatingRowColors(True)
+        self.table_proxies.setShowGrid(False)
+        # Сортировка Qt + setCellWidget() на Windows часто даёт 0xC0000409 — сортируем в Python.
+        self.table_proxies.setSortingEnabled(False)
+        self.table_proxies.cellChanged.connect(self._on_proxies_table_cell_changed)
+        self._proxy_password_delegate = ProxyPasswordDelegate(self.table_proxies)
+        self.table_proxies.setItemDelegateForColumn(_PROXY_COL_PASSWORD, self._proxy_password_delegate)
         hh = self.table_proxies.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        self.table_proxies.setColumnWidth(5, 44)
-        l.addWidget(self.table_proxies, 1)
+        hh.setSectionResizeMode(_PROXY_COL_SERVER, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(_PROXY_COL_LOGIN, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(_PROXY_COL_PASSWORD, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(_PROXY_COL_IDS, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(_PROXY_COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(_PROXY_COL_CHECKED, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(_PROXY_COL_COUNT, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(_PROXY_COL_REFRESH, QHeaderView.ResizeMode.Fixed)
+        self.table_proxies.setColumnWidth(_PROXY_COL_REFRESH, 52)
+        table_l.addWidget(self.table_proxies)
+        l.addWidget(table_frame, 1)
         return w
 
     def _group_profiles_by_proxy(self) -> dict[tuple[str, str | None, str | None], list[BrowserProfile]]:
+        """Одна строка таблицы = уникальный прокси (URL + логин + пароль), все профили в группе."""
         groups: dict[tuple[str, str | None, str | None], list[BrowserProfile]] = {}
         for p in self._profiles:
-            srv = (p.proxy_server or "").strip()
-            if not srv:
+            key = canonical_proxy_key(p.proxy_server, p.proxy_username, p.proxy_password)
+            if not key:
                 continue
-            u = (p.proxy_username or "").strip() or None
-            pw = (p.proxy_password or "").strip() or None
-            key = (srv, u, pw)
-            groups.setdefault(key, []).append(p)
+            bucket = groups.setdefault(key, [])
+            if any(m.profile_id == p.profile_id for m in bucket):
+                continue
+            bucket.append(p)
         return groups
 
     def _newest_health_in_group(self, members: list[BrowserProfile]) -> tuple[bool | None, str | None, str | None]:
@@ -1211,47 +1518,373 @@ class MainWindow(QMainWindow):
         best = max(with_ts, key=lambda m: (m.proxy_health_checked_at or ""))
         return best.proxy_health_ok, best.proxy_health_checked_at, best.proxy_health_message
 
+    def _proxies_table_item(self, text: str, *, editable: bool) -> QTableWidgetItem:
+        item = QTableWidgetItem(text)
+        flags = item.flags()
+        if editable:
+            flags |= Qt.ItemFlag.ItemIsEditable
+        else:
+            flags &= ~Qt.ItemFlag.ItemIsEditable
+        item.setFlags(flags)
+        return item
+
+    def _proxy_cell_to_optional(self, raw: str) -> str | None:
+        s = (raw or "").strip()
+        if not s or s == "—":
+            return None
+        return s
+
+    def _proxy_batch_check_in_progress(self) -> bool:
+        if self._proxy_health_thread and self._proxy_health_thread.isRunning():
+            return True
+        if self._import_health_thread and self._import_health_thread.isRunning():
+            return True
+        return False
+
+    def _sync_proxies_page_buttons(self) -> None:
+        if not hasattr(self, "btn_check_all_proxies"):
+            return
+        groups = self._group_profiles_by_proxy()
+        busy = self._proxy_batch_check_in_progress()
+        has_proxies = bool(self._group_profiles_by_proxy())
+        self.btn_check_all_proxies.setEnabled(has_proxies and not busy)
+        self.btn_refresh_proxies_table.setEnabled(not busy)
+        if busy:
+            self.btn_check_all_proxies.setText("Проверка…")
+        else:
+            self.btn_check_all_proxies.setText("Проверить все прокси")
+        if hasattr(self, "table_proxies"):
+            if busy:
+                self.table_proxies.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            else:
+                self.table_proxies.setEditTriggers(
+                    QAbstractItemView.EditTrigger.DoubleClicked
+                    | QAbstractItemView.EditTrigger.SelectedClicked
+                    | QAbstractItemView.EditTrigger.EditKeyPressed,
+                )
+            for row in range(self.table_proxies.rowCount()):
+                cell_btn = self.table_proxies.cellWidget(row, _PROXY_COL_REFRESH)
+                if isinstance(cell_btn, QPushButton):
+                    cell_btn.setEnabled(not busy)
+
+    def _proxy_group_status_sort_key(self, members: list[BrowserProfile]) -> int:
+        ok, _, _ = self._newest_health_in_group(members)
+        if ok is True:
+            return 0
+        if ok is False:
+            return 1
+        return 2
+
+    def _proxies_search_tokens(self) -> list[str]:
+        raw = (self.ed_proxies_search.text() if hasattr(self, "ed_proxies_search") else "") or ""
+        return [t for t in raw.lower().strip().split() if t]
+
+    def _proxy_group_search_rank(
+        self,
+        key: tuple[str, str | None, str | None],
+        members: list[BrowserProfile],
+        tokens: list[str],
+    ) -> int | None:
+        """
+        Ранг совпадения для сортировки: 0 — сервер, 1 — логин, 2 — ID профиля.
+        None — строка не подходит (не все слова запроса найдены).
+        """
+        if not tokens:
+            return 0
+        srv, user, _pw = key
+        srv_l = srv.lower()
+        user_l = (user or "").lower()
+        ids_l = [p.profile_id.lower() for p in members]
+        worst_tier = 0
+        for tok in tokens:
+            if tok in srv_l:
+                tier = 0
+            elif tok in user_l:
+                tier = 1
+            elif any(tok in pid for pid in ids_l):
+                tier = 2
+            else:
+                return None
+            worst_tier = max(worst_tier, tier)
+        return worst_tier
+
+    def _filtered_proxy_groups(
+        self,
+        groups: dict[tuple[str, str | None, str | None], list[BrowserProfile]],
+    ) -> list[tuple[int, tuple[str, str | None, str | None], list[BrowserProfile]]]:
+        tokens = self._proxies_search_tokens()
+        rows: list[tuple[int, tuple[str, str | None, str | None], list[BrowserProfile]]] = []
+        for key, members in groups.items():
+            rank = self._proxy_group_search_rank(key, members, tokens)
+            if rank is None:
+                continue
+            rows.append((rank, key, members))
+        rows.sort(
+            key=lambda row: (
+                row[0],
+                self._proxy_group_status_sort_key(row[2]),
+                row[1][0].lower(),
+            ),
+        )
+        return rows
+
+    def _update_proxies_page_stats(self, groups: dict[tuple[str, str | None, str | None], list[BrowserProfile]]) -> None:
+        if not hasattr(self, "lbl_proxies_stat_total"):
+            return
+        total = len(groups)
+        ok_n = fail_n = unknown_n = 0
+        for members in groups.values():
+            ok, _, _ = self._newest_health_in_group(members)
+            if ok is True:
+                ok_n += 1
+            elif ok is False:
+                fail_n += 1
+            else:
+                unknown_n += 1
+        self.lbl_proxies_stat_total.setText(str(total))
+        self.lbl_proxies_stat_ok.setText(str(ok_n))
+        self.lbl_proxies_stat_fail.setText(str(fail_n))
+        self.lbl_proxies_stat_unknown.setText(str(unknown_n))
+
     def _refresh_proxies_page_table(self) -> None:
         if not hasattr(self, "table_proxies"):
             return
-        groups = self._group_profiles_by_proxy()
-        self.table_proxies.setSortingEnabled(False)
+        all_groups = self._group_profiles_by_proxy()
+        visible_rows = self._filtered_proxy_groups(all_groups)
+        visible_groups = {key: members for _rank, key, members in visible_rows}
+        self._update_proxies_page_stats(visible_groups)
+        self._proxies_table_refreshing = True
+        self.table_proxies.blockSignals(True)
         self.table_proxies.setRowCount(0)
-        for key in sorted(groups.keys(), key=lambda k: k[0].lower()):
-            members = groups[key]
-            srv, u, _pw = key
+        muted = QColor("#94a3b8")
+        ok_color = QColor("#86efac")
+        fail_color = QColor("#fda4af")
+        for _rank, key, members in visible_rows:
+            srv, u, pw = key
             row = self.table_proxies.rowCount()
             self.table_proxies.insertRow(row)
+            self.table_proxies.setRowHeight(row, 44)
             rep = members[0]
             ok, ts, msg = self._newest_health_in_group(members)
             if ok is True:
-                status_label, sort_key = "Рабочий", 0
+                status_label, sort_key, status_color = "● Рабочий", 0, ok_color
             elif ok is False:
-                status_label, sort_key = "Нерабочий", 1
+                status_label, sort_key, status_color = "● Нерабочий", 1, fail_color
             else:
-                status_label, sort_key = "Не проверен", 2
+                status_label, sort_key, status_color = "● Не проверен", 2, muted
             tip = (msg or "").strip()
             if len(tip) > 900:
                 tip = tip[:900] + "…"
             st_item = ProxyStatusTableItem(status_label, sort_key)
             st_item.setToolTip(tip if tip else status_label)
-            self.table_proxies.setItem(row, 0, QTableWidgetItem(srv))
-            self.table_proxies.setItem(row, 1, QTableWidgetItem(u or "—"))
-            self.table_proxies.setItem(row, 2, st_item)
-            self.table_proxies.setItem(row, 3, QTableWidgetItem(ts or "—"))
-            self.table_proxies.setItem(row, 4, QTableWidgetItem(str(len(members))))
+            st_item.setForeground(QBrush(status_color))
+            st_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+            st_item.setFlags(st_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            srv_item = self._proxies_table_item(srv, editable=True)
+            srv_item.setToolTip("Двойной клик для редактирования. Изменение применится ко всем профилям в строке.")
+            srv_item.setData(
+                Qt.ItemDataRole.UserRole,
+                {"member_ids": [p.profile_id for p in members], "proxy_key": key},
+            )
+            user_item = self._proxies_table_item(u or "", editable=True)
+            pass_item = self._proxies_table_item(ProxyPasswordDelegate.mask_password(pw), editable=True)
+            pass_item.setData(ProxyPasswordDelegate.REAL_PASSWORD_ROLE, pw or "")
+            pass_item.setToolTip("Двойной клик — изменить пароль (в ячейке •••, при вводе — текст)")
+            ids_widget = _ProxyProfileIdsCell(
+                members,
+                on_open=self._open_profile_from_proxies_tab,
+                on_copy=self._copy_profile_id_to_clipboard,
+                parent=self.table_proxies,
+            )
+            ts_item = self._proxies_table_item(ts or "—", editable=False)
+            n_profiles = len(members)
+            count_item = self._proxies_table_item(str(n_profiles), editable=False)
+            count_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            count_item.setToolTip(
+                f"Профилей с этим прокси: {n_profiles}"
+                if n_profiles != 1
+                else "Один профиль с этим прокси",
+            )
+            self.table_proxies.setItem(row, _PROXY_COL_SERVER, srv_item)
+            self.table_proxies.setItem(row, _PROXY_COL_LOGIN, user_item)
+            self.table_proxies.setItem(row, _PROXY_COL_PASSWORD, pass_item)
+            self.table_proxies.setCellWidget(row, _PROXY_COL_IDS, ids_widget)
+            self.table_proxies.setItem(row, _PROXY_COL_STATUS, st_item)
+            self.table_proxies.setItem(row, _PROXY_COL_CHECKED, ts_item)
+            self.table_proxies.setItem(row, _PROXY_COL_COUNT, count_item)
             btn = QPushButton()
-            btn.setObjectName("secondary")
-            btn.setFixedSize(36, 30)
+            btn.setObjectName("proxiesTableRefreshBtn")
+            btn.setFixedSize(40, 32)
             btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
             btn.setToolTip("Проверить этот прокси")
+            btn.setEnabled(not self._proxy_batch_check_in_progress())
             btn.clicked.connect(lambda _c=False, pid=rep.profile_id: self._on_proxies_table_refresh_click(pid))
-            self.table_proxies.setCellWidget(row, 5, btn)
-        self.table_proxies.setSortingEnabled(True)
-        self.table_proxies.sortItems(2, Qt.SortOrder.AscendingOrder)
+            self.table_proxies.setCellWidget(row, _PROXY_COL_REFRESH, btn)
+            ids_widget.adjustSize()
+            self.table_proxies.setRowHeight(row, max(52, ids_widget.sizeHint().height() + 10))
+        self.table_proxies.blockSignals(False)
+        self._proxies_table_refreshing = False
+        self._sync_proxies_page_buttons()
+
+    def _on_proxies_table_cell_changed(self, row: int, col: int) -> None:
+        if self._proxies_table_refreshing:
+            return
+        if col not in (_PROXY_COL_SERVER, _PROXY_COL_LOGIN, _PROXY_COL_PASSWORD):
+            return
+        if self._proxy_batch_check_in_progress():
+            return
+        self._apply_proxies_table_row_edit(row)
+
+    def _apply_proxies_table_row_edit(self, row: int) -> None:
+        srv_item = self.table_proxies.item(row, _PROXY_COL_SERVER)
+        if not srv_item:
+            return
+        meta = srv_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(meta, dict):
+            return
+        member_ids = meta.get("member_ids")
+        if not isinstance(member_ids, list) or not member_ids:
+            return
+
+        raw_srv = (srv_item.text() or "").strip()
+        login_item = self.table_proxies.item(row, _PROXY_COL_LOGIN)
+        pass_item = self.table_proxies.item(row, _PROXY_COL_PASSWORD)
+        new_user = self._proxy_cell_to_optional(login_item.text() if login_item else "")
+        raw_pass = pass_item.data(ProxyPasswordDelegate.REAL_PASSWORD_ROLE) if pass_item else None
+        new_pass = self._proxy_cell_to_optional("" if raw_pass is None else str(raw_pass))
+
+        if not raw_srv:
+            QMessageBox.warning(self, "Прокси", "Адрес сервера не может быть пустым.")
+            self._refresh_proxies_page_table()
+            return
+
+        new_srv = normalize_proxy_server_url(raw_srv)
+        if new_srv != raw_srv:
+            self._proxies_table_refreshing = True
+            self.table_proxies.blockSignals(True)
+            srv_item.setText(new_srv)
+            self.table_proxies.blockSignals(False)
+            self._proxies_table_refreshing = False
+
+        id_set = set(member_ids)
+        members = [p for p in self._profiles if p.profile_id in id_set]
+        if not members:
+            self._refresh_proxies_page_table()
+            return
+        rep = members[0]
+        new_key = canonical_proxy_key(new_srv, new_user, new_pass)
+        old_key = canonical_proxy_key(rep.proxy_server, rep.proxy_username, rep.proxy_password)
+        if new_key == old_key:
+            return
+
+        new_list: list[BrowserProfile] = []
+        for p in self._profiles:
+            if p.profile_id in id_set:
+                base = replace(
+                    p,
+                    proxy_health_ok=None,
+                    proxy_health_checked_at=None,
+                    proxy_health_message=None,
+                )
+                new_list.append(
+                    apply_proxy_and_sync_geo(
+                        base,
+                        proxy_server=new_srv,
+                        proxy_username=new_user,
+                        proxy_password=new_pass,
+                    )
+                )
+            else:
+                new_list.append(p)
+        self._profiles = new_list
+        save_profiles(self._profiles)
+        self._refresh_profiles_list()
+        if self._active_profile_id in id_set:
+            self._load_active_profile_into_form()
+        self._refresh_proxies_page_table()
 
     def _on_proxies_table_refresh_click(self, representative_profile_id: str) -> None:
+        if self._proxy_batch_check_in_progress():
+            QMessageBox.information(self, "Прокси", "Дождитесь завершения текущей проверки.")
+            return
         self._start_proxy_health_check(representative_profile_id)
+
+    def _on_check_all_proxies_click(self) -> None:
+        groups = self._group_profiles_by_proxy()
+        if not groups:
+            QMessageBox.information(self, "Прокси", "Нет профилей с настроенным прокси.")
+            return
+        if self._proxy_batch_check_in_progress():
+            QMessageBox.information(self, "Прокси", "Уже выполняется проверка прокси.")
+            return
+        jobs: list[tuple[str, str, str | None, str | None]] = []
+        for members in groups.values():
+            rep = members[0]
+            jobs.append((rep.profile_id, rep.proxy_server or "", rep.proxy_username, rep.proxy_password))
+        self._start_proxies_page_batch_health(jobs)
+
+    def _apply_all_proxies_health_payload(self, payload: dict) -> None:
+        for rep_id, (ok, msg, ts) in payload.items():
+            rep = next((x for x in self._profiles if x.profile_id == rep_id), None)
+            if not rep:
+                continue
+            self._profiles = update_all_profiles_matching_proxy_credentials(
+                self._profiles,
+                proxy_server=rep.proxy_server or "",
+                proxy_username=rep.proxy_username,
+                proxy_password=rep.proxy_password,
+                ok=ok,
+                message=msg,
+                checked_at=ts,
+            )
+        save_profiles(self._profiles)
+        self._refresh_profiles_list()
+        self._load_active_profile_into_form()
+        self._refresh_proxies_page_table()
+
+    def _start_proxies_page_batch_health(self, jobs: list[tuple[str, str, str | None, str | None]]) -> None:
+        if not jobs:
+            return
+        if self._proxy_batch_check_in_progress():
+            return
+        dlg = ProxyBatchCheckProgressDialog(
+            self,
+            len(jobs),
+            window_title="Прокси",
+            progress_caption="Проверка всех прокси",
+        )
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self._import_health_dialog = dlg
+        dlg.show()
+        QApplication.processEvents()
+        self._sync_proxies_page_buttons()
+
+        self._import_health_thread = BatchImportProxyHealthThread(jobs)
+
+        def on_prog(cur: int, total: int) -> None:
+            dlg.set_progress(cur, total)
+            QApplication.processEvents()
+
+        def on_done(payload: dict) -> None:
+            dlg.hide()
+            dlg.deleteLater()
+            self._import_health_dialog = None
+            self._import_health_thread = None
+            self._apply_all_proxies_health_payload(payload)
+            ok_n = sum(1 for ok, _msg, _ts in payload.values() if ok)
+            fail_n = len(payload) - ok_n
+            QMessageBox.information(
+                self,
+                "Прокси",
+                f"Проверено уникальных прокси: {len(payload)}.\n"
+                f"Рабочих: {ok_n}.\n"
+                f"Нерабочих: {fail_n}.",
+            )
+            self._sync_proxies_page_buttons()
+
+        self._import_health_thread.progress.connect(on_prog)
+        self._import_health_thread.finished_payload.connect(on_done)
+        self._import_health_thread.start()
 
     def _proxy_form_matches_saved(self) -> bool:
         p = self._active_profile()
@@ -1351,11 +1984,13 @@ class MainWindow(QMainWindow):
         self._proxy_health_thread.finished_for_profile.connect(_finish_single)
         self._proxy_health_thread.finished.connect(self._on_proxy_health_check_thread_cleanup)
         self._sync_proxy_health_badge()
+        self._sync_proxies_page_buttons()
         self._proxy_health_thread.start()
 
     def _on_proxy_health_check_thread_cleanup(self) -> None:
         self._proxy_health_thread = None
         self._sync_proxy_health_badge()
+        self._sync_proxies_page_buttons()
 
     def _on_proxy_health_check_finished(self, rep_id: str, ok: bool, msg: str, ts: str) -> None:
         rep = next((x for x in self._profiles if x.profile_id == rep_id), None)
@@ -1402,7 +2037,7 @@ class MainWindow(QMainWindow):
         if not jobs:
             QMessageBox.information(self, "Импорт", f"Создано профилей: {created_count}.{skipped_extra}")
             return
-        if self._import_health_thread and self._import_health_thread.isRunning():
+        if self._proxy_batch_check_in_progress():
             return
         dlg = ProxyBatchCheckProgressDialog(
             self,
@@ -1414,6 +2049,7 @@ class MainWindow(QMainWindow):
         self._import_health_dialog = dlg
         dlg.show()
         QApplication.processEvents()
+        self._sync_proxies_page_buttons()
 
         self._import_health_thread = BatchImportProxyHealthThread(jobs)
 
@@ -1427,6 +2063,7 @@ class MainWindow(QMainWindow):
             self._import_health_dialog = None
             self._import_health_thread = None
             self._apply_batch_import_health_payload(payload)
+            self._sync_proxies_page_buttons()
             QMessageBox.information(
                 self,
                 "Импорт",

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from dataclasses import replace
 
-from playwright_runner import probe_proxy_connection
+from playwright_runner import canonical_proxy_key, probe_proxy_connection
 from profiles_store import BrowserProfile
 
 
@@ -43,15 +43,13 @@ def update_all_profiles_matching_proxy_credentials(
     checked_at: str,
 ) -> list[BrowserProfile]:
     """Одинаковый результат проверки для всех профилей с тем же server/user/password."""
-    srv = (proxy_server or "").strip()
-    u = (proxy_username or "").strip() or None
-    pw = (proxy_password or "").strip() or None
+    target = canonical_proxy_key(proxy_server, proxy_username, proxy_password)
+    if not target:
+        return list(profiles)
     out: list[BrowserProfile] = []
     for p in profiles:
-        ps = (p.proxy_server or "").strip()
-        pu = (p.proxy_username or "").strip() or None
-        ppw = (p.proxy_password or "").strip() or None
-        if ps == srv and pu == u and ppw == pw:
+        pk = canonical_proxy_key(p.proxy_server, p.proxy_username, p.proxy_password)
+        if pk == target:
             out.append(
                 replace(
                     p,

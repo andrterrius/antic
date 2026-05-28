@@ -302,5 +302,172 @@ QPushButton#tagChipClose:hover {
     color: #f1f5f9;
     background-color: rgba(239, 68, 68, 0.22);
 }
+
+/* Вкладка «Прокси» */
+QFrame#proxiesHeader {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 rgba(99, 102, 241, 0.14), stop:1 rgba(124, 58, 237, 0.10));
+    border: 1px solid #3d4258;
+    border-radius: 14px;
+    padding: 4px;
+}
+
+QLabel#proxiesHeaderHint {
+    color: #94a3b8;
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+QFrame#proxiesStatCard {
+    background-color: #1a1d26;
+    border: 1px solid #2d3142;
+    border-radius: 12px;
+}
+
+QFrame#proxiesStatCardOk {
+    background-color: rgba(22, 163, 74, 0.10);
+    border: 1px solid rgba(22, 163, 74, 0.45);
+    border-radius: 12px;
+}
+
+QFrame#proxiesStatCardFail {
+    background-color: rgba(190, 18, 60, 0.10);
+    border: 1px solid rgba(190, 18, 60, 0.45);
+    border-radius: 12px;
+}
+
+QFrame#proxiesStatCardUnknown {
+    background-color: rgba(100, 116, 139, 0.12);
+    border: 1px solid #3d4258;
+    border-radius: 12px;
+}
+
+QLabel#proxiesStatValue {
+    font-size: 26px;
+    font-weight: 700;
+    color: #f1f5f9;
+}
+
+QLabel#proxiesStatValueOk {
+    font-size: 26px;
+    font-weight: 700;
+    color: #86efac;
+}
+
+QLabel#proxiesStatValueFail {
+    font-size: 26px;
+    font-weight: 700;
+    color: #fda4af;
+}
+
+QLabel#proxiesStatValueUnknown {
+    font-size: 26px;
+    font-weight: 700;
+    color: #cbd5e1;
+}
+
+QLabel#proxiesStatLabel {
+    color: #94a3b8;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+}
+
+QFrame#proxiesTableFrame {
+    background-color: #1a1d26;
+    border: 1px solid #2d3142;
+    border-radius: 14px;
+}
+
+QTableWidget#proxiesTable {
+    background-color: #0f1118;
+    border: none;
+    border-radius: 10px;
+    gridline-color: #252836;
+    outline: none;
+    selection-background-color: rgba(99, 102, 241, 0.28);
+    selection-color: #f1f5f9;
+    alternate-background-color: rgba(255, 255, 255, 0.02);
+}
+
+QTableWidget#proxiesTable::item {
+    padding: 8px 10px;
+    border: none;
+}
+
+QTableWidget#proxiesTable QHeaderView::section {
+    background-color: #252836;
+    color: #a5b4fc;
+    font-weight: 600;
+    padding: 10px 12px;
+    border: none;
+    border-bottom: 1px solid #3d4258;
+}
+
+QPushButton#proxiesTableRefreshBtn {
+    background-color: #252836;
+    border: 1px solid #3d4258;
+    border-radius: 8px;
+    padding: 4px;
+    min-height: 0;
+}
+
+QPushButton#proxiesTableRefreshBtn:hover {
+    background-color: #2e3245;
+    border: 1px solid #6366f1;
+}
+
+QFrame#proxyProfileIdChip {
+    background-color: #252836;
+    border: 1px solid #3d4258;
+    border-radius: 8px;
+}
+
+QFrame#proxyProfileIdChip:hover {
+    border: 1px solid #6366f1;
+}
+
+QLabel#proxyProfileIdLabel {
+    color: #c7d2fe;
+    border: none;
+    background: transparent;
+    padding: 0;
+}
+
+QPushButton#proxyProfileIdOpenBtn {
+    background: transparent;
+    border: none;
+    color: #c7d2fe;
+    text-align: left;
+    padding: 0 2px;
+    min-height: 0;
+    font-weight: 500;
+}
+
+QPushButton#proxyProfileIdOpenBtn:hover {
+    color: #f1f5f9;
+    text-decoration: underline;
+}
+
+QPushButton#proxyProfileIdOpenBtn:pressed {
+    color: #a5b4fc;
+}
+
+QPushButton#proxyIdCopyBtn {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 2px;
+    min-height: 0;
+}
+
+QPushButton#proxyIdCopyBtn:hover {
+    background-color: rgba(99, 102, 241, 0.22);
+    border: 1px solid #6366f1;
+}
+
+QScrollArea#proxyProfileIdsScroll {
+    background: transparent;
+}
 """
 

@@ -744,6 +744,42 @@ def normalize_proxy_server_url(raw: str) -> str:
     )
 
 
+def canonical_proxy_key(
+    proxy_server: str | None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
+) -> tuple[str, str | None, str | None] | None:
+    """
+    Ключ для группировки одинаковых прокси: нормализованный URL (без логина в netloc),
+    логин и пароль. Разные записи host:port и http://host:port дают один ключ.
+    """
+    raw = (proxy_server or "").strip()
+    if not raw:
+        return None
+
+    user = (proxy_username or "").strip() or None
+    password = (proxy_password or "").strip() or None
+
+    if "://" not in raw:
+        raw = f"http://{raw}"
+
+    parsed = urlparse(raw)
+    if parsed.username and not user:
+        user = parsed.username or None
+    if parsed.password and not password:
+        password = parsed.password or None
+
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None
+
+    port = parsed.port
+    netloc = f"{host}:{port}" if port else host
+    scheme = _canonical_proxy_scheme(parsed.scheme or "http")
+    server = urlunparse((scheme, netloc, parsed.path or "", "", "", ""))
+    return server, user, password
+
+
 def _proxy_settings(p: BrowserProfile) -> ProxySettings | None:
     if not p.proxy_server:
         return None
