@@ -17,6 +17,7 @@ from collections.abc import Callable
 from profiles_store import (
     BrowserProfile,
     load_profiles,
+    normalize_custom_data,
     normalize_tags_list,
     save_profiles,
     set_profiles_ui_log_hook,
@@ -36,6 +37,10 @@ class ProfileOut(BaseModel):
     name: str = Field(..., description="Имя профиля в списке")
     tags: list[str] = Field(default_factory=list, description="Теги профиля (произвольное число)")
     description: str | None = Field(None, description="Текстовое описание профиля")
+    custom_data: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Произвольные JSON-совместимые данные (ключ → значение)",
+    )
     automation_enabled: bool = Field(False, description="Флаг автоматизации (по смыслу приложения)")
     proxy_server: str | None = Field(
         None,
@@ -61,6 +66,25 @@ class ProfileOut(BaseModel):
     webgl_renderer: str | None = Field(None)
     webgl_version: str | None = Field(None)
     webgl_shading_language_version: str | None = Field(None)
+
+
+class CustomDataBody(BaseModel):
+    """Полная замена или слияние custom_data профиля."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    data: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Объект custom_data (строковые ключи, JSON-совместимые значения)",
+    )
+
+
+class CustomDataValueBody(BaseModel):
+    """Значение одного ключа custom_data."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: Any = Field(..., description="JSON-совместимое значение (строка, число, объект, массив, null)")
 
 
 class LaunchProfileBody(BaseModel):
@@ -474,6 +498,55 @@ def _require_non_empty_tag(tag: str) -> str:
     return t
 
 
+def _require_custom_data_key(key: str) -> str:
+    k = (key or "").strip()
+    if not k:
+        raise HTTPException(status_code=400, detail="Key must be non-empty")
+    if len(k) > 256:
+        raise HTTPException(status_code=400, detail="Key is too long (max 256)")
+    return k
+
+
+def _mutate_profile_custom_data(
+    profile_id: str,
+    *,
+    replace: dict[str, Any] | None = None,
+    merge: dict[str, Any] | None = None,
+    set_key: tuple[str, Any] | None = None,
+    delete_key: str | None = None,
+) -> ProfileOut:
+    pid = (profile_id or "").strip()
+    if not pid:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    out: ProfileOut
+    with _lock:
+        profiles = load_profiles()
+        idx = next((i for i, p in enumerate(profiles) if p.profile_id == pid), -1)
+        if idx < 0:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        p = profiles[idx]
+        current = dict(p.custom_data or {})
+        if replace is not None:
+            current = normalize_custom_data(replace)
+        if merge is not None:
+            current = normalize_custom_data({**current, **merge})
+        if set_key is not None:
+            k, v = set_key
+            kk = _require_custom_data_key(k)
+            trial = normalize_custom_data({kk: v})
+            if kk not in trial:
+                raise HTTPException(status_code=400, detail="Value is not JSON-serializable")
+            current = {**current, kk: trial[kk]}
+        if delete_key is not None:
+            dk = _require_custom_data_key(delete_key)
+            current = {k: v for k, v in current.items() if k != dk}
+        profiles[idx] = BrowserProfile(**{**asdict(p), "custom_data": current})
+        save_profiles(profiles)
+        out = _profile_to_out(profiles[idx])
+    _ui_sync_profile(pid)
+    return out
+
+
 def _session_worker(sess: ProfileRunSession, profile: BrowserProfile, body: LaunchProfileBody) -> None:
     prefix = f"[API:{profile.name}:{profile.profile_id}]"
 
@@ -597,6 +670,44 @@ def build_app() -> FastAPI:
             out = _profile_to_out(profiles[idx])
         _ui_sync_profile(pid)
         return out
+
+    @app.put(
+        "/profiles/{profile_id}/custom-data",
+        response_model=ProfileOut,
+        tags=["Профили"],
+        summary="Заменить custom_data профиля",
+    )
+    def replace_profile_custom_data(profile_id: str, body: CustomDataBody) -> ProfileOut:
+        """Полностью заменяет словарь custom_data (пустой объект очищает поле)."""
+        return _mutate_profile_custom_data(profile_id, replace=body.data)
+
+    @app.patch(
+        "/profiles/{profile_id}/custom-data",
+        response_model=ProfileOut,
+        tags=["Профили"],
+        summary="Объединить custom_data профиля",
+    )
+    def merge_profile_custom_data(profile_id: str, body: CustomDataBody) -> ProfileOut:
+        """Добавляет/перезаписывает ключи из тела запроса, остальные ключи сохраняются."""
+        return _mutate_profile_custom_data(profile_id, merge=body.data)
+
+    @app.put(
+        "/profiles/{profile_id}/custom-data/{key}",
+        response_model=ProfileOut,
+        tags=["Профили"],
+        summary="Установить один ключ custom_data",
+    )
+    def set_profile_custom_data_key(profile_id: str, key: str, body: CustomDataValueBody) -> ProfileOut:
+        return _mutate_profile_custom_data(profile_id, set_key=(key, body.value))
+
+    @app.delete(
+        "/profiles/{profile_id}/custom-data/{key}",
+        response_model=ProfileOut,
+        tags=["Профили"],
+        summary="Удалить ключ custom_data",
+    )
+    def delete_profile_custom_data_key(profile_id: str, key: str) -> ProfileOut:
+        return _mutate_profile_custom_data(profile_id, delete_key=key)
 
     @app.delete(
         "/profiles/{profile_id}/tags/{tag}",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import threading
 import uuid
@@ -49,7 +50,14 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
 )
 
-from profiles_store import BrowserProfile, load_profiles, save_profiles, tags_from_delimited_text
+from profiles_store import (
+    BrowserProfile,
+    custom_data_from_json_text,
+    custom_data_to_json_text,
+    load_profiles,
+    save_profiles,
+    tags_from_delimited_text,
+)
 from fingerprint_generator import generate_test_fingerprint
 from proxy_health import probe_proxy_health_triple, update_all_profiles_matching_proxy_credentials
 from proxy_import import apply_proxy_and_sync_geo, parse_host_port_user_pass_line, proxy_server_url
@@ -905,6 +913,37 @@ class MainWindow(QMainWindow):
         w.setSizePolicy(sp)
         w.setMinimumWidth(min_w)
 
+    def _custom_data_key_count(self, data: dict | None = None) -> int:
+        if data is not None:
+            return len(data or {})
+        raw = (self.ed_custom_data.toPlainText() if hasattr(self, "ed_custom_data") else "") or ""
+        if not raw.strip():
+            return 0
+        try:
+            return len(custom_data_from_json_text(raw))
+        except (json.JSONDecodeError, ValueError):
+            p = self._active_profile()
+            return len(p.custom_data) if p else 0
+
+    def _update_custom_data_toggle_label(self, *, expanded: bool | None = None) -> None:
+        if not hasattr(self, "btn_custom_data_toggle"):
+            return
+        n = self._custom_data_key_count()
+        open_ = self._custom_data_expanded if expanded is None else expanded
+        arrow = "▾" if open_ else "▸"
+        suffix = f" ({n})" if n else " (пусто)"
+        self.btn_custom_data_toggle.setText(f"{arrow} Доп. данные{suffix}")
+
+    def _collapse_custom_data_panel(self) -> None:
+        self._custom_data_expanded = False
+        self._custom_data_panel.hide()
+        self._update_custom_data_toggle_label(expanded=False)
+
+    def _toggle_custom_data_panel(self) -> None:
+        self._custom_data_expanded = not self._custom_data_expanded
+        self._custom_data_panel.setVisible(self._custom_data_expanded)
+        self._update_custom_data_toggle_label(expanded=self._custom_data_expanded)
+
     def _rebuild_tag_chips(self) -> None:
         lay = self._tags_chips_layout
         while lay.count():
@@ -1151,8 +1190,26 @@ class MainWindow(QMainWindow):
         self.ed_description.setPlaceholderText("Заметки к профилю…")
         self.ed_description.setFixedHeight(48)
         self.ed_description.setTabChangesFocus(True)
+        self.ed_custom_data = QPlainTextEdit()
+        self.ed_custom_data.setPlaceholderText('{"ключ": "значение"} — JSON-объект')
+        self.ed_custom_data.setFixedHeight(72)
+        self.ed_custom_data.setTabChangesFocus(True)
         self._expand_field(self._tags_input_block)
         self._expand_field(self.ed_description)
+
+        self._custom_data_panel = QWidget()
+        _cdl = QVBoxLayout(self._custom_data_panel)
+        _cdl.setContentsMargins(0, 0, 0, 0)
+        _cdl.setSpacing(0)
+        _cdl.addWidget(self.ed_custom_data)
+        self._expand_field(self.ed_custom_data)
+        self._custom_data_panel.hide()
+
+        self.btn_custom_data_toggle = QPushButton("▸ Доп. данные")
+        self.btn_custom_data_toggle.setFlat(True)
+        self.btn_custom_data_toggle.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_custom_data_toggle.clicked.connect(self._toggle_custom_data_panel)
+        self._custom_data_expanded = False
 
         for _w in (
             self.ed_name,
@@ -1250,6 +1307,8 @@ class MainWindow(QMainWindow):
         meta_l.setSpacing(6)
         meta_l.addLayout(tags_row)
         meta_l.addLayout(desc_row)
+        meta_l.addWidget(self.btn_custom_data_toggle, 0)
+        meta_l.addWidget(self._custom_data_panel, 0)
 
         self.btn_save = QPushButton("Сохранить профиль")
         self.btn_save.setObjectName("secondary")
@@ -2102,7 +2161,8 @@ class MainWindow(QMainWindow):
             name = (p.name or "").lower()
             desc = (p.description or "").lower()
             tags = ", ".join(p.tags or []).lower()
-            hay = " ".join([pid, name, desc, tags])
+            custom = custom_data_to_json_text(p.custom_data).lower()
+            hay = " ".join([pid, name, desc, tags, custom])
             return all(t in hay for t in tokens)
 
         def rank(p: BrowserProfile, original_index: int) -> tuple[int, int]:
@@ -2784,6 +2844,8 @@ class MainWindow(QMainWindow):
             self._rebuild_tag_chips()
             self.ed_tag_add.clear()
             self.ed_description.setPlainText("")
+            self.ed_custom_data.setPlainText("")
+            self._collapse_custom_data_panel()
             self._sync_proxy_health_badge()
             return
         self.ed_name.setText(p.name)
@@ -2791,6 +2853,8 @@ class MainWindow(QMainWindow):
         self._rebuild_tag_chips()
         self.ed_tag_add.clear()
         self.ed_description.setPlainText((p.description or "").replace("\r\n", "\n"))
+        self.ed_custom_data.setPlainText(custom_data_to_json_text(p.custom_data))
+        self._collapse_custom_data_panel()
         self.ed_proxy_server.setText(p.proxy_server or "")
         self.ed_proxy_user.setText(p.proxy_username or "")
         self.ed_proxy_pass.setText(p.proxy_password or "")
@@ -3230,11 +3294,22 @@ class MainWindow(QMainWindow):
         )
         desc_raw = self.ed_description.toPlainText()
         desc_stripped = desc_raw.strip()
+        custom_raw = self.ed_custom_data.toPlainText()
+        try:
+            custom_parsed = custom_data_from_json_text(custom_raw)
+        except (json.JSONDecodeError, ValueError) as e:
+            QMessageBox.warning(
+                self,
+                "Доп. данные",
+                f"Некорректный JSON в поле «Доп. данные»:\n{e}",
+            )
+            return
         updated = replace(
             p,
             name=self.ed_name.text().strip() or p.name,
             tags=list(self._editable_tags),
             description=desc_stripped if desc_stripped else None,
+            custom_data=custom_parsed,
             proxy_server=proxy_server,
             proxy_username=proxy_user,
             proxy_password=proxy_pass,

@@ -15,6 +15,8 @@ class BrowserProfile:
     # Метаданные UI: произвольное число тегов, многострочное описание
     tags: list[str] = field(default_factory=list)
     description: str | None = None
+    # Произвольные JSON-совместимые данные (ключ → значение), не влияют на Playwright
+    custom_data: dict[str, Any] = field(default_factory=dict)
     automation_enabled: bool = False
     proxy_server: str | None = None  # e.g. http://host:port
     proxy_username: str | None = None
@@ -113,6 +115,7 @@ def profiles_from_json_list(raw: Any) -> list[BrowserProfile]:
                 name=str(item.get("name", "")).strip() or "Profile",
                 tags=normalize_tags_list(item.get("tags")),
                 description=_none_if_blank(item.get("description")),
+                custom_data=normalize_custom_data(item.get("custom_data")),
                 automation_enabled=bool(item.get("automation_enabled", False)),
                 proxy_server=_none_if_blank(item.get("proxy_server")),
                 proxy_username=_none_if_blank(item.get("proxy_username")),
@@ -154,6 +157,39 @@ def save_profiles(profiles: list[BrowserProfile]) -> None:
     p = profiles_path()
     payload: list[dict[str, Any]] = [asdict(x) for x in profiles]
     p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def normalize_custom_data(raw: Any) -> dict[str, Any]:
+    """Словарь с строковыми ключами и JSON-сериализуемыми значениями."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for k, v in raw.items():
+        key = str(k).strip()
+        if not key or len(key) > 256:
+            continue
+        if _is_json_serializable(v):
+            out[key] = v
+    return out
+
+
+def custom_data_to_json_text(data: dict[str, Any] | None) -> str:
+    d = normalize_custom_data(data)
+    if not d:
+        return ""
+    return json.dumps(d, ensure_ascii=False, indent=2)
+
+
+def custom_data_from_json_text(text: str) -> dict[str, Any]:
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("custom_data must be a JSON object")
+    return normalize_custom_data(parsed)
 
 
 def normalize_tags_list(raw: Any) -> list[str]:
@@ -234,4 +270,12 @@ def _float_or_none(v: Any) -> float | None:
         return float(v)
     except Exception:
         return None
+
+
+def _is_json_serializable(v: Any) -> bool:
+    try:
+        json.dumps(v)
+        return True
+    except (TypeError, ValueError):
+        return False
 
