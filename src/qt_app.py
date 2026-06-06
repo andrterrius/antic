@@ -77,6 +77,7 @@ from api_server import (
     register_ui_session,
     request_stop_by_profile_id,
     set_api_ui_hooks,
+    set_ui_profile_running,
     start_profile_api_background,
 )
 from fingerprint_consistency import normalize_timezone_country
@@ -140,13 +141,13 @@ class ApiUiBridge(QObject):
 
     log_line = pyqtSignal(str)
     sync_profile_run_button = pyqtSignal(str)
+    sync_profile_metadata = pyqtSignal(str)
 
     def __init__(self, main: "MainWindow") -> None:
         super().__init__(main)
         self.log_line.connect(main._append_log)
-        # Called from API thread via set_api_ui_hooks(): we also refresh profile list/form,
-        # because API can update profile metadata (e.g., tags).
-        self.sync_profile_run_button.connect(main._sync_profile_from_disk)
+        self.sync_profile_run_button.connect(main._sync_run_button)
+        self.sync_profile_metadata.connect(main._sync_profile_from_disk)
 
 
 class ProxyHealthCheckThread(QThread):
@@ -804,6 +805,7 @@ class MainWindow(QMainWindow):
         self._profile_id_to_checkbox: dict[str, QCheckBox] = {}
         self._profile_id_to_row: dict[str, QWidget] = {}
         self._profile_id_to_title_label: dict[str, QLabel] = {}
+        self._profile_id_to_id_label: dict[str, QLabel] = {}
         self._profile_row_filter_widgets: set[QWidget] = set()
         self._syncing_selection_check: bool = False
         # LMB «краска» по чекбоксам (Ctrl — добавить к уже отмеченным).
@@ -867,7 +869,7 @@ class MainWindow(QMainWindow):
         set_api_ui_hooks(
             log_line=self._api_bridge.log_line.emit,
             sync_profile_button=self._api_bridge.sync_profile_run_button.emit,
-            is_profile_running_in_ui=self._is_runner_thread_active,
+            sync_profile_metadata=self._api_bridge.sync_profile_metadata.emit,
         )
 
         self._main_splitter.addWidget(self._side_nav)
@@ -1026,7 +1028,7 @@ class MainWindow(QMainWindow):
         list_layout.setSpacing(10)
 
         self.ed_profiles_search = QLineEdit()
-        self.ed_profiles_search.setPlaceholderText("Поиск: имя / описание / теги / ID…")
+        self.ed_profiles_search.setPlaceholderText("Поиск: имя / описание / теги / ID / прокси…")
         self._expand_field(self.ed_profiles_search, min_w=240)
         self.ed_profiles_search.textChanged.connect(lambda _t: self._refresh_profiles_list())
         list_layout.addWidget(self.ed_profiles_search, 0)
@@ -2162,7 +2164,9 @@ class MainWindow(QMainWindow):
             desc = (p.description or "").lower()
             tags = ", ".join(p.tags or []).lower()
             custom = custom_data_to_json_text(p.custom_data).lower()
-            hay = " ".join([pid, name, desc, tags, custom])
+            proxy_srv = (p.proxy_server or "").lower()
+            proxy_user = (p.proxy_username or "").lower()
+            hay = " ".join([pid, name, desc, tags, custom, proxy_srv, proxy_user])
             return all(t in hay for t in tokens)
 
         def rank(p: BrowserProfile, original_index: int) -> tuple[int, int]:
@@ -2171,6 +2175,7 @@ class MainWindow(QMainWindow):
               0) profile_id
               1) name
               2) description/tags
+              3) proxy (сервер / логин)
             Чем меньше — тем выше в списке. Второй ключ — стабильность (старый порядок).
             """
             if not tokens:
@@ -2181,6 +2186,8 @@ class MainWindow(QMainWindow):
             name = (p.name or "").lower()
             desc = (p.description or "").lower()
             tags = ", ".join(p.tags or []).lower()
+            proxy_srv = (p.proxy_server or "").lower()
+            proxy_user = (p.proxy_username or "").lower()
 
             # Предпочтение "как ввели" (целиком) если пользователь вставил кусок ID/имени.
             if q and q in pid:
@@ -2189,6 +2196,8 @@ class MainWindow(QMainWindow):
                 return (1, original_index)
             if q and (q in desc or q in tags):
                 return (2, original_index)
+            if q and (q in proxy_srv or q in proxy_user):
+                return (3, original_index)
 
             # Иначе — по токенам.
             if all(t in pid for t in tokens):
@@ -2197,9 +2206,11 @@ class MainWindow(QMainWindow):
                 return (1, original_index)
             if all((t in desc) or (t in tags) for t in tokens):
                 return (2, original_index)
+            if all((t in proxy_srv) or (t in proxy_user) for t in tokens):
+                return (3, original_index)
 
             # Совпало “смешанно” по разным полям — ставим в самый низ среди найденных.
-            return (3, original_index)
+            return (4, original_index)
 
         existing_ids = {p.profile_id for p in self._profiles}
         # Preserve row selection across rebuild (clear() drops Qt item state; we restore from _checked_profile_ids).
@@ -2220,6 +2231,7 @@ class MainWindow(QMainWindow):
         self._profile_id_to_checkbox.clear()
         self._profile_id_to_row.clear()
         self._profile_id_to_title_label.clear()
+        self._profile_id_to_id_label.clear()
         self._profile_row_filter_widgets.clear()
 
         matched: list[tuple[int, BrowserProfile]] = []
@@ -2254,19 +2266,47 @@ class MainWindow(QMainWindow):
             cb.stateChanged.connect(lambda _state, pid=p.profile_id: self._on_profile_checkbox_state_changed(pid))
             cb.installEventFilter(self)
 
-            title_lbl = QLabel(f"{p.name}  ({p.profile_id})")
-            title_lbl.setObjectName(
+            title_row = QWidget()
+            title_l = QHBoxLayout(title_row)
+            title_l.setContentsMargins(0, 0, 0, 0)
+            title_l.setSpacing(6)
+
+            name_lbl = QLabel(p.name)
+            name_lbl.setObjectName(
                 "profileRowTitleActive" if is_active_row else "profileRowTitle"
             )
-            self._profile_id_to_title_label[p.profile_id] = title_lbl
-            # Только клавиатура: мышью — клик открывает настройки, перетаскивание — групповое выделение.
-            title_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByKeyboard)
+            self._profile_id_to_title_label[p.profile_id] = name_lbl
+            name_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByKeyboard)
+
+            id_lbl = QLabel(f"({p.profile_id})")
+            id_lbl.setObjectName(
+                "profileRowIdActive" if is_active_row else "profileRowId"
+            )
+            id_lbl.setFont(QFont("Consolas", 9))
+            self._profile_id_to_id_label[p.profile_id] = id_lbl
+            id_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByKeyboard)
+
+            copy_id_btn = QPushButton()
+            copy_id_btn.setObjectName("profileIdCopyBtn")
+            copy_id_btn.setFixedSize(22, 22)
+            copy_id_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            copy_id_btn.setToolTip("Копировать ID в буфер")
+            copy_id_btn.setText("⧉")
+            copy_id_btn.setFont(QFont("Segoe UI Symbol", 10))
+            copy_id_btn.clicked.connect(
+                lambda _c=False, pid=p.profile_id: self._copy_profile_id_to_clipboard(pid)
+            )
+
+            title_l.addWidget(name_lbl, 0)
+            title_l.addWidget(id_lbl, 0)
+            title_l.addWidget(copy_id_btn, 0)
+            title_l.addStretch(1)
 
             info = QWidget()
             info_l = QVBoxLayout(info)
             info_l.setContentsMargins(0, 0, 0, 0)
             info_l.setSpacing(4)
-            info_l.addWidget(title_lbl, 0)
+            info_l.addWidget(title_row, 0)
             desc_text = (p.description or "").strip()
             if desc_text:
                 desc_lbl = QLabel(desc_text)
@@ -2305,7 +2345,7 @@ class MainWindow(QMainWindow):
             hint = row.minimumSizeHint()
             it.setSizeHint(QSize(hint.width(), hint.height() + 6))
             self.profiles_list.setItemWidget(it, row)
-            self._register_profile_row_mouse_targets(row, cb, btn_run)
+            self._register_profile_row_mouse_targets(row, cb, btn_run, copy_id_btn)
 
         self.profiles_list.blockSignals(False)
         self._apply_profile_list_selection_visuals()
@@ -2319,12 +2359,12 @@ class MainWindow(QMainWindow):
         self._sync_proxy_health_badge()
 
     def _register_profile_row_mouse_targets(
-        self, row: QWidget, cb: QCheckBox, btn_run: QPushButton
+        self, row: QWidget, cb: QCheckBox, btn_run: QPushButton, copy_id_btn: QPushButton
     ) -> None:
         """Фильтр на виджеты строки: клики по тексту не должны попадать в QListWidget как выделение."""
         targets: list[QWidget] = [row]
         for ch in row.findChildren(QWidget):
-            if ch is cb or ch is btn_run:
+            if ch is cb or ch is btn_run or ch is copy_id_btn:
                 continue
             targets.append(ch)
         for w in targets:
@@ -2359,6 +2399,9 @@ class MainWindow(QMainWindow):
             self._repolish_widget(row)
         for pid, lbl in self._profile_id_to_title_label.items():
             lbl.setObjectName("profileRowTitleActive" if pid == active else "profileRowTitle")
+            self._repolish_widget(lbl)
+        for pid, lbl in self._profile_id_to_id_label.items():
+            lbl.setObjectName("profileRowIdActive" if pid == active else "profileRowId")
             self._repolish_widget(lbl)
 
     def _update_checked_profiles_count_label(self) -> None:
@@ -2429,7 +2472,7 @@ class MainWindow(QMainWindow):
             return False
         local = w.mapFrom(self.profiles_list.viewport(), pos)
         ch = w.childAt(local)
-        return isinstance(ch, QLabel) and ch.objectName() == "profileRowTitle"
+        return isinstance(ch, QLabel) and ch.objectName() in ("profileRowTitle", "profileRowId")
 
     def _profile_row_at_viewport_pos(self, pos) -> int | None:
         idx = self.profiles_list.indexAt(pos)
@@ -2749,7 +2792,10 @@ class MainWindow(QMainWindow):
                 return super().eventFilter(watched, event)
             if isinstance(watched, QScrollBar):
                 return super().eventFilter(watched, event)
-            if isinstance(watched, QPushButton) and self._run_buttons and any(watched is b for b in self._run_buttons.values()):
+            if isinstance(watched, QPushButton) and (
+                (self._run_buttons and any(watched is b for b in self._run_buttons.values()))
+                or watched.objectName() == "profileIdCopyBtn"
+            ):
                 return super().eventFilter(watched, event)
             if not isinstance(event, QMouseEvent):
                 return super().eventFilter(watched, event)
@@ -3420,6 +3466,7 @@ class MainWindow(QMainWindow):
             runner.finished_ok.connect(lambda ok, msg, pref=prefix, pid=profile_id: self._on_runner_finished(pid, pref, ok, msg))
             setattr(runner, "api_tracked_session_id", sid)
             self._runners[profile_id] = runner
+            set_ui_profile_running(profile_id, True)
             runner.start()
             self._sync_run_button(profile_id)
 
@@ -3429,6 +3476,7 @@ class MainWindow(QMainWindow):
         tid = getattr(r, "api_tracked_session_id", None) if r else None
         if r and not r.isRunning():
             self._runners.pop(profile_id, None)
+        set_ui_profile_running(profile_id, False)
         if isinstance(tid, str) and tid:
             notify_ui_session_finished(tid, ok, msg)
         self._sync_run_button(profile_id)

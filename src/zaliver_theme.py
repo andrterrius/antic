@@ -151,6 +151,18 @@ QLabel#profileRowTitleActive {
     background: transparent;
 }
 
+QLabel#profileRowId {
+    color: #94a3b8;
+    border: none;
+    background: transparent;
+}
+
+QLabel#profileRowIdActive {
+    color: #cbd5e1;
+    border: none;
+    background: transparent;
+}
+
 /* Строка списка: обычная / открыта в редакторе (клик по строке, не чекбокс) */
 QWidget#profileRow {
     background: transparent;
@@ -453,7 +465,8 @@ QPushButton#proxyProfileIdOpenBtn:pressed {
     color: #a5b4fc;
 }
 
-QPushButton#proxyIdCopyBtn {
+QPushButton#proxyIdCopyBtn,
+QPushButton#profileIdCopyBtn {
     background: transparent;
     border: 1px solid transparent;
     border-radius: 6px;
@@ -461,7 +474,8 @@ QPushButton#proxyIdCopyBtn {
     min-height: 0;
 }
 
-QPushButton#proxyIdCopyBtn:hover {
+QPushButton#proxyIdCopyBtn:hover,
+QPushButton#profileIdCopyBtn:hover {
     background-color: rgba(99, 102, 241, 0.22);
     border: 1px solid #6366f1;
 }

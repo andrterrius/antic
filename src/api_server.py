@@ -220,21 +220,46 @@ _ui_profile_busy: dict[str, str] = {}  # profile_id -> session_id только �
 _hooks_lock = threading.Lock()
 _log_hook: Callable[[str], None] | None = None
 _sync_hook: Callable[[str], None] | None = None  # profile_id -> refresh Run button in UI
-_qt_runner_busy: Callable[[str], bool] | None = None  # profile_id -> UI RunnerThread active
+_sync_metadata_hook: Callable[[str], None] | None = None  # profile_id -> reload profiles from disk in UI
+
+# Обновляется только из GUI-потока; читается из потоков API без обращения к QThread.
+_ui_running_lock = threading.Lock()
+_ui_running_profile_ids: set[str] = set()
+
+
+def set_ui_profile_running(profile_id: str, running: bool) -> None:
+    """Вызывается из GUI при старте/завершении RunnerThread."""
+    pid = (profile_id or "").strip()
+    if not pid:
+        return
+    with _ui_running_lock:
+        if running:
+            _ui_running_profile_ids.add(pid)
+        else:
+            _ui_running_profile_ids.discard(pid)
+
+
+def is_profile_running_in_ui(profile_id: str) -> bool:
+    """Потокобезопасная проверка без QThread.isRunning() из чужого потока."""
+    pid = (profile_id or "").strip()
+    if not pid:
+        return False
+    with _ui_running_lock:
+        return pid in _ui_running_profile_ids
 
 
 def set_api_ui_hooks(
     *,
     log_line: Callable[[str], None] | None = None,
     sync_profile_button: Callable[[str], None] | None = None,
-    is_profile_running_in_ui: Callable[[str], bool] | None = None,
+    sync_profile_metadata: Callable[[str], None] | None = None,
 ) -> None:
     """Called from the Qt main thread after MainWindow is ready (optional hooks)."""
-    global _log_hook, _sync_hook, _qt_runner_busy
+    global _log_hook, _sync_hook, _sync_metadata_hook
     with _hooks_lock:
         _log_hook = log_line
         _sync_hook = sync_profile_button
-        _qt_runner_busy = is_profile_running_in_ui
+        _sync_metadata_hook = sync_profile_metadata
     set_profiles_ui_log_hook(log_line)
     if log_line:
         try:
@@ -246,17 +271,6 @@ def set_api_ui_hooks(
             log_line(f"Каталог данных профилей Chromium (user-data): {resolved_ud}")
         except Exception:
             pass
-
-
-def _ui_runner_blocks(profile_id: str) -> bool:
-    with _hooks_lock:
-        fn = _qt_runner_busy
-    if not fn:
-        return False
-    try:
-        return bool(fn(profile_id))
-    except Exception:
-        return False
 
 
 def _ui_log(msg: str) -> None:
@@ -272,6 +286,16 @@ def _ui_log(msg: str) -> None:
 def _ui_sync_profile(profile_id: str) -> None:
     with _hooks_lock:
         fn = _sync_hook
+    if fn:
+        try:
+            fn(profile_id)
+        except Exception:
+            pass
+
+
+def _ui_sync_profile_metadata(profile_id: str) -> None:
+    with _hooks_lock:
+        fn = _sync_metadata_hook
     if fn:
         try:
             fn(profile_id)
@@ -543,7 +567,7 @@ def _mutate_profile_custom_data(
         profiles[idx] = BrowserProfile(**{**asdict(p), "custom_data": current})
         save_profiles(profiles)
         out = _profile_to_out(profiles[idx])
-    _ui_sync_profile(pid)
+    _ui_sync_profile_metadata(pid)
     return out
 
 
@@ -555,7 +579,7 @@ def _session_worker(sess: ProfileRunSession, profile: BrowserProfile, body: Laun
             sess.log_lines.append(line.rstrip("\n"))
             if len(sess.log_lines) > 4000:
                 sess.log_lines = sess.log_lines[-2500:]
-        _ui_log(f"{prefix} {line.rstrip()}")
+        # Строки доступны в GET /sessions/{id} → log_tail; не заливаем GUI на каждую строку.
 
     def on_cdp(info: dict[str, object]) -> None:
         with _lock:
@@ -668,7 +692,7 @@ def build_app() -> FastAPI:
             profiles[idx] = BrowserProfile(**{**asdict(p), "tags": tags_next})
             save_profiles(profiles)
             out = _profile_to_out(profiles[idx])
-        _ui_sync_profile(pid)
+        _ui_sync_profile_metadata(pid)
         return out
 
     @app.put(
@@ -732,7 +756,7 @@ def build_app() -> FastAPI:
             profiles[idx] = BrowserProfile(**{**asdict(p), "tags": tags_next})
             save_profiles(profiles)
             out = _profile_to_out(profiles[idx])
-        _ui_sync_profile(pid)
+        _ui_sync_profile_metadata(pid)
         return out
 
     @app.post(
@@ -746,7 +770,7 @@ def build_app() -> FastAPI:
         if not p:
             raise HTTPException(status_code=404, detail="Profile not found")
 
-        if _ui_runner_blocks(profile_id):
+        if is_profile_running_in_ui(profile_id):
             raise HTTPException(
                 status_code=409,
                 detail="Profile is already running from the UI (stop it first)",
@@ -837,6 +861,7 @@ def build_app() -> FastAPI:
         summary="Запросить остановку сессии",
     )
     def stop_session(session_id: str) -> SimpleStatusOut:
+        s: ProfileRunSession | None = None
         u: UiRunSession | None = None
         cb: Callable[[], None] | None = None
         pid: str = ""
@@ -845,15 +870,17 @@ def build_app() -> FastAPI:
             if s:
                 s.stop_event.set()
                 pid = s.profile_id
-                _ui_log(f"[API:{session_id}] POST /stop — профиль {pid}, остановка запрошена")
-                _ui_sync_profile(pid)
-                return SimpleStatusOut(status="stop_requested")
-            u = _ui_sessions.get(session_id)
-            if u:
-                if u.finished:
-                    raise HTTPException(status_code=400, detail="Session already finished")
-                cb = u._stop_cb
-                pid = u.profile_id
+            else:
+                u = _ui_sessions.get(session_id)
+                if u:
+                    if u.finished:
+                        raise HTTPException(status_code=400, detail="Session already finished")
+                    cb = u._stop_cb
+                    pid = u.profile_id
+        if s:
+            _ui_log(f"[API:{session_id}] POST /stop — профиль {pid}, остановка запрошена")
+            _ui_sync_profile(pid)
+            return SimpleStatusOut(status="stop_requested")
         if u and cb:
             try:
                 cb()
