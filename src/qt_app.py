@@ -52,9 +52,13 @@ from PyQt6.QtWidgets import (
 
 from profiles_store import (
     BrowserProfile,
+    count_legacy_json_profiles,
     custom_data_from_json_text,
     custom_data_to_json_text,
+    legacy_json_path,
     load_profiles,
+    migrate_json_to_sqlite,
+    needs_json_migration,
     save_profiles,
     tags_from_delimited_text,
 )
@@ -840,6 +844,10 @@ class MainWindow(QMainWindow):
         self._proxy_single_check_dialog: QProgressDialog | None = None
         self._proxies_table_refreshing = False
         self._pending_open_profile_id: str | None = None
+        self._metadata_sync_timer = QTimer(self)
+        self._metadata_sync_timer.setSingleShot(True)
+        self._metadata_sync_timer.setInterval(300)
+        self._metadata_sync_timer.timeout.connect(self._flush_metadata_sync_from_disk)
 
         layout = QHBoxLayout(root)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -1031,7 +1039,11 @@ class MainWindow(QMainWindow):
         self.ed_profiles_search.setPlaceholderText("Поиск: имя / описание / теги / ID / прокси…")
         self._expand_field(self.ed_profiles_search, min_w=240)
         self.ed_profiles_search.textChanged.connect(lambda _t: self._refresh_profiles_list())
-        list_layout.addWidget(self.ed_profiles_search, 0)
+
+        search_row = QHBoxLayout()
+        search_row.setSpacing(8)
+        search_row.addWidget(self.ed_profiles_search, 1)
+        list_layout.addLayout(search_row)
 
         list_sel_row = QHBoxLayout()
         list_sel_row.addStretch(1)
@@ -2681,12 +2693,12 @@ class MainWindow(QMainWindow):
     def _sync_profile_from_disk(self, profile_id: str) -> None:
         """
         UI-sync entrypoint used by the local API hook.
-        Refreshes run button state and reloads profiles from disk to reflect metadata updates (tags, description, etc).
+        Debounces full reload so bursts of API metadata updates do not freeze the UI.
         """
-        # Fast path: update the Run/Stop button if it exists in the current list.
         self._sync_run_button(profile_id)
+        self._metadata_sync_timer.start()
 
-        # Reload profiles so the list (tag hint) and editor reflect the latest saved state.
+    def _flush_metadata_sync_from_disk(self) -> None:
         prev_active = self._active_profile_id
         prev_checked = set(self._checked_profile_ids)
         self._profiles = load_profiles()
@@ -3485,12 +3497,52 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(s)
 
 
+def _offer_json_migration_dialog() -> None:
+    if not needs_json_migration():
+        return
+
+    count = count_legacy_json_profiles()
+    json_path = legacy_json_path()
+    reply = QMessageBox.question(
+        None,
+        "Миграция базы данных",
+        (
+            "Обнаружен старый файл profiles.json с данными профилей.\n\n"
+            f"Файл: {json_path}\n"
+            f"Профилей: {count}\n\n"
+            "Перенести все данные в новую базу SQLite?\n"
+            "После миграции profiles.json будет переименован в profiles.json.migrated."
+        ),
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.Yes,
+    )
+    if reply != QMessageBox.StandardButton.Yes:
+        return
+
+    try:
+        migrated = migrate_json_to_sqlite()
+    except Exception as e:
+        QMessageBox.critical(
+            None,
+            "Ошибка миграции",
+            f"Не удалось перенести данные из profiles.json:\n{e}",
+        )
+        return
+
+    QMessageBox.information(
+        None,
+        "Миграция завершена",
+        f"Перенесено профилей: {migrated}.\nДанные сохранены в SQLite.",
+    )
+
+
 def run_qt() -> None:
     app = QApplication([])
     app.setApplicationName("Antidetect UI")
     _ico = build_app_icon()
     app.setWindowIcon(_ico)
     app.setStyleSheet(ZALIVER_DARK_QSS)
+    _offer_json_migration_dialog()
     w = MainWindow()
     w.setWindowIcon(_ico)
     base = start_profile_api_background()

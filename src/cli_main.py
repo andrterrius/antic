@@ -11,7 +11,16 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Callable, Optional
 
-from profiles_store import BrowserProfile, load_profiles, save_profiles, tags_from_delimited_text
+from profiles_store import (
+    BrowserProfile,
+    count_legacy_json_profiles,
+    legacy_json_path,
+    load_profiles,
+    migrate_json_to_sqlite,
+    needs_json_migration,
+    save_profiles,
+    tags_from_delimited_text,
+)
 from fingerprint_generator import generate_test_fingerprint
 from fingerprint_consistency import normalize_timezone_country
 from proxy_health import profile_with_recorded_proxy_health
@@ -534,9 +543,35 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _maybe_migrate_json_on_cli() -> None:
+    if not needs_json_migration():
+        return
+
+    count = count_legacy_json_profiles()
+    _eprint(
+        f"Обнаружен старый profiles.json ({count} профилей): {legacy_json_path()}\n"
+        "Перенести данные в SQLite? [y/N]: "
+    )
+    try:
+        answer = input().strip().lower()
+    except EOFError:
+        answer = ""
+    if answer not in ("y", "yes", "д", "да"):
+        _eprint("Миграция пропущена.")
+        return
+
+    try:
+        migrated = migrate_json_to_sqlite()
+    except Exception as e:
+        _eprint(f"ERROR: не удалось выполнить миграцию: {e}")
+        raise SystemExit(2) from e
+    _eprint(f"Перенесено профилей: {migrated}.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _maybe_migrate_json_on_cli()
     try:
         return int(args.func(args))
     except BrokenPipeError:

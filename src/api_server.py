@@ -16,10 +16,12 @@ from collections.abc import Callable
 
 from profiles_store import (
     BrowserProfile,
+    get_profile,
     load_profiles,
     normalize_custom_data,
     normalize_tags_list,
-    save_profiles,
+    update_profile_custom_data,
+    update_profile_tags,
     set_profiles_ui_log_hook,
 )
 from playwright_runner import chromium_user_data_parent, run_profile
@@ -504,13 +506,7 @@ class ProfileRunSession:
 
 
 def _find_profile(profile_id: str) -> BrowserProfile | None:
-    pid = (profile_id or "").strip()
-    if not pid:
-        return None
-    for p in load_profiles():
-        if p.profile_id == pid:
-            return p
-    return None
+    return get_profile(profile_id)
 
 
 def _require_non_empty_tag(tag: str) -> str:
@@ -542,33 +538,29 @@ def _mutate_profile_custom_data(
     pid = (profile_id or "").strip()
     if not pid:
         raise HTTPException(status_code=404, detail="Profile not found")
-    out: ProfileOut
-    with _lock:
-        profiles = load_profiles()
-        idx = next((i for i, p in enumerate(profiles) if p.profile_id == pid), -1)
-        if idx < 0:
-            raise HTTPException(status_code=404, detail="Profile not found")
-        p = profiles[idx]
-        current = dict(p.custom_data or {})
-        if replace is not None:
-            current = normalize_custom_data(replace)
-        if merge is not None:
-            current = normalize_custom_data({**current, **merge})
-        if set_key is not None:
-            k, v = set_key
-            kk = _require_custom_data_key(k)
-            trial = normalize_custom_data({kk: v})
-            if kk not in trial:
-                raise HTTPException(status_code=400, detail="Value is not JSON-serializable")
-            current = {**current, kk: trial[kk]}
-        if delete_key is not None:
-            dk = _require_custom_data_key(delete_key)
-            current = {k: v for k, v in current.items() if k != dk}
-        profiles[idx] = BrowserProfile(**{**asdict(p), "custom_data": current})
-        save_profiles(profiles)
-        out = _profile_to_out(profiles[idx])
+    p = get_profile(pid)
+    if not p:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    current = dict(p.custom_data or {})
+    if replace is not None:
+        current = normalize_custom_data(replace)
+    if merge is not None:
+        current = normalize_custom_data({**current, **merge})
+    if set_key is not None:
+        k, v = set_key
+        kk = _require_custom_data_key(k)
+        trial = normalize_custom_data({kk: v})
+        if kk not in trial:
+            raise HTTPException(status_code=400, detail="Value is not JSON-serializable")
+        current = {**current, kk: trial[kk]}
+    if delete_key is not None:
+        dk = _require_custom_data_key(delete_key)
+        current = {k: v for k, v in current.items() if k != dk}
+    updated = update_profile_custom_data(pid, current)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Profile not found")
     _ui_sync_profile_metadata(pid)
-    return out
+    return _profile_to_out(updated)
 
 
 def _session_worker(sess: ProfileRunSession, profile: BrowserProfile, body: LaunchProfileBody) -> None:
@@ -676,24 +668,19 @@ def build_app() -> FastAPI:
         summary="Добавить тег профилю",
     )
     def add_profile_tag(profile_id: str, tag: str) -> ProfileOut:
-        """Добавляет тег (без дублей) и сохраняет profiles.json."""
+        """Добавляет тег (без дублей) и сохраняет в SQLite."""
         pid = (profile_id or "").strip()
         if not pid:
             raise HTTPException(status_code=404, detail="Profile not found")
         t = _require_non_empty_tag(tag)
-        out: ProfileOut
-        with _lock:
-            profiles = load_profiles()
-            idx = next((i for i, p in enumerate(profiles) if p.profile_id == pid), -1)
-            if idx < 0:
-                raise HTTPException(status_code=404, detail="Profile not found")
-            p = profiles[idx]
-            tags_next = normalize_tags_list([*p.tags, t])
-            profiles[idx] = BrowserProfile(**{**asdict(p), "tags": tags_next})
-            save_profiles(profiles)
-            out = _profile_to_out(profiles[idx])
+        p = get_profile(pid)
+        if not p:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        updated = update_profile_tags(pid, normalize_tags_list([*p.tags, t]))
+        if not updated:
+            raise HTTPException(status_code=404, detail="Profile not found")
         _ui_sync_profile_metadata(pid)
-        return out
+        return _profile_to_out(updated)
 
     @app.put(
         "/profiles/{profile_id}/custom-data",
@@ -740,24 +727,19 @@ def build_app() -> FastAPI:
         summary="Удалить тег у профиля",
     )
     def remove_profile_tag(profile_id: str, tag: str) -> ProfileOut:
-        """Удаляет тег (если есть) и сохраняет profiles.json."""
+        """Удаляет тег (если есть) и сохраняет в SQLite."""
         pid = (profile_id or "").strip()
         if not pid:
             raise HTTPException(status_code=404, detail="Profile not found")
         t = _require_non_empty_tag(tag)
-        out: ProfileOut
-        with _lock:
-            profiles = load_profiles()
-            idx = next((i for i, p in enumerate(profiles) if p.profile_id == pid), -1)
-            if idx < 0:
-                raise HTTPException(status_code=404, detail="Profile not found")
-            p = profiles[idx]
-            tags_next = [x for x in p.tags if x != t]
-            profiles[idx] = BrowserProfile(**{**asdict(p), "tags": tags_next})
-            save_profiles(profiles)
-            out = _profile_to_out(profiles[idx])
+        p = get_profile(pid)
+        if not p:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        updated = update_profile_tags(pid, [x for x in p.tags if x != t])
+        if not updated:
+            raise HTTPException(status_code=404, detail="Profile not found")
         _ui_sync_profile_metadata(pid)
-        return out
+        return _profile_to_out(updated)
 
     @app.post(
         "/profiles/{profile_id}/launch",

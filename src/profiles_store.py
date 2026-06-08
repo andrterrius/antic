@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sqlite3
 import sys
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
+
+DB_FILENAME = "profiles.db"
+LEGACY_JSON_FILENAME = "profiles.json"
+LEGACY_JSON_BACKUP_SUFFIX = ".migrated"
 
 
 @dataclass(slots=True)
@@ -48,9 +56,72 @@ class BrowserProfile:
     webgl_shading_language_version: str | None = None
 
 
+_PROFILE_COLUMNS: tuple[str, ...] = (
+    "profile_id",
+    "name",
+    "tags",
+    "description",
+    "custom_data",
+    "automation_enabled",
+    "proxy_server",
+    "proxy_username",
+    "proxy_password",
+    "proxy_health_ok",
+    "proxy_health_checked_at",
+    "proxy_health_message",
+    "engine",
+    "device_preset",
+    "user_agent",
+    "locale",
+    "timezone_id",
+    "country_code",
+    "viewport_width",
+    "viewport_height",
+    "color_scheme",
+    "geo_lat",
+    "geo_lon",
+    "webgl_vendor",
+    "webgl_renderer",
+    "webgl_version",
+    "webgl_shading_language_version",
+)
+
+_CREATE_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS profiles (
+    profile_id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    tags TEXT NOT NULL DEFAULT '[]',
+    description TEXT,
+    custom_data TEXT NOT NULL DEFAULT '{{}}',
+    automation_enabled INTEGER NOT NULL DEFAULT 0,
+    proxy_server TEXT,
+    proxy_username TEXT,
+    proxy_password TEXT,
+    proxy_health_ok INTEGER,
+    proxy_health_checked_at TEXT,
+    proxy_health_message TEXT,
+    engine TEXT,
+    device_preset TEXT,
+    user_agent TEXT,
+    locale TEXT,
+    timezone_id TEXT,
+    country_code TEXT,
+    viewport_width INTEGER,
+    viewport_height INTEGER,
+    color_scheme TEXT,
+    geo_lat REAL,
+    geo_lon REAL,
+    webgl_vendor TEXT,
+    webgl_renderer TEXT,
+    webgl_version TEXT,
+    webgl_shading_language_version TEXT
+)
+"""
+
+
 def app_state_root() -> Path:
     """
-    Корень данных приложения: рядом лежат подкаталоги `data/` (profiles.json) и `user-data/` (Chromium).
+    Корень данных приложения: рядом лежат подкаталоги `data/` (profiles.db) и `user-data/` (Chromium).
     Windows: %APPDATA%\\AntidetectUI; macOS: ~/Library/Application Support/AntidetectUI; иначе ./data от репо.
     """
     if sys.platform == "win32":
@@ -82,8 +153,17 @@ def set_profiles_ui_log_hook(fn: Callable[[str], None] | None) -> None:
         profiles_path()
 
 
+def sqlite_db_path() -> Path:
+    return _data_dir() / DB_FILENAME
+
+
+def legacy_json_path() -> Path:
+    return _data_dir() / LEGACY_JSON_FILENAME
+
+
 def profiles_path() -> Path:
-    p = _data_dir() / "profiles.json"
+    """Путь к основному хранилищу профилей (SQLite)."""
+    p = sqlite_db_path()
     log_fn = _profiles_ui_log
     if log_fn:
         try:
@@ -94,10 +174,132 @@ def profiles_path() -> Path:
         if _profiles_path_logged_resolved != resolved:
             _profiles_path_logged_resolved = resolved
             try:
-                log_fn(f"Хранилище профилей (profiles.json): {resolved}")
+                log_fn(f"Хранилище профилей (SQLite): {resolved}")
             except Exception:
                 pass
     return p
+
+
+_store_lock = threading.RLock()
+
+
+def _init_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(_CREATE_TABLE_SQL)
+
+
+def _configure_connection(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+
+
+@contextmanager
+def _db_connection(*, write: bool = False) -> Iterator[sqlite3.Connection]:
+    db_path = sqlite_db_path()
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        _configure_connection(conn)
+        _init_schema(conn)
+        yield conn
+        if write:
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _bool_to_db(v: bool | None) -> int | None:
+    if v is None:
+        return None
+    return 1 if v else 0
+
+
+def _bool_from_db(v: Any) -> bool | None:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    try:
+        return bool(int(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _profile_to_row(p: BrowserProfile) -> tuple[Any, ...]:
+    return (
+        p.profile_id,
+        p.name,
+        json.dumps(p.tags, ensure_ascii=False),
+        p.description,
+        json.dumps(p.custom_data, ensure_ascii=False),
+        1 if p.automation_enabled else 0,
+        p.proxy_server,
+        p.proxy_username,
+        p.proxy_password,
+        _bool_to_db(p.proxy_health_ok),
+        p.proxy_health_checked_at,
+        p.proxy_health_message,
+        p.engine,
+        p.device_preset,
+        p.user_agent,
+        p.locale,
+        p.timezone_id,
+        p.country_code,
+        p.viewport_width,
+        p.viewport_height,
+        p.color_scheme,
+        p.geo_lat,
+        p.geo_lon,
+        p.webgl_vendor,
+        p.webgl_renderer,
+        p.webgl_version,
+        p.webgl_shading_language_version,
+    )
+
+
+def _row_to_profile(row: sqlite3.Row) -> BrowserProfile:
+    tags_raw = row["tags"]
+    custom_raw = row["custom_data"]
+    try:
+        tags = json.loads(tags_raw) if tags_raw else []
+    except (TypeError, json.JSONDecodeError):
+        tags = []
+    try:
+        custom_data = json.loads(custom_raw) if custom_raw else {}
+    except (TypeError, json.JSONDecodeError):
+        custom_data = {}
+
+    return BrowserProfile(
+        profile_id=str(row["profile_id"]).strip(),
+        name=str(row["name"]).strip() or "Profile",
+        tags=normalize_tags_list(tags),
+        description=_none_if_blank(row["description"]),
+        custom_data=normalize_custom_data(custom_data),
+        automation_enabled=bool(row["automation_enabled"]),
+        proxy_server=_none_if_blank(row["proxy_server"]),
+        proxy_username=_none_if_blank(row["proxy_username"]),
+        proxy_password=_none_if_blank(row["proxy_password"]),
+        proxy_health_ok=_bool_from_db(row["proxy_health_ok"]),
+        proxy_health_checked_at=_none_if_blank(row["proxy_health_checked_at"]),
+        proxy_health_message=_none_if_blank(row["proxy_health_message"]),
+        engine=_none_if_blank(row["engine"]) or "chromium",
+        device_preset=_none_if_blank(row["device_preset"]),
+        user_agent=_none_if_blank(row["user_agent"]),
+        locale=_none_if_blank(row["locale"]),
+        timezone_id=_none_if_blank(row["timezone_id"]),
+        country_code=_none_if_blank(row["country_code"]),
+        viewport_width=_int_or_none(row["viewport_width"], default=None),
+        viewport_height=_int_or_none(row["viewport_height"], default=None),
+        color_scheme=_none_if_blank(row["color_scheme"]),
+        geo_lat=_float_or_none(row["geo_lat"]),
+        geo_lon=_float_or_none(row["geo_lon"]),
+        webgl_vendor=_none_if_blank(row["webgl_vendor"]),
+        webgl_renderer=_none_if_blank(row["webgl_renderer"]),
+        webgl_version=_none_if_blank(row["webgl_version"]),
+        webgl_shading_language_version=_none_if_blank(row["webgl_shading_language_version"]),
+    )
 
 
 def profiles_from_json_list(raw: Any) -> list[BrowserProfile]:
@@ -144,19 +346,133 @@ def profiles_from_json_list(raw: Any) -> list[BrowserProfile]:
     return [x for x in out if x.profile_id]
 
 
-def load_profiles() -> list[BrowserProfile]:
-    p = profiles_path()
-    if not p.exists():
+def load_profiles_from_json_file(path: Path | None = None) -> list[BrowserProfile]:
+    p = path or legacy_json_path()
+    if not p.is_file():
         return []
-
     raw = json.loads(p.read_text(encoding="utf-8"))
     return profiles_from_json_list(raw)
 
 
+def _select_profile_row(conn: sqlite3.Connection, profile_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        f"SELECT {', '.join(_PROFILE_COLUMNS)} FROM profiles WHERE profile_id = ?",
+        (profile_id,),
+    ).fetchone()
+
+
+def get_profile(profile_id: str) -> BrowserProfile | None:
+    pid = (profile_id or "").strip()
+    if not pid or not sqlite_db_path().exists():
+        return None
+    with _db_connection() as conn:
+        row = _select_profile_row(conn, pid)
+    if not row:
+        return None
+    return _row_to_profile(row)
+
+
+def load_profiles() -> list[BrowserProfile]:
+    if not sqlite_db_path().exists():
+        return []
+
+    with _db_connection() as conn:
+        rows = conn.execute(
+            f"SELECT {', '.join(_PROFILE_COLUMNS)} FROM profiles ORDER BY rowid"
+        ).fetchall()
+    return [_row_to_profile(row) for row in rows if str(row["profile_id"]).strip()]
+
+
+def update_profile_tags(profile_id: str, tags: list[str]) -> BrowserProfile | None:
+    """Обновляет только поле tags одного профиля (без полной перезаписи базы)."""
+    pid = (profile_id or "").strip()
+    if not pid:
+        return None
+    tags_json = json.dumps(normalize_tags_list(tags), ensure_ascii=False)
+    with _store_lock:
+        with _db_connection(write=True) as conn:
+            cur = conn.execute(
+                "UPDATE profiles SET tags = ? WHERE profile_id = ?",
+                (tags_json, pid),
+            )
+            if cur.rowcount == 0:
+                return None
+            row = _select_profile_row(conn, pid)
+    return _row_to_profile(row) if row else None
+
+
+def update_profile_custom_data(profile_id: str, custom_data: dict[str, Any]) -> BrowserProfile | None:
+    """Обновляет только поле custom_data одного профиля."""
+    pid = (profile_id or "").strip()
+    if not pid:
+        return None
+    data_json = json.dumps(normalize_custom_data(custom_data), ensure_ascii=False)
+    with _store_lock:
+        with _db_connection(write=True) as conn:
+            cur = conn.execute(
+                "UPDATE profiles SET custom_data = ? WHERE profile_id = ?",
+                (data_json, pid),
+            )
+            if cur.rowcount == 0:
+                return None
+            row = _select_profile_row(conn, pid)
+    return _row_to_profile(row) if row else None
+
+
 def save_profiles(profiles: list[BrowserProfile]) -> None:
-    p = profiles_path()
-    payload: list[dict[str, Any]] = [asdict(x) for x in profiles]
-    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    placeholders = ", ".join("?" for _ in _PROFILE_COLUMNS)
+    columns = ", ".join(_PROFILE_COLUMNS)
+    insert_sql = f"INSERT OR REPLACE INTO profiles ({columns}) VALUES ({placeholders})"
+    keep_ids = [p.profile_id for p in profiles if p.profile_id]
+
+    with _store_lock:
+        with _db_connection(write=True) as conn:
+            if keep_ids:
+                conn.executemany(insert_sql, [_profile_to_row(p) for p in profiles if p.profile_id])
+                placeholders_ids = ", ".join("?" for _ in keep_ids)
+                conn.execute(
+                    f"DELETE FROM profiles WHERE profile_id NOT IN ({placeholders_ids})",
+                    keep_ids,
+                )
+            else:
+                conn.execute("DELETE FROM profiles")
+
+
+def needs_json_migration() -> bool:
+    """True, если есть старый profiles.json, но ещё нет SQLite-базы."""
+    return legacy_json_path().is_file() and not sqlite_db_path().is_file()
+
+
+def count_legacy_json_profiles() -> int:
+    return len(load_profiles_from_json_file())
+
+
+def _backup_legacy_json() -> Path:
+    src = legacy_json_path()
+    backup = src.with_suffix(src.suffix + LEGACY_JSON_BACKUP_SUFFIX)
+    if backup.exists():
+        backup.unlink()
+    shutil.move(str(src), str(backup))
+    return backup
+
+
+def migrate_json_to_sqlite(*, json_path: Path | None = None) -> int:
+    """
+    Переносит профили из profiles.json в SQLite.
+    После успешной записи переименовывает JSON в profiles.json.migrated.
+    Возвращает число перенесённых профилей.
+    """
+    src = json_path or legacy_json_path()
+    if not src.is_file():
+        return 0
+
+    profiles = load_profiles_from_json_file(src)
+    save_profiles(profiles)
+
+    if src == legacy_json_path():
+        _backup_legacy_json()
+
+    return len(profiles)
 
 
 def normalize_custom_data(raw: Any) -> dict[str, Any]:
@@ -278,4 +594,3 @@ def _is_json_serializable(v: Any) -> bool:
         return True
     except (TypeError, ValueError):
         return False
-
