@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from collections.abc import Callable
 
@@ -21,6 +21,7 @@ from profiles_store import (
     normalize_custom_data,
     normalize_tags_list,
     update_profile_custom_data,
+    update_profile_name,
     update_profile_tags,
     set_profiles_ui_log_hook,
 )
@@ -68,6 +69,27 @@ class ProfileOut(BaseModel):
     webgl_renderer: str | None = Field(None)
     webgl_version: str | None = Field(None)
     webgl_shading_language_version: str | None = Field(None)
+
+
+_PROFILE_NAME_MAX_LEN = 256
+
+
+class ProfileNamePatch(BaseModel):
+    """Частичное обновление профиля (сейчас — только имя)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., description="Новое имя профиля")
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        s = (v or "").strip()
+        if not s:
+            raise ValueError("name must be non-empty")
+        if len(s) > _PROFILE_NAME_MAX_LEN:
+            raise ValueError(f"name is too long (max {_PROFILE_NAME_MAX_LEN})")
+        return s
 
 
 class CustomDataBody(BaseModel):
@@ -660,6 +682,25 @@ def build_app() -> FastAPI:
         if not p:
             raise HTTPException(status_code=404, detail="Profile not found")
         return _profile_to_out(p)
+
+    @app.patch(
+        "/profiles/{profile_id}",
+        response_model=ProfileOut,
+        tags=["Профили"],
+        summary="Частичное обновление профиля",
+    )
+    def patch_profile(profile_id: str, body: ProfileNamePatch) -> ProfileOut:
+        """Частичное обновление профиля (сейчас — только имя)."""
+        pid = (profile_id or "").strip()
+        if not pid:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        if not get_profile(pid):
+            raise HTTPException(status_code=404, detail="Profile not found")
+        updated = update_profile_name(pid, body.name)
+        if not updated:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        _ui_sync_profile_metadata(pid)
+        return _profile_to_out(updated)
 
     @app.post(
         "/profiles/{profile_id}/tags/{tag}",

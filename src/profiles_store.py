@@ -383,6 +383,26 @@ def load_profiles() -> list[BrowserProfile]:
     return [_row_to_profile(row) for row in rows if str(row["profile_id"]).strip()]
 
 
+def update_profile_name(profile_id: str, name: str) -> BrowserProfile | None:
+    """Обновляет только поле name одного профиля (без полной перезаписи базы)."""
+    pid = (profile_id or "").strip()
+    if not pid:
+        return None
+    new_name = (name or "").strip()
+    if not new_name:
+        return None
+    with _store_lock:
+        with _db_connection(write=True) as conn:
+            cur = conn.execute(
+                "UPDATE profiles SET name = ? WHERE profile_id = ?",
+                (new_name, pid),
+            )
+            if cur.rowcount == 0:
+                return None
+            row = _select_profile_row(conn, pid)
+    return _row_to_profile(row) if row else None
+
+
 def update_profile_tags(profile_id: str, tags: list[str]) -> BrowserProfile | None:
     """Обновляет только поле tags одного профиля (без полной перезаписи базы)."""
     pid = (profile_id or "").strip()
