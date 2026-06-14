@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import random
+import uuid
 from dataclasses import replace
 from typing import TypeVar
 
 from chromium_release_versions import CHROMIUM_RELEASE_VERSIONS
+from fingerprint_consistency import normalize_timezone_country
+from playwright_runner import geoip_from_ip, get_proxy_ip
 from profiles_store import BrowserProfile
 
 T = TypeVar("T")
@@ -328,3 +331,27 @@ def _webgl_params(
 
     v, r = rnd.choice(_WGL_CHROME_WIN)
     return v, r, _WGL_CR_VERSION, _WGL_CR_SLV
+
+
+def regenerate_profile_fingerprint(profile: BrowserProfile, *, seed: str | None = None) -> BrowserProfile:
+    """
+    New browser persona for an existing profile.
+    Keeps profile_id, name, proxy fields, and proxy health; regenerates fingerprint knobs.
+    """
+    new_seed = seed or uuid.uuid4().hex
+    base = replace(profile, viewport_width=None, viewport_height=None)
+    regen = generate_test_fingerprint(base, seed=new_seed)
+    if base.proxy_server:
+        proxy_ip = get_proxy_ip(base.proxy_server, base.proxy_username, base.proxy_password)
+        geo = geoip_from_ip(proxy_ip) if proxy_ip else None
+        if geo:
+            regen = replace(
+                regen,
+                country_code=str(geo.get("country_code") or "").strip().upper() or None,
+                timezone_id=str(geo.get("timezone_id") or "").strip() or None,
+                locale=None,
+                geo_lat=geo.get("geo_lat") if geo.get("geo_lat") is not None else regen.geo_lat,
+                geo_lon=geo.get("geo_lon") if geo.get("geo_lon") is not None else regen.geo_lon,
+            )
+        regen = normalize_timezone_country(regen)
+    return replace(regen, viewport_width=None, viewport_height=None)

@@ -62,7 +62,7 @@ from profiles_store import (
     save_profiles,
     tags_from_delimited_text,
 )
-from fingerprint_generator import generate_test_fingerprint
+from fingerprint_generator import generate_test_fingerprint, regenerate_profile_fingerprint
 from proxy_health import probe_proxy_health_triple, update_all_profiles_matching_proxy_credentials
 from proxy_import import apply_proxy_and_sync_geo, parse_host_port_user_pass_line, proxy_server_url
 from playwright_runner import (
@@ -257,6 +257,61 @@ class ProxyBatchCheckProgressDialog(QDialog):
         self._bar.setMaximum(t)
         self._bar.setValue(c)
         self._label.setText(f"{self._caption}: {c} из {t}")
+
+
+class _ClearProfilesOptionsDialog(QDialog):
+    """Первый шаг очистки: выбор действий и кнопка «Далее»."""
+
+    def __init__(self, parent: QWidget | None, message: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Очистка профилей")
+        self.setModal(True)
+        self.setMinimumWidth(440)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(12)
+
+        lbl = QLabel(message)
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+
+        self.cb_fingerprint = QCheckBox("Сменить отпечаток")
+        self.cb_browser_data = QCheckBox("Очистить все данные в браузере")
+        lay.addWidget(self.cb_fingerprint)
+        lay.addWidget(self.cb_browser_data)
+
+        hint = QLabel("Выберите хотя бы одно действие.")
+        hint.setObjectName("hint")
+        lay.addWidget(hint)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("Отмена")
+        self.btn_next = QPushButton("Далее")
+        self.btn_next.setDefault(True)
+        self.btn_next.setEnabled(False)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(self.btn_next)
+        lay.addLayout(btn_row)
+
+        self.cb_fingerprint.toggled.connect(self._sync_next_enabled)
+        self.cb_browser_data.toggled.connect(self._sync_next_enabled)
+        btn_cancel.clicked.connect(self.reject)
+        self.btn_next.clicked.connect(self._on_next)
+
+    def _sync_next_enabled(self) -> None:
+        self.btn_next.setEnabled(self.cb_fingerprint.isChecked() or self.cb_browser_data.isChecked())
+
+    def _on_next(self) -> None:
+        if self.cb_fingerprint.isChecked() or self.cb_browser_data.isChecked():
+            self.accept()
+
+    @property
+    def change_fingerprint(self) -> bool:
+        return self.cb_fingerprint.isChecked()
+
+    @property
+    def clear_browser_data(self) -> bool:
+        return self.cb_browser_data.isChecked()
 
 
 class ProxyStatusTableItem(QTableWidgetItem):
@@ -1113,6 +1168,13 @@ class MainWindow(QMainWindow):
         self.btn_import_archive.setToolTip(
             "ZIP из «Экспорт»: профили добавятся к текущим; при совпадении ID будет назначен новый."
         )
+        self.btn_clear = QPushButton("Очистить")
+        self.btn_clear.setObjectName("danger")
+        self.btn_clear.setToolTip(
+            "Действия для выделенных профилей; если ничего не выделено — текущий открытый в форме: "
+            "очистка данных браузера и/или смена отпечатка; теги и custom_data сбрасываются. "
+            "Имя и прокси сохраняются."
+        )
         self.btn_delete = QPushButton("Удалить")
         self.btn_delete.setObjectName("danger")
         self.btn_delete.setToolTip("Удалить все выделенные профили; если ничего не выделено — текущий открытый в форме")
@@ -1120,6 +1182,7 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_import_proxies)
         btn_row.addWidget(self.btn_export_archive)
         btn_row.addWidget(self.btn_import_archive)
+        btn_row.addWidget(self.btn_clear)
         btn_row.addWidget(self.btn_delete)
         list_layout.addLayout(btn_row)
 
@@ -1127,6 +1190,7 @@ class MainWindow(QMainWindow):
         self.btn_import_proxies.clicked.connect(self._import_profiles_from_proxy_file)
         self.btn_export_archive.clicked.connect(self._export_profiles_archive)
         self.btn_import_archive.clicked.connect(self._import_profiles_archive)
+        self.btn_clear.clicked.connect(self._clear_profiles)
         self.btn_delete.clicked.connect(self._delete_profile)
 
         list_box.setMinimumWidth(260)
@@ -3280,6 +3344,79 @@ class MainWindow(QMainWindow):
                 continue
             out.append(s)
         return out
+
+    def _clear_profiles(self) -> None:
+        ids = self._batch_profile_ids()
+        if not ids and self._active_profile_id:
+            ids = [self._active_profile_id]
+        if not ids:
+            QMessageBox.information(self, "Очистка", "Нет профилей для очистки.")
+            return
+
+        to_clear: list[BrowserProfile] = [p for p in self._profiles if p.profile_id in ids]
+        if not to_clear:
+            return
+
+        running = [p.profile_id for p in to_clear if self._is_profile_running(p.profile_id)]
+        if running:
+            QMessageBox.warning(
+                self,
+                "Запущен профиль",
+                "Нельзя очистить, пока браузер запущен. Остановите или закройте окна для:\n"
+                + "\n".join(running),
+            )
+            return
+
+        if len(to_clear) == 1:
+            p0 = to_clear[0]
+            msg = f"Профиль «{p0.name}»\n\nID: {p0.profile_id}"
+        else:
+            msg = f"Выбранные профили ({len(to_clear)} шт.):\n\n" + "\n".join(
+                f"• {p.name} ({p.profile_id})" for p in to_clear[:20]
+            )
+            if len(to_clear) > 20:
+                msg += f"\n… и ещё {len(to_clear) - 20}"
+
+        dlg = _ClearProfilesOptionsDialog(self, msg)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        change_fp = dlg.change_fingerprint
+        clear_data = dlg.clear_browser_data
+
+        confirm_parts: list[str] = []
+        if clear_data:
+            confirm_parts.append("удалены все данные браузера (кэш, куки, сессии)")
+        if change_fp:
+            confirm_parts.append("сгенерирован новый отпечаток (имя и прокси сохранятся)")
+        confirm_parts.append("сброшены теги и пользовательские данные")
+        confirm_msg = (
+            "Будут " + " и ".join(confirm_parts) + ".\n\n"
+            "Нажмите «Да» ещё раз для окончательного подтверждения."
+        )
+        if clear_data:
+            confirm_msg += "\n\nДанные браузера будут удалены без возможности восстановления."
+
+        if QMessageBox.question(self, "Подтверждение очистки", confirm_msg) != QMessageBox.StandardButton.Yes:
+            return
+
+        clear_ids = {p.profile_id for p in to_clear}
+        for i, p in enumerate(self._profiles):
+            if p.profile_id not in clear_ids:
+                continue
+            updated = p
+            if clear_data:
+                try:
+                    shutil.rmtree(profile_user_data_dir(p.profile_id), ignore_errors=True)
+                except Exception:
+                    pass
+            if change_fp:
+                updated = regenerate_profile_fingerprint(updated)
+            self._profiles[i] = replace(updated, tags=[], custom_data={})
+
+        save_profiles(self._profiles)
+        self._refresh_profiles_list()
+        self._load_active_profile_into_form()
 
     def _delete_profile(self) -> None:
         ids = self._batch_profile_ids()
