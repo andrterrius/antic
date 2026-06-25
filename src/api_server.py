@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import sys
 import socket
+import time
 from pathlib import Path
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from typing import Any, List, Literal
+
+if sys.version_info < (3, 10):
+    import eval_type_backport  # noqa: F401  # Pydantic: list[str], str | None on 3.8–3.9
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -25,7 +31,12 @@ from profiles_store import (
     update_profile_tags,
     set_profiles_ui_log_hook,
 )
-from playwright_runner import chromium_user_data_parent, run_profile
+from playwright_runner import (
+    chromium_user_data_parent,
+    normalize_cdp_public_host,
+    rewrite_cdp_public_urls,
+    run_profile,
+)
 
 
 # --- OpenAPI / Pydantic-схемы (документация в /docs) ---
@@ -119,6 +130,20 @@ class LaunchProfileBody(BaseModel):
         True,
         description="Выделить порт remote debugging и заполнить cdp_ws_url в сессии (для connect_over_cdp)",
     )
+    cdp_port: int | None = Field(
+        None,
+        ge=1024,
+        le=65535,
+        description="Фиксированный порт CDP (по умолчанию — свободный случайный).",
+    )
+    cdp_bind: Literal["loopback", "all"] = Field(
+        "loopback",
+        description="loopback=127.0.0.1; all=внешний доступ через socat на cdp_port (Chromium слушает только localhost).",
+    )
+    cdp_public_host: str | None = Field(
+        None,
+        description="Публичный IP или домен в cdp_ws_url (без http://; обязателен при cdp_bind=all).",
+    )
     start_url: str = Field(
         default="https://studio.youtube.com",
         max_length=4096,
@@ -129,6 +154,11 @@ class LaunchProfileBody(BaseModel):
         max_length=4096,
         description="Путь к пользовательскому Python-скрипту с функцией run(page, log=None)",
     )
+
+    @field_validator("cdp_public_host")
+    @classmethod
+    def _normalize_cdp_public_host(cls, v: str | None) -> str | None:
+        return normalize_cdp_public_host(v)
 
 
 class LaunchProfileAccepted(BaseModel):
@@ -215,21 +245,103 @@ def _reserved_cdp_ports_locked() -> set[int]:
     for s in _sessions.values():
         if not s.finished and s.cdp_debug_port is not None:
             used.add(int(s.cdp_debug_port))
+        if not s.finished and s.cdp_chrome_port is not None:
+            used.add(int(s.cdp_chrome_port))
     for u in _ui_sessions.values():
         if u.cdp_debug_port is not None:
             used.add(int(u.cdp_debug_port))
     return used
 
 
+def _start_cdp_socat_proxy(*, listen_port: int, chrome_port: int) -> subprocess.Popen[bytes]:
+    """Chromium binds CDP to 127.0.0.1 only; socat exposes listen_port on 0.0.0.0."""
+    socat = shutil.which("socat")
+    if not socat:
+        raise RuntimeError("socat not found (install: apt install socat)")
+    cmd = [
+        socat,
+        f"TCP-LISTEN:{int(listen_port)},bind=0.0.0.0,fork,reuseaddr",
+        f"TCP:127.0.0.1:{int(chrome_port)}",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.15)
+    if proc.poll() is not None:
+        raise RuntimeError(f"socat exited immediately (listen {listen_port} -> 127.0.0.1:{chrome_port})")
+    return proc
+
+
+def _stop_cdp_socat_proxy(proc: subprocess.Popen[bytes] | None) -> None:
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def _pick_free_loopback_port_avoiding(used: set[int]) -> int:
     """Pick a port not already assigned to another session (avoids duplicate ephemeral picks)."""
+    return _pick_free_tcp_port_avoiding(used, bind_host="127.0.0.1")
+
+
+def _pick_free_tcp_port_avoiding(used: set[int], *, bind_host: str) -> int:
     avoided = set(used)
+    host = (bind_host or "127.0.0.1").strip() or "127.0.0.1"
     for _ in range(256):
-        p = _pick_free_loopback_port_once()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, 0))
+            p = int(s.getsockname()[1])
         if p not in avoided:
             return p
         avoided.add(p)
     raise RuntimeError("Could not allocate a unique CDP debug port")
+
+
+def _is_tcp_port_available(port: int, bind_host: str) -> bool:
+    host = (bind_host or "127.0.0.1").strip() or "127.0.0.1"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, int(port)))
+            return True
+        except OSError:
+            return False
+
+
+def _cdp_bind_host(cdp_bind: str) -> str:
+    return "0.0.0.0" if (cdp_bind or "").strip().lower() == "all" else "127.0.0.1"
+
+
+def _resolve_cdp_public_host(body: LaunchProfileBody) -> str | None:
+    raw = body.cdp_public_host or (os.environ.get("ANTIDETECT_CDP_PUBLIC_HOST") or "").strip() or None
+    return normalize_cdp_public_host(raw)
+
+
+def _allocate_cdp_port(
+    *,
+    requested: int | None,
+    used: set[int],
+    bind_host: str,
+) -> int:
+    if requested is not None:
+        port = int(requested)
+        if port in used:
+            raise HTTPException(
+                status_code=409,
+                detail=f"CDP port {port} is already assigned to another active session",
+            )
+        if not _is_tcp_port_available(port, bind_host):
+            raise HTTPException(
+                status_code=409,
+                detail=f"CDP port {port} is not available on {bind_host}",
+            )
+        return port
+    return _pick_free_tcp_port_avoiding(used, bind_host=bind_host)
 
 
 # RLock: to_public_dict() takes the same lock as list_sessions() while iterating — plain Lock deadlocks.
@@ -495,6 +607,10 @@ class ProfileRunSession:
     profile_id: str
     headless: bool
     cdp_debug_port: int | None
+    cdp_chrome_port: int | None = None
+    cdp_debug_bind: str = "127.0.0.1"
+    cdp_public_host: str | None = None
+    cdp_socat_proc: subprocess.Popen[bytes] | None = field(default=None, repr=False)
     start_url: str = "https://studio.youtube.com"
     script_path: str | None = None
     cdp_ws_url: str | None = None
@@ -596,22 +712,58 @@ def _session_worker(sess: ProfileRunSession, profile: BrowserProfile, body: Laun
         # Строки доступны в GET /sessions/{id} → log_tail; не заливаем GUI на каждую строку.
 
     def on_cdp(info: dict[str, object]) -> None:
+        chrome_port = sess.cdp_chrome_port if sess.cdp_chrome_port is not None else sess.cdp_debug_port
+        ws_raw = info.get("webSocketDebuggerUrl")
+        http_raw = info.get("http_debugger")
+        ws_out = ws_raw if isinstance(ws_raw, str) else None
+        http_out = http_raw if isinstance(http_raw, str) else None
+
+        if (
+            sess.cdp_debug_bind == "0.0.0.0"
+            and sess.cdp_debug_port is not None
+            and chrome_port is not None
+            and sess.cdp_debug_port != chrome_port
+        ):
+            if sess.cdp_socat_proc is None:
+                try:
+                    sess.cdp_socat_proc = _start_cdp_socat_proxy(
+                        listen_port=sess.cdp_debug_port,
+                        chrome_port=chrome_port,
+                    )
+                    log(
+                        f"CDP proxy: 0.0.0.0:{sess.cdp_debug_port} -> 127.0.0.1:{chrome_port} "
+                        f"(Chromium CDP is loopback-only)"
+                    )
+                except Exception as e:
+                    log(f"CDP proxy (socat) failed: {e}")
+            if isinstance(ws_raw, str) and ws_raw.strip():
+                ws_out, http_out = rewrite_cdp_public_urls(
+                    ws_raw.strip(),
+                    debug_port=int(chrome_port),
+                    public_host=sess.cdp_public_host,
+                    public_port=int(sess.cdp_debug_port),
+                )
+
         with _lock:
-            ws = info.get("webSocketDebuggerUrl")
-            if isinstance(ws, str):
-                sess.cdp_ws_url = ws
-            http = info.get("http_debugger")
-            if isinstance(http, str):
-                sess.cdp_http = http
-        ws_s = info.get("webSocketDebuggerUrl")
-        if isinstance(ws_s, str) and ws_s.strip():
-            short = ws_s.strip()
+            if ws_out:
+                sess.cdp_ws_url = ws_out
+            if http_out:
+                sess.cdp_http = http_out
+        if ws_out:
+            short = ws_out.strip()
             if len(short) > 120:
                 short = short[:117] + "..."
             _ui_log(f"{prefix} CDP: {short}")
         _ui_sync_profile(sess.profile_id)
 
     try:
+        chrome_port = sess.cdp_chrome_port if sess.cdp_chrome_port is not None else sess.cdp_debug_port
+        expose_port = (
+            sess.cdp_debug_port
+            if sess.cdp_debug_bind == "0.0.0.0" and sess.cdp_debug_port is not None
+            else None
+        )
+
         res = run_profile(
             profile,
             start_url=(body.start_url or "https://studio.youtube.com").strip() or "https://studio.youtube.com",
@@ -619,8 +771,11 @@ def _session_worker(sess: ProfileRunSession, profile: BrowserProfile, body: Laun
             log=log,
             stop_requested=sess.stop_event.is_set,
             headless=bool(body.headless),
-            cdp_debug_port=sess.cdp_debug_port,
-            on_cdp_ready=on_cdp if sess.cdp_debug_port is not None else None,
+            cdp_debug_port=chrome_port,
+            cdp_debug_bind="127.0.0.1",
+            cdp_public_host=sess.cdp_public_host,
+            cdp_public_port=expose_port,
+            on_cdp_ready=on_cdp if chrome_port is not None else None,
         )
         with _lock:
             sess.result_ok = res.ok
@@ -630,6 +785,8 @@ def _session_worker(sess: ProfileRunSession, profile: BrowserProfile, body: Laun
             sess.result_ok = False
             sess.result_message = str(e)
     finally:
+        _stop_cdp_socat_proxy(sess.cdp_socat_proc)
+        sess.cdp_socat_proc = None
         with _lock:
             sess.finished = True
             _profile_busy.pop(sess.profile_id, None)
@@ -651,7 +808,7 @@ def build_app() -> FastAPI:
 Сессии, запущенные из окна приложения, тоже видны в `GET /sessions` (`source: ui`).
 
 ## Типичный сценарий (запуск по API)
-1. **`POST /profiles/{profile_id}/launch`** — в теле можно задать `headless`, `expose_cdp`, `start_url`.
+1. **`POST /profiles/{profile_id}/launch`** — в теле: `headless`, `expose_cdp`, `cdp_port`, `cdp_bind`, `cdp_public_host`, `start_url`.
 2. **`GET /sessions/{session_id}`** — повторять, пока при `expose_cdp: true` не появится **`cdp_ws_url`**.
 3. Подключение: Playwright `chromium.connect_over_cdp(cdp_ws_url)` или другой CDP-клиент.
 4. **`POST /sessions/{session_id}/stop`** — запросить закрытие; после завершения запись может остаться (`finished`, `running: false`) — удалить **`DELETE /sessions/{session_id}`** при необходимости.
@@ -672,7 +829,7 @@ def build_app() -> FastAPI:
     def health() -> HealthOut:
         return HealthOut()
 
-    @app.get("/profiles", response_model=list[ProfileOut], tags=["Профили"])
+    @app.get("/profiles", response_model=List[ProfileOut], tags=["Профили"])
     def list_profiles() -> list[ProfileOut]:
         return [_profile_to_out(p) for p in load_profiles()]
 
@@ -811,9 +968,36 @@ def build_app() -> FastAPI:
                     detail=f"Profile already running in session {_profile_busy[profile_id]}",
                 )
             sid = uuid.uuid4().hex[:16]
-            cdp_port: int | None = (
-                _pick_free_loopback_port_avoiding(_reserved_cdp_ports_locked()) if body.expose_cdp else None
-            )
+            cdp_port: int | None = None
+            cdp_chrome_port: int | None = None
+            cdp_bind_host = "127.0.0.1"
+            cdp_public: str | None = None
+            if body.expose_cdp:
+                used = _reserved_cdp_ports_locked()
+                if body.cdp_bind == "all":
+                    cdp_public = _resolve_cdp_public_host(body)
+                    if not cdp_public:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="cdp_public_host (or env ANTIDETECT_CDP_PUBLIC_HOST) is required when cdp_bind=all",
+                        )
+                    cdp_port = _allocate_cdp_port(
+                        requested=body.cdp_port,
+                        used=used,
+                        bind_host="0.0.0.0",
+                    )
+                    cdp_chrome_port = _pick_free_tcp_port_avoiding(
+                        used | {cdp_port},
+                        bind_host="127.0.0.1",
+                    )
+                    cdp_bind_host = "0.0.0.0"
+                else:
+                    cdp_port = _allocate_cdp_port(
+                        requested=body.cdp_port,
+                        used=used,
+                        bind_host="127.0.0.1",
+                    )
+                    cdp_chrome_port = cdp_port
             su = (body.start_url or "https://studio.youtube.com").strip() or "https://studio.youtube.com"
             sp = (body.script_path or "").strip() or None
             sess = ProfileRunSession(
@@ -821,6 +1005,9 @@ def build_app() -> FastAPI:
                 profile_id=profile_id,
                 headless=bool(body.headless),
                 cdp_debug_port=cdp_port,
+                cdp_chrome_port=cdp_chrome_port,
+                cdp_debug_bind=cdp_bind_host,
+                cdp_public_host=cdp_public,
                 start_url=su,
                 script_path=sp,
             )
@@ -838,7 +1025,8 @@ def build_app() -> FastAPI:
         cdp_on = cdp_port is not None
         _ui_log(
             f"[API:{p.name}:{profile_id}] запуск по API: session={sid}, headless={bool(body.headless)}, "
-            f"CDP={'порт ' + str(cdp_port) if cdp_on else 'выкл.'}, url={((body.start_url or '')[:80] + '…') if len(body.start_url or '') > 80 else (body.start_url or 'https://studio.youtube.com')}"
+            f"CDP={'внешний ' + str(cdp_port) + ' (chrome 127.0.0.1:' + str(cdp_chrome_port) + ')' if cdp_on and body.cdp_bind == 'all' else ('порт ' + str(cdp_port) if cdp_on else 'выкл.')}, "
+            f"url={((body.start_url or '')[:80] + '…') if len(body.start_url or '') > 80 else (body.start_url or 'https://studio.youtube.com')}"
         )
         _ui_sync_profile(profile_id)
         return LaunchProfileAccepted(
@@ -851,7 +1039,7 @@ def build_app() -> FastAPI:
 
     @app.get(
         "/sessions",
-        response_model=list[BrowserSessionOut],
+        response_model=List[BrowserSessionOut],
         tags=["Сессии"],
         summary="Список сессий",
     )

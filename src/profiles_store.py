@@ -16,7 +16,7 @@ LEGACY_JSON_FILENAME = "profiles.json"
 LEGACY_JSON_BACKUP_SUFFIX = ".migrated"
 
 
-@dataclass(slots=True)
+@dataclass
 class BrowserProfile:
     profile_id: str
     name: str

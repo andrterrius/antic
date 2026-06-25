@@ -311,6 +311,7 @@ def _run_one_profile(
     *,
     url: str,
     script_path: str | None,
+    headless: bool,
     protect_webrtc: bool,
     force_webrtc_proxy_ip: bool,
     log: Callable[[str], None],
@@ -320,6 +321,7 @@ def _run_one_profile(
         profile,
         start_url=url,
         script_path=script_path,
+        headless=headless,
         protect_webrtc=protect_webrtc,
         force_webrtc_proxy_ip=force_webrtc_proxy_ip,
         log=log,
@@ -350,6 +352,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             p,
             url=args.url,
             script_path=args.script,
+            headless=bool(args.headless),
             protect_webrtc=not args.no_protect_webrtc,
             force_webrtc_proxy_ip=not args.no_force_webrtc_proxy_ip,
             log=mklog(prefix),
@@ -419,6 +422,57 @@ def cmd_geoip(args: argparse.Namespace) -> int:
     if not data:
         return 2
     print(_json_dump(data))
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    if sys.version_info < (3, 10):
+        try:
+            import eval_type_backport  # noqa: F401
+        except ImportError:
+            _eprint(
+                "ERROR: Python 3.8–3.9 requires eval_type_backport for the HTTP API.\n"
+                "Install: pip install eval_type_backport\n"
+                "Or use Python 3.10+."
+            )
+            return 2
+
+    import uvicorn
+
+    from api_server import build_app
+
+    host = (args.host or os.environ.get("ANTIDETECT_API_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+    if args.port is not None:
+        port = int(args.port)
+    else:
+        port_raw = (os.environ.get("ANTIDETECT_API_PORT") or "18765").strip() or "18765"
+        try:
+            port = int(port_raw)
+        except ValueError:
+            port = 18765
+
+    opts: dict[str, object] = {
+        "host": host,
+        "port": port,
+        "log_level": args.log_level,
+        "access_log": not args.no_access_log,
+    }
+    if getattr(sys, "frozen", False):
+        opts["loop"] = "asyncio"
+        opts["http"] = "h11"
+
+    base = f"http://{host}:{port}"
+    print(f"Antidetect API: {base}/docs (Ctrl+C to stop)", flush=True)
+    try:
+        uvicorn.run(build_app(), **opts)
+    except KeyboardInterrupt:
+        print("\nStopped.", flush=True)
+    except Exception as e:
+        import traceback
+
+        _eprint(f"ERROR: {e}")
+        _eprint(traceback.format_exc())
+        return 2
     return 0
 
 
@@ -514,6 +568,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp_run.add_argument("profile_ids", nargs="+")
     sp_run.add_argument("--url", default="https://studio.youtube.com")
     sp_run.add_argument("--script", default=None, help="Path to .py script with run(page, log=None).")
+    sp_run.add_argument("--headless", action="store_true", help="Run Chromium without a window.")
     sp_run.add_argument("--parallel", action="store_true", help="Run multiple profiles in parallel.")
     sp_run.add_argument("--no-protect-webrtc", action="store_true", help="Disable WebRTC protection flags.")
     sp_run.add_argument("--no-force-webrtc-proxy-ip", action="store_true", help="Do not try to detect proxy IP.")
@@ -522,6 +577,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp_run_all = sub.add_parser("run-all", help="Run all stored profiles.")
     sp_run_all.add_argument("--url", default="https://studio.youtube.com")
     sp_run_all.add_argument("--script", default=None)
+    sp_run_all.add_argument("--headless", action="store_true", help="Run Chromium without a window.")
     sp_run_all.add_argument("--parallel", action="store_true")
     sp_run_all.add_argument("--no-protect-webrtc", action="store_true")
     sp_run_all.add_argument("--no-force-webrtc-proxy-ip", action="store_true")
@@ -539,6 +595,27 @@ def build_parser() -> argparse.ArgumentParser:
     sp_geo = sub.add_parser("geoip", help="GeoIP lookup for an IP.")
     sp_geo.add_argument("ip")
     sp_geo.set_defaults(func=cmd_geoip)
+
+    sp_serve = sub.add_parser("serve", help="Run local HTTP API (FastAPI + uvicorn).")
+    sp_serve.add_argument(
+        "--host",
+        default=None,
+        help="Bind host (default: ANTIDETECT_API_HOST or 127.0.0.1).",
+    )
+    sp_serve.add_argument(
+        "--port",
+        default=None,
+        type=int,
+        help="Bind port (default: ANTIDETECT_API_PORT or 18765).",
+    )
+    sp_serve.add_argument(
+        "--log-level",
+        default="info",
+        choices=["critical", "error", "warning", "info", "debug", "trace"],
+        help="Uvicorn log level (default: info).",
+    )
+    sp_serve.add_argument("--no-access-log", action="store_true", help="Disable HTTP access log.")
+    sp_serve.set_defaults(func=cmd_serve)
 
     return p
 

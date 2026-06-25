@@ -4,6 +4,8 @@ Snapshot source: https://chromium.googlesource.com/chromium/src/+refs
 Regenerate: python tools/emit_chromium_versions_module.py
 """
 
+from __future__ import annotations
+
 CHROMIUM_RELEASE_VERSIONS: tuple[str, ...] = (
     "149.0.7818.1",
     "149.0.7818.0",

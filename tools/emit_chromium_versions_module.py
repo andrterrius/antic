@@ -28,6 +28,8 @@ def emit(versions: list[str]) -> None:
         "Regenerate: python tools/emit_chromium_versions_module.py",
         '"""',
         "",
+        "from __future__ import annotations",
+        "",
         "CHROMIUM_RELEASE_VERSIONS: tuple[str, ...] = (",
     ]
     for v in versions:

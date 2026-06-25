@@ -30,16 +30,67 @@ from fingerprint_consistency import (
 )
 
 
-@dataclass(slots=True)
+@dataclass
 class LaunchResult:
     ok: bool
     message: str
 
 
-def fetch_chromium_cdp_browser_ws_url(debug_port: int, *, timeout_sec: float = 15.0, log: Callable[[str], None] | None = None) -> str | None:
+def normalize_cdp_public_host(raw: str | None) -> str | None:
+    """IP or hostname only — strips http(s)://, ws(s):// and accidental :port suffix."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if "://" in s:
+        parsed = urlparse(s)
+        host = (parsed.hostname or "").strip()
+        return host or None
+    s = s.split("/")[0].strip()
+    if not s:
+        return None
+    # host:port → host (CDP port is set separately via cdp_port)
+    if s.count(":") == 1:
+        host, _, port_part = s.partition(":")
+        if port_part.isdigit():
+            return host.strip() or None
+    return s
+
+
+def rewrite_cdp_public_urls(
+    ws_url: str,
+    *,
+    debug_port: int,
+    public_host: str | None,
+    public_port: int | None = None,
+) -> tuple[str, str]:
+    """Replace loopback host/port in CDP URLs so external clients use the socat listen port."""
+    chrome_port = int(debug_port)
+    http_local = f"http://127.0.0.1:{chrome_port}"
+    host = normalize_cdp_public_host(public_host)
+    if not host or host in ("127.0.0.1", "localhost"):
+        return ws_url, http_local
+
+    expose_port = int(public_port if public_port is not None else chrome_port)
+    parsed = urlparse(ws_url)
+    if not parsed.scheme:
+        return ws_url, http_local
+    netloc = f"{host}:{expose_port}"
+    ws_out = urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+    return ws_out, f"http://{netloc}"
+
+
+def fetch_chromium_cdp_browser_ws_url(
+    debug_port: int,
+    *,
+    timeout_sec: float = 15.0,
+    log: Callable[[str], None] | None = None,
+    public_host: str | None = None,
+    public_port: int | None = None,
+) -> str | None:
     """
     After Chromium starts with --remote-debugging-port=<debug_port>, returns the browser-level
     webSocketDebuggerUrl from http://127.0.0.1:<port>/json/version (for Playwright connect_over_cdp, Puppeteer, etc.).
+  If public_host is set, rewrites the WebSocket URL host for external clients.
     """
     import time
 
@@ -64,7 +115,13 @@ def fetch_chromium_cdp_browser_ws_url(debug_port: int, *, timeout_sec: float = 1
                 if isinstance(data, dict):
                     ws = data.get("webSocketDebuggerUrl")
                     if isinstance(ws, str) and ws.strip():
-                        return ws.strip()
+                        ws_out, _http = rewrite_cdp_public_urls(
+                            ws.strip(),
+                            debug_port=int(debug_port),
+                            public_host=public_host,
+                            public_port=public_port,
+                        )
+                        return ws_out
         except Exception as e:
             last_err = str(e).strip()[:200]
         time.sleep(0.15)
@@ -174,16 +231,59 @@ def _playwright_browsers_path(log: Callable[[str], None]) -> Path:
 def _chromium_executable_exists(browsers_root: Path, log: Callable[[str], None]) -> bool:
     """True only for the Chromium revision shipped with the installed patchright package."""
     try:
-        for exe in browsers_root.glob(f"chromium-*/chrome-win*/chrome.exe"):
+        root = Path(browsers_root)
+        log(f"Checking for Chromium in: {root}")
+        if not root.is_dir():
+            log(f"No browsers directory: {root}")
+            return False
+
+        chromium_dirs = sorted(root.glob("chromium*"))
+        if chromium_dirs:
+            log(f"Found chromium directories: {[str(d) for d in chromium_dirs[:8]]}")
+
+        for exe in root.glob("chromium-*/chrome-win*/chrome.exe"):
             if exe.is_file():
+                log(f"Found Chromium at: {exe}")
                 return True
-        for d in browsers_root.glob(f"chromium-*/chrome-mac-*"):
+        for exe in root.glob("chromium-*/chrome-linux/chrome"):
+            if exe.is_file():
+                log(f"Found Chromium at: {exe}")
+                return True
+        for exe in root.glob("chromium-*/chrome-linux/headless_shell"):
+            if exe.is_file():
+                log(f"Found Chromium at: {exe}")
+                return True
+        for exe in root.glob("chromium_headless_shell-*/chrome-linux/headless_shell"):
+            if exe.is_file():
+                log(f"Found Chromium at: {exe}")
+                return True
+        for d in root.glob("chromium-*/chrome-mac-*"):
             if d.is_dir():
+                log(f"Found Chromium at: {d}")
                 return True
-        exe = browsers_root / f"chromium-*" / "chrome-linux" / "chrome"
-        return exe.is_file()
+
+        if not chromium_dirs:
+            log(f"No chromium* folders under {root}")
+        return False
     except Exception as e:
         log(f"Error: {e}")
+        return False
+
+
+def _log_browsers_root_contents(browsers_root: Path, log: Callable[[str], None]) -> None:
+    try:
+        root = Path(browsers_root)
+        if not root.is_dir():
+            log(f"  (no such directory: {root})")
+            return
+        entries = sorted(root.glob("chromium*"))
+        if not entries:
+            log(f"  (no chromium* folders under {root})")
+            return
+        for entry in entries[:8]:
+            log(f"  found: {entry.name}")
+    except Exception as e:
+        log(f"  (could not list {browsers_root}: {e})")
 
 
 class _LogWriter(io.TextIOBase):
@@ -247,7 +347,18 @@ def ensure_playwright_chromium_installed(log: Callable[[str], None]) -> bool:
             log("Patchright Chromium installed successfully.")
             return True
 
+        # Install may have used the default cache if PLAYWRIGHT_BROWSERS_PATH was ignored.
+        default_cache = _get_playwright_default_cache_path(log)
+        if default_cache and default_cache != browsers_root and _chromium_executable_exists(default_cache, log):
+            log(f"Chromium found in default cache: {default_cache}")
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(default_cache)
+            return True
+
         log("patchright install finished, but Chromium executable was not found.")
+        _log_browsers_root_contents(browsers_root, log)
+        if default_cache and default_cache != browsers_root:
+            log(f"Also checked default cache: {default_cache}")
+            _log_browsers_root_contents(default_cache, log)
         return False
     except Exception as e:
         log(f"Failed to install Patchright Chromium automatically: {e}")
@@ -1037,6 +1148,9 @@ def run_profile(
         stop_requested: Callable[[], bool] | None = None,
         headless: bool = False,
         cdp_debug_port: int | None = None,
+        cdp_debug_bind: str = "127.0.0.1",
+        cdp_public_host: str | None = None,
+        cdp_public_port: int | None = None,
         on_cdp_ready: Callable[[dict[str, object]], None] | None = None,
 ) -> LaunchResult:
     """
@@ -1127,6 +1241,9 @@ def run_profile(
                 launch_args.append(f"--load-extension={profile_ext_dir.resolve()}")
                 if cdp_debug_port is not None:
                     launch_args.append(f"--remote-debugging-port={int(cdp_debug_port)}")
+                    bind = (cdp_debug_bind or "127.0.0.1").strip() or "127.0.0.1"
+                    if bind not in ("127.0.0.1", "localhost"):
+                        launch_args.append(f"--remote-debugging-address={bind}")
                 # Desktop: let CDP set window bounds after launch (work-area sized).
                 # For mobile presets we keep explicit viewport.
                 if not device_opts.get("is_mobile"):
@@ -1169,12 +1286,24 @@ def run_profile(
                     page = context.new_page()
 
                 if cdp_debug_port is not None and on_cdp_ready:
-                    ws = fetch_chromium_cdp_browser_ws_url(cdp_debug_port, log=log)
+                    ws = fetch_chromium_cdp_browser_ws_url(
+                        cdp_debug_port,
+                        log=log,
+                        public_host=cdp_public_host,
+                        public_port=cdp_public_port,
+                    )
                     if ws:
+                        _ws, http_dbg = rewrite_cdp_public_urls(
+                            ws,
+                            debug_port=int(cdp_debug_port),
+                            public_host=cdp_public_host,
+                            public_port=cdp_public_port,
+                        )
                         payload: dict[str, object] = {
-                            "webSocketDebuggerUrl": ws,
-                            "debug_port": int(cdp_debug_port),
-                            "http_debugger": f"http://127.0.0.1:{int(cdp_debug_port)}",
+                            "webSocketDebuggerUrl": _ws,
+                            "debug_port": int(cdp_public_port or cdp_debug_port),
+                            "chrome_debug_port": int(cdp_debug_port),
+                            "http_debugger": http_dbg,
                         }
                         try:
                             on_cdp_ready(payload)
