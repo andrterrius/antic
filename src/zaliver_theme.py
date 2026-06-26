@@ -273,24 +273,24 @@ QFrame#tagChip QLabel {
     background: transparent;
     padding: 4px 6px;
 }
-QFrame#tagChipError {
+QFrame#error {
     background-color: rgba(190, 18, 60, 0.18);
     border: 1px solid #be123c;
     border-radius: 8px;
 }
-QFrame#tagChipError QLabel {
+QFrame#error QLabel {
     color: #fda4af;
     font-size: 12px;
     border: none;
     background: transparent;
     padding: 4px 6px;
 }
-QFrame#tagChipSuccess {
+QFrame#success {
     background-color: rgba(22, 163, 74, 0.18);
     border: 1px solid #16a34a;
     border-radius: 8px;
 }
-QFrame#tagChipSuccess QLabel {
+QFrame#success QLabel {
     color: #86efac;
     font-size: 12px;
     border: none;

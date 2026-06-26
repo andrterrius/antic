@@ -546,11 +546,11 @@ class ProfilesArchiveImportThread(QThread):
 
 def _tag_chip_object_name(tag: str) -> str:
     """Имя objectName для QSS: ошибка — красный, успех — зелёный, иначе дефолт."""
-    t = tag.casefold()
-    if "ошибка" in t:
-        return "tagChipError"
-    if "успех" in t or "успешный" in t:
-        return "tagChipSuccess"
+    low = tag.casefold()
+    if "ошибка" in low:
+        return "error"
+    if "успех" in low or low.startswith("успеш"):
+        return "success"
     return "tagChip"
 
 
