@@ -1137,6 +1137,55 @@ def inject_webrtc_ip_override(page: Page, proxy_ip: str, log: Callable[[str], No
     # """)
 
 
+def inject_cookies_into_profile(
+    profile: BrowserProfile,
+    cookies: list[dict],
+    *,
+    log: Callable[[str], None] | None = None,
+) -> None:
+    """Headless launch, add_cookies, close — Chromium сохранит cookies в user-data."""
+    from cookies_io import cookie_to_playwright
+
+    def _log(msg: str) -> None:
+        if log:
+            log(msg)
+
+    if not cookies:
+        return
+
+    if not ensure_playwright_chromium_installed(_log):
+        raise RuntimeError("Chromium is not installed (patchright install chromium).")
+
+    playwright_cookies = [cookie_to_playwright(c) for c in cookies]
+    user_data_dir = profile_user_data_dir(profile.profile_id)
+    proxy_settings = _proxy_settings(profile)
+
+    with sync_playwright() as pw:
+        launch_kw: dict = dict(
+            user_data_dir=str(user_data_dir),
+            headless=True,
+            channel="chromium",
+            proxy=proxy_settings,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-breakpad"],
+        )
+        context: BrowserContext = pw.chromium.launch_persistent_context(**launch_kw)
+        try:
+            try:
+                context.add_cookies(playwright_cookies)
+                written = len(playwright_cookies)
+            except Exception:
+                written = 0
+                for item in playwright_cookies:
+                    try:
+                        context.add_cookies([item])
+                        written += 1
+                    except Exception:
+                        pass
+            _log(f"Записано cookies: {written} / {len(playwright_cookies)}")
+        finally:
+            context.close()
+
+
 def run_profile(
         profile: BrowserProfile,
         *,

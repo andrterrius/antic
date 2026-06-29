@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QPlainTextEdit,
+    QRadioButton,
     QScrollBar,
     QScrollArea,
     QSplitter,
@@ -314,6 +315,108 @@ class _ClearProfilesOptionsDialog(QDialog):
         return self.cb_browser_data.isChecked()
 
 
+class ExportProfilesOptionsDialog(QDialog):
+    """Выбор режима экспорта: полный архив или только cookies."""
+
+    def __init__(self, parent: QWidget | None, profile_count: int) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Экспорт профилей")
+        self.setModal(True)
+        self.setMinimumWidth(480)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(12)
+
+        lbl = QLabel(
+            f"Экспортировать {profile_count} профил(я/ей). "
+            "Браузеры должны быть закрыты."
+        )
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+
+        self.rb_full = QRadioButton("Полный архив — весь user-data Chromium (тяжёлый)")
+        self.rb_cookies = QRadioButton("Только cookies — лёгкий архив, выбор сайтов")
+        self.rb_full.setChecked(True)
+        lay.addWidget(self.rb_full)
+        lay.addWidget(self.rb_cookies)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("Отмена")
+        btn_ok = QPushButton("Далее")
+        btn_ok.setDefault(True)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_ok)
+        lay.addLayout(btn_row)
+
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok.clicked.connect(self.accept)
+
+    @property
+    def cookies_only(self) -> bool:
+        return self.rb_cookies.isChecked()
+
+
+class CookieHostsSelectDialog(QDialog):
+    """Выбор доменов для экспорта cookies."""
+
+    def __init__(self, parent: QWidget | None, hosts: list[tuple[str, int]]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Сайты для экспорта cookies")
+        self.setModal(True)
+        self.setMinimumSize(520, 420)
+        self._checks: list[tuple[str, QCheckBox]] = []
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        hint = QLabel("Отметьте домены, cookies которых попадут в архив.")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        btn_row = QHBoxLayout()
+        btn_all = QPushButton("Выбрать все")
+        btn_none = QPushButton("Снять все")
+        btn_row.addWidget(btn_all)
+        btn_row.addWidget(btn_none)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        inner_lay = QVBoxLayout(inner)
+        inner_lay.setSpacing(4)
+        for host, count in hosts:
+            cb = QCheckBox(f"{host}  ({count})")
+            cb.setChecked(True)
+            inner_lay.addWidget(cb)
+            self._checks.append((host, cb))
+        inner_lay.addStretch()
+        scroll.setWidget(inner)
+        lay.addWidget(scroll, 1)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        btn_cancel = QPushButton("Отмена")
+        btn_ok = QPushButton("Экспорт")
+        btn_ok.setDefault(True)
+        footer.addWidget(btn_cancel)
+        footer.addWidget(btn_ok)
+        lay.addLayout(footer)
+
+        btn_all.clicked.connect(lambda: self._set_all(True))
+        btn_none.clicked.connect(lambda: self._set_all(False))
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok.clicked.connect(self.accept)
+
+    def _set_all(self, checked: bool) -> None:
+        for _, cb in self._checks:
+            cb.setChecked(checked)
+
+    def selected_hosts(self) -> set[str]:
+        return {host for host, cb in self._checks if cb.isChecked()}
+
+
 class ProxyStatusTableItem(QTableWidgetItem):
     """Сортировка по колонке статуса: рабочие → нерабочие → не проверены (по возрастанию ключа)."""
 
@@ -493,26 +596,45 @@ class ImportProfilesBuildThread(QThread):
 
 
 class ProfilesArchiveExportThread(QThread):
-    """ZIP: profiles.json + user-data (Chromium) для выбранных или всех профилей."""
+    """ZIP: полный user-data или лёгкий архив cookies."""
 
     progress = pyqtSignal(str)
     finished_ok = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, dest_dir: str, profiles: list[BrowserProfile]) -> None:
+    def __init__(
+        self,
+        dest_dir: str,
+        profiles: list[BrowserProfile],
+        *,
+        cookies_only: bool = False,
+        cookie_hosts: set[str] | None = None,
+    ) -> None:
         super().__init__()
         self._dest_dir = dest_dir
         self._profiles = profiles
+        self._cookies_only = cookies_only
+        self._cookie_hosts = cookie_hosts
 
     def run(self) -> None:
-        from profiles_bundle import export_profiles_zip
-
         try:
-            path = export_profiles_zip(
-                Path(self._dest_dir),
-                self._profiles,
-                progress=lambda s: self.progress.emit(s),
-            )
+            if self._cookies_only:
+                from profiles_bundle import export_profiles_cookies_zip
+
+                path = export_profiles_cookies_zip(
+                    Path(self._dest_dir),
+                    self._profiles,
+                    self._cookie_hosts or set(),
+                    progress=lambda s: self.progress.emit(s),
+                )
+            else:
+                from profiles_bundle import export_profiles_zip
+
+                path = export_profiles_zip(
+                    Path(self._dest_dir),
+                    self._profiles,
+                    progress=lambda s: self.progress.emit(s),
+                )
             self.finished_ok.emit(str(path))
         except Exception as e:
             self.failed.emit(str(e).strip() or "Ошибка экспорта архива")
@@ -1141,12 +1263,8 @@ class MainWindow(QMainWindow):
         self.btn_launch_selected = QPushButton("Запустить выбранные")
         self.btn_launch_selected.setObjectName("secondary")
         self.btn_launch_selected.clicked.connect(self._launch_selected_from_profiles_list)
-        self.btn_launch_all = QPushButton("Запустить все")
-        self.btn_launch_all.setObjectName("secondary")
-        self.btn_launch_all.clicked.connect(self._launch_all)
         launch_btns.addStretch(1)
         launch_btns.addWidget(self.btn_launch_selected)
-        launch_btns.addWidget(self.btn_launch_all)
         launch_form.addRow("", launch_btns)
 
         list_layout.addWidget(launch_box)
@@ -1154,19 +1272,20 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         self.btn_new = QPushButton("Новый")
         self.btn_new.setObjectName("secondary")
-        self.btn_import_proxies = QPushButton("Из файла…")
+        self.btn_import_proxies = QPushButton("Прокси из файла…")
         self.btn_import_proxies.setObjectName("secondary")
         self.btn_import_proxies.setToolTip("Текстовый файл: по одной строке host:port:user:pass")
         self.btn_export_archive = QPushButton("Экспорт")
         self.btn_export_archive.setObjectName("secondary")
         self.btn_export_archive.setToolTip(
-            "Сохранить ZIP с profiles.json и каталогами user-data (данные Chromium). "
+            "Сохранить ZIP: полный user-data или только cookies (с выбором сайтов). "
             "Если отмечены профили — только они; иначе все профили."
         )
         self.btn_import_archive = QPushButton("Импорт")
         self.btn_import_archive.setObjectName("secondary")
         self.btn_import_archive.setToolTip(
-            "ZIP из «Экспорт»: профили добавятся к текущим; при совпадении ID будет назначен новый."
+            "ZIP из «Экспорт» (полный или cookies): профили добавятся к текущим; "
+            "при совпадении ID будет назначен новый."
         )
         self.btn_clear = QPushButton("Очистить")
         self.btn_clear.setObjectName("danger")
@@ -3217,11 +3336,56 @@ class MainWindow(QMainWindow):
             )
             return
 
+        opt_dlg = ExportProfilesOptionsDialog(self, len(to_export))
+        if opt_dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        cookie_hosts: set[str] | None = None
+        if opt_dlg.cookies_only:
+            scan_dlg = QProgressDialog("Сканирование сайтов в cookies…", None, 0, 0, self)
+            scan_dlg.setWindowTitle("Экспорт профилей")
+            scan_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+            scan_dlg.setMinimumDuration(0)
+            scan_dlg.setCancelButton(None)
+            scan_dlg.show()
+            QApplication.processEvents()
+            try:
+                from cookies_io import collect_hosts_for_profiles
+
+                hosts = collect_hosts_for_profiles([p.profile_id for p in to_export])
+            except Exception as e:
+                scan_dlg.close()
+                QMessageBox.warning(self, "Экспорт", str(e).strip() or "Не удалось прочитать cookies")
+                return
+            scan_dlg.close()
+
+            if not hosts:
+                QMessageBox.information(
+                    self,
+                    "Экспорт",
+                    "У выбранных профилей нет сохранённых cookies.",
+                )
+                return
+
+            host_dlg = CookieHostsSelectDialog(self, hosts)
+            if host_dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            cookie_hosts = host_dlg.selected_hosts()
+            if not cookie_hosts:
+                QMessageBox.warning(self, "Экспорт", "Выберите хотя бы один сайт.")
+                return
+
         dest = QFileDialog.getExistingDirectory(self, "Папка для сохранения архива")
         if not dest:
             return
 
-        dlg = QProgressDialog("Создание архива…", None, 0, 0, self)
+        dlg = QProgressDialog(
+            "Создание архива cookies…" if opt_dlg.cookies_only else "Создание архива…",
+            None,
+            0,
+            0,
+            self,
+        )
         dlg.setWindowTitle("Экспорт профилей")
         dlg.setWindowModality(Qt.WindowModality.WindowModal)
         dlg.setMinimumDuration(0)
@@ -3229,7 +3393,12 @@ class MainWindow(QMainWindow):
         dlg.show()
         QApplication.processEvents()
 
-        self._archive_export_thread = ProfilesArchiveExportThread(dest, list(to_export))
+        self._archive_export_thread = ProfilesArchiveExportThread(
+            dest,
+            list(to_export),
+            cookies_only=opt_dlg.cookies_only,
+            cookie_hosts=cookie_hosts,
+        )
 
         def on_prog(msg: str) -> None:
             dlg.setLabelText(msg)
@@ -3564,13 +3733,6 @@ class MainWindow(QMainWindow):
                 "Выбор профилей",
                 "Отметьте чекбоксами или выделите один/несколько профилей для запуска.",
             )
-            return
-        self._launch_profiles(ids)
-
-    def _launch_all(self) -> None:
-        ids = [p.profile_id for p in self._profiles]
-        if not ids:
-            QMessageBox.information(self, "Нет профилей", "Сначала создайте профиль.")
             return
         self._launch_profiles(ids)
 

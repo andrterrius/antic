@@ -18,6 +18,7 @@ from profiles_store import (
     load_profiles,
     migrate_json_to_sqlite,
     needs_json_migration,
+    recover_profiles_from_user_data,
     save_profiles,
     tags_from_delimited_text,
 )
@@ -208,6 +209,20 @@ def cmd_profiles_import_proxies(args: argparse.Namespace) -> int:
             print(f"Skipped {skipped} non-comment line(s) that did not match host:port:user:pass.")
         for p in created:
             print(f"  {p.profile_id}\t{p.name}\t{p.proxy_server}")
+    return 0
+
+
+def cmd_profiles_recover(args: argparse.Namespace) -> int:
+    recovered = recover_profiles_from_user_data()
+    if args.quiet:
+        return 0
+    if not recovered:
+        print("No new profiles to recover (user-data folders already in database).")
+        return 0
+    print(f"Recovered {len(recovered)} profile(s) from user-data/.")
+    for p in recovered:
+        print(f"  {p.profile_id}\t{p.name}")
+    print("Note: proxy/fingerprint settings are default; re-import a full export ZIP to restore them.")
     return 0
 
 
@@ -535,6 +550,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp_del.add_argument("--no-purge-data", dest="purge_data", action="store_false", help="Keep user-data dir.")
     sp_del.add_argument("--quiet", action="store_true")
     sp_del.set_defaults(func=cmd_profiles_delete)
+
+    sp_rec = psub.add_parser(
+        "recover",
+        help="Restore profile records from user-data/ folders (after DB loss).",
+    )
+    sp_rec.add_argument("--quiet", action="store_true")
+    sp_rec.set_defaults(func=cmd_profiles_recover)
 
     sp_set = psub.add_parser("set", help="Update profile fields.")
     sp_set.add_argument("profile_id")

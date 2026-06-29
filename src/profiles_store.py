@@ -8,6 +8,7 @@ import sys
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -456,6 +457,107 @@ def save_profiles(profiles: list[BrowserProfile]) -> None:
                 )
             else:
                 conn.execute("DELETE FROM profiles")
+
+
+def upsert_profiles(profiles: list[BrowserProfile]) -> None:
+    """Добавляет или обновляет переданные профили; остальные в базе не трогает."""
+    rows = [_profile_to_row(p) for p in profiles if p.profile_id]
+    if not rows:
+        return
+    placeholders = ", ".join("?" for _ in _PROFILE_COLUMNS)
+    columns = ", ".join(_PROFILE_COLUMNS)
+    insert_sql = f"INSERT OR REPLACE INTO profiles ({columns}) VALUES ({placeholders})"
+    with _store_lock:
+        with _db_connection(write=True) as conn:
+            conn.executemany(insert_sql, rows)
+
+
+def backup_profiles_db() -> Path | None:
+    """Копия profiles.db с меткой времени (перед импортом и т.п.)."""
+    src = sqlite_db_path()
+    if not src.is_file():
+        return None
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    dest = src.with_name(f"profiles.db.bak.{ts}")
+    shutil.copy2(src, dest)
+    return dest
+
+
+def _profile_name_from_user_data_dir(user_data_dir: Path) -> str | None:
+    ext = user_data_dir / "_antidetect_profile_id_ext" / "manifest.json"
+    if not ext.is_file():
+        return None
+    try:
+        manifest = json.loads(ext.read_text(encoding="utf-8"))
+        title = str(manifest.get("action", {}).get("default_title", "")).strip()
+        if " · " in title:
+            return title.split(" · ", 1)[0].strip() or None
+        return title or None
+    except Exception:
+        return None
+
+
+def recover_profiles_from_user_data() -> list[BrowserProfile]:
+    """
+    Восстанавливает записи профилей по каталогам user-data/<profile_id>/.
+    Cookies/данные браузера сохраняются; прокси/отпечаток нужно настроить заново, если не было экспорта.
+    """
+    from playwright_runner import chromium_user_data_parent
+
+    def _safe_id(s: str) -> bool:
+        if not s or len(s) > 64:
+            return False
+        return all(c.isalnum() or c in "_-" for c in s)
+
+    root = chromium_user_data_parent()
+    if not root.is_dir():
+        return []
+
+    existing_ids = {p.profile_id for p in load_profiles()}
+    recovered: list[BrowserProfile] = []
+    for entry in sorted(root.iterdir(), key=lambda p: p.name):
+        if not entry.is_dir():
+            continue
+        pid = entry.name
+        if not _safe_id(pid) or pid in existing_ids:
+            continue
+        name = _profile_name_from_user_data_dir(entry) or f"Profile {pid[:8]}"
+        recovered.append(BrowserProfile(profile_id=pid, name=name))
+
+    if recovered:
+        upsert_profiles(recovered)
+    return recovered
+
+
+def reorder_profiles(ordered_profile_ids: list[str]) -> None:
+    """
+    Задаёт порядок профилей в UI (ORDER BY rowid).
+    Все известные profile_id должны быть в списке; не указанные — в конце в прежнем порядке.
+    """
+    profiles = load_profiles()
+    by_id = {p.profile_id: p for p in profiles}
+    ordered: list[BrowserProfile] = []
+    seen: set[str] = set()
+    for pid in ordered_profile_ids:
+        pid = (pid or "").strip()
+        if not pid or pid in seen or pid not in by_id:
+            continue
+        ordered.append(by_id[pid])
+        seen.add(pid)
+    for p in profiles:
+        if p.profile_id not in seen:
+            ordered.append(p)
+            seen.add(p.profile_id)
+    if not ordered:
+        return
+    placeholders = ", ".join("?" for _ in _PROFILE_COLUMNS)
+    columns = ", ".join(_PROFILE_COLUMNS)
+    insert_sql = f"INSERT INTO profiles ({columns}) VALUES ({placeholders})"
+    with _store_lock:
+        with _db_connection(write=True) as conn:
+            conn.execute("DELETE FROM profiles")
+            for p in ordered:
+                conn.execute(insert_sql, _profile_to_row(p))
 
 
 def needs_json_migration() -> bool:

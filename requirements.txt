@@ -7,3 +7,4 @@ fastapi>=0.115.0
 uvicorn>=0.32.0
 pydantic>=2.0.0
 eval_type_backport>=0.2.0
+browser-cookie3>=0.19.1
