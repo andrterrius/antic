@@ -9,7 +9,17 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Optional
 
-from PyQt6.QtCore import QEvent, QPoint, QItemSelectionModel, QObject, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import (
+    QEvent,
+    QPoint,
+    QItemSelectionModel,
+    QObject,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt6.QtGui import QBrush, QColor, QCursor, QFont, QFontMetrics, QMouseEvent, QTextDocument, QTextOption
 from PyQt6.QtWidgets import (
     QApplication,
@@ -66,6 +76,15 @@ from profiles_store import (
 from fingerprint_generator import generate_test_fingerprint, regenerate_profile_fingerprint
 from proxy_health import probe_proxy_health_triple, update_all_profiles_matching_proxy_credentials
 from proxy_import import apply_proxy_and_sync_geo, parse_host_port_user_pass_line, proxy_server_url
+from totp import get_totp_token, totp_seconds_remaining
+from twofa_custom_data import (
+    collect_unique_twofa_keys,
+    normalize_twofa_custom_key,
+    secret_for_twofa_key,
+    set_twofa_in_custom_data,
+    twofa_entries,
+    twofa_key_names,
+)
 from playwright_runner import (
     run_profile,
     profile_user_data_dir,
@@ -183,6 +202,10 @@ _PROXY_COL_STATUS = 4
 _PROXY_COL_CHECKED = 5
 _PROXY_COL_COUNT = 6
 _PROXY_COL_REFRESH = 7
+
+_NAV_PROFILES = 0
+_NAV_PROXIES = 1
+_NAV_TWOFA = 2
 
 
 class BatchImportProxyHealthThread(QThread):
@@ -335,7 +358,7 @@ class ExportProfilesOptionsDialog(QDialog):
 
         self.rb_full = QRadioButton("Полный архив — весь user-data Chromium (тяжёлый)")
         self.rb_cookies = QRadioButton("Только cookies — лёгкий архив, выбор сайтов")
-        self.rb_full.setChecked(True)
+        self.rb_cookies.setChecked(True)
         lay.addWidget(self.rb_full)
         lay.addWidget(self.rb_cookies)
 
@@ -547,6 +570,115 @@ class _ProxyProfileIdsCell(QWidget):
             )
         if row_l is not None:
             row_l.addStretch(1)
+
+
+class _ClickableTwofaCodeLabel(QLabel):
+    """TOTP-код: клик по цифрам копирует в буфер."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, text: str = "—", parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.setObjectName("twofaCodeLabel")
+
+    def mousePressEvent(self, a0: QMouseEvent | None) -> None:
+        if a0 is not None and a0.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            a0.accept()
+            return
+        super().mousePressEvent(a0)
+
+
+class _TwofaProfilePicker(QWidget):
+    """Поиск над обычным выпадающим списком профилей."""
+
+    profile_changed = pyqtSignal(str)
+    profile_cleared = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._items: list[tuple[str, str]] = []
+        self._loading = False
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+        self.ed_search = QLineEdit()
+        self.ed_search.setPlaceholderText("Поиск: имя или ID профиля…")
+        self.ed_search.setClearButtonEnabled(True)
+        self.ed_search.textChanged.connect(self._on_search_changed)
+        self.cb_profile = QComboBox()
+        self.cb_profile.setMaxVisibleItems(24)
+        self.cb_profile.currentIndexChanged.connect(self._on_combo_index_changed)
+        outer.addWidget(self.ed_search)
+        outer.addWidget(self.cb_profile)
+
+    def current_profile_id(self) -> str | None:
+        pid = self.cb_profile.currentData(Qt.ItemDataRole.UserRole)
+        return pid if isinstance(pid, str) and pid else None
+
+    def set_profiles(
+        self,
+        profiles: list[BrowserProfile],
+        *,
+        select_profile_id: str | None = None,
+    ) -> None:
+        self._loading = True
+        self.ed_search.blockSignals(True)
+        self.cb_profile.blockSignals(True)
+        try:
+            self._items = [
+                (f"{p.name or 'без имени'} ({p.profile_id})", p.profile_id)
+                for p in sorted(profiles, key=lambda x: ((x.name or "").lower(), x.profile_id))
+            ]
+            self.ed_search.clear()
+            target = select_profile_id or self.current_profile_id()
+            self._populate_combo(filter_text="", select_profile_id=target)
+        finally:
+            self.ed_search.blockSignals(False)
+            self.cb_profile.blockSignals(False)
+            self._loading = False
+
+    def _populate_combo(self, *, filter_text: str, select_profile_id: str | None) -> str | None:
+        ft = filter_text.strip().lower()
+        self.cb_profile.blockSignals(True)
+        try:
+            self.cb_profile.clear()
+            for label, pid in self._items:
+                if not ft or ft in label.lower() or ft in pid.lower():
+                    self.cb_profile.addItem(label, pid)
+            if select_profile_id:
+                for i in range(self.cb_profile.count()):
+                    if self.cb_profile.itemData(i) == select_profile_id:
+                        self.cb_profile.setCurrentIndex(i)
+                        return select_profile_id
+            if self.cb_profile.count() and self.cb_profile.currentIndex() < 0:
+                self.cb_profile.setCurrentIndex(0)
+        finally:
+            self.cb_profile.blockSignals(False)
+        return self.current_profile_id()
+
+    def _notify_profile_selection(self, prev_id: str | None) -> None:
+        new_id = self.current_profile_id()
+        if new_id == prev_id:
+            return
+        if new_id:
+            self.profile_changed.emit(new_id)
+        elif prev_id:
+            self.profile_cleared.emit()
+
+    def _on_search_changed(self, text: str) -> None:
+        if self._loading:
+            return
+        prev_id = self.current_profile_id()
+        self._populate_combo(filter_text=text, select_profile_id=prev_id)
+        self._notify_profile_selection(prev_id)
+
+    def _on_combo_index_changed(self, _index: int) -> None:
+        if self._loading:
+            return
+        pid = self.current_profile_id()
+        if pid:
+            self.profile_changed.emit(pid)
 
 
 class ImportProfilesBuildThread(QThread):
@@ -1020,7 +1152,12 @@ class MainWindow(QMainWindow):
         self._archive_import_thread: ProfilesArchiveImportThread | None = None
         self._proxy_single_check_dialog: QProgressDialog | None = None
         self._proxies_table_refreshing = False
+        self._twofa_quick_updating = False
+        self._twofa_quick_old_key: str | None = None
         self._pending_open_profile_id: str | None = None
+        self._twofa_tick_timer = QTimer(self)
+        self._twofa_tick_timer.setInterval(1000)
+        self._twofa_tick_timer.timeout.connect(self._on_twofa_timer_tick)
         self._metadata_sync_timer = QTimer(self)
         self._metadata_sync_timer.setSingleShot(True)
         self._metadata_sync_timer.setInterval(300)
@@ -1039,6 +1176,7 @@ class MainWindow(QMainWindow):
         self._side_nav.setObjectName("sideNav")
         self._side_nav.addItem("Профили")
         self._side_nav.addItem("Прокси")
+        self._side_nav.addItem("2FA")
         self._side_nav.setMinimumWidth(56)
         self._side_nav.setMaximumWidth(360)
         self._side_nav.setCurrentRow(0)
@@ -1047,8 +1185,10 @@ class MainWindow(QMainWindow):
         self.pages = QStackedWidget()
         self.page_profiles = self._build_profiles_page()
         self.page_proxies = self._build_proxies_page()
+        self.page_twofa = self._build_twofa_page()
         self.pages.addWidget(self.page_profiles)
         self.pages.addWidget(self.page_proxies)
+        self.pages.addWidget(self.page_twofa)
 
         self._api_bridge = ApiUiBridge(self)
         set_api_ui_hooks(
@@ -1562,8 +1702,14 @@ class MainWindow(QMainWindow):
 
     def _on_nav_changed(self, row: int) -> None:
         self.pages.setCurrentIndex(row)
-        if row == 1:
+        if row == _NAV_PROXIES:
+            self._twofa_tick_timer.stop()
             self._refresh_proxies_page_table()
+        elif row == _NAV_TWOFA:
+            self._refresh_twofa_page()
+            self._twofa_tick_timer.start()
+        else:
+            self._twofa_tick_timer.stop()
 
     def _release_profiles_list_mouse_grab(self) -> None:
         """Снять grab с viewport списка профилей (иначе возможен краш Qt при смене вкладки)."""
@@ -1753,6 +1899,289 @@ class MainWindow(QMainWindow):
         table_l.addWidget(self.table_proxies)
         l.addWidget(table_frame, 1)
         return w
+
+    def _totp_code_for_secret(self, secret: str) -> tuple[str, bool]:
+        s = (secret or "").strip()
+        if not s:
+            return "—", False
+        try:
+            return get_totp_token(s), True
+        except Exception:
+            return "ошибка", False
+
+    def _build_twofa_page(self) -> QWidget:
+        w = QWidget()
+        l = QVBoxLayout(w)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(14)
+
+        header = QFrame()
+        header.setObjectName("twofaHeader")
+        header_l = QVBoxLayout(header)
+        header_l.setContentsMargins(18, 16, 18, 16)
+        header_l.setSpacing(6)
+        title = QLabel("2FA")
+        title.setObjectName("title")
+        hint = QLabel(
+            "Секрет 2FA хранится в custom_data профиля — в ключе, содержащем «_2fa». "
+            "Код обновляется каждые 30 секунд."
+        )
+        hint.setObjectName("twofaHeaderHint")
+        hint.setWordWrap(True)
+        header_l.addWidget(title)
+        header_l.addWidget(hint)
+        l.addWidget(header)
+
+        quick = QFrame()
+        quick.setObjectName("twofaQuickPanel")
+        quick_l = QVBoxLayout(quick)
+        quick_l.setContentsMargins(16, 14, 16, 14)
+        quick_l.setSpacing(10)
+        quick_title = QLabel("Ввод 2FA")
+        quick_title.setObjectName("twofaQuickTitle")
+        quick_hint = QLabel(
+            "Выберите профиль где в custom_data есть ключ или несколько ключей с _2fa или просто введите в поле секретный код и 2FA-код сгенерируется. "
+        )
+        quick_hint.setObjectName("twofaQuickHint")
+        quick_hint.setWordWrap(True)
+        quick_l.addWidget(quick_title)
+        quick_l.addWidget(quick_hint)
+
+        quick_form = QFormLayout()
+        quick_form.setSpacing(10)
+        self.twofa_profile_picker = _TwofaProfilePicker()
+        self.twofa_profile_picker.setToolTip("Профиль, в custom_data которого сохраняется секрет")
+        self.cb_twofa_custom_key = QComboBox()
+        self.cb_twofa_custom_key.setEditable(True)
+        self.cb_twofa_custom_key.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        _twofa_key_le = self.cb_twofa_custom_key.lineEdit()
+        if _twofa_key_le is not None:
+            _twofa_key_le.setPlaceholderText("ключ с «_2fa»")
+        self.cb_twofa_custom_key.setToolTip(
+            "Ключи «_2fa» из custom_data всех профилей; можно ввести новый вручную"
+        )
+        self.ed_twofa_secret = QLineEdit()
+        self.ed_twofa_secret.setPlaceholderText("Секрет TOTP (base32)")
+        quick_form.addRow("Профиль", self.twofa_profile_picker)
+        quick_form.addRow("Ключ custom_data", self.cb_twofa_custom_key)
+        quick_form.addRow("Секрет 2FA", self.ed_twofa_secret)
+        quick_l.addLayout(quick_form)
+
+        quick_code_row = QHBoxLayout()
+        quick_code_row.setSpacing(12)
+        self.lbl_twofa_quick_code = _ClickableTwofaCodeLabel("—")
+        self.lbl_twofa_quick_code.clicked.connect(self._on_twofa_quick_copy)
+        self.lbl_twofa_quick_timer = QLabel("—")
+        self.lbl_twofa_quick_timer.setObjectName("twofaTimerLabel")
+        self.btn_twofa_quick_copy = QPushButton("Копировать код")
+        self.btn_twofa_quick_copy.setObjectName("secondary")
+        self.btn_twofa_quick_copy.setEnabled(False)
+        self.btn_twofa_quick_save = QPushButton("Сохранить в профиль")
+        self.btn_twofa_quick_copy.clicked.connect(self._on_twofa_quick_copy)
+        self.btn_twofa_quick_save.clicked.connect(self._on_twofa_quick_save)
+        quick_code_row.addWidget(QLabel("Код:"))
+        quick_code_row.addWidget(self.lbl_twofa_quick_code)
+        quick_code_row.addWidget(QLabel("Осталось:"))
+        quick_code_row.addWidget(self.lbl_twofa_quick_timer)
+        quick_code_row.addStretch(1)
+        quick_code_row.addWidget(self.btn_twofa_quick_copy)
+        quick_code_row.addWidget(self.btn_twofa_quick_save)
+        quick_l.addLayout(quick_code_row)
+        l.addWidget(quick)
+        l.addStretch(1)
+
+        self.twofa_profile_picker.profile_changed.connect(self._on_twofa_quick_profile_selected)
+        self.twofa_profile_picker.profile_cleared.connect(self._on_twofa_quick_profile_cleared)
+        self.cb_twofa_custom_key.currentTextChanged.connect(self._on_twofa_custom_key_changed)
+        self.ed_twofa_secret.textChanged.connect(self._update_twofa_quick_code_display)
+        return w
+
+    def _refresh_twofa_custom_key_combo(self, *, select_key: str | None = None) -> None:
+        if not hasattr(self, "cb_twofa_custom_key"):
+            return
+        keys = collect_unique_twofa_keys(self._profiles)
+        target = (select_key or self.cb_twofa_custom_key.currentText() or "").strip()
+        self._twofa_quick_updating = True
+        self.cb_twofa_custom_key.blockSignals(True)
+        try:
+            self.cb_twofa_custom_key.clear()
+            for k in keys:
+                self.cb_twofa_custom_key.addItem(k)
+            if target:
+                idx = self.cb_twofa_custom_key.findText(target)
+                if idx >= 0:
+                    self.cb_twofa_custom_key.setCurrentIndex(idx)
+                else:
+                    self.cb_twofa_custom_key.setEditText(target)
+            elif keys:
+                self.cb_twofa_custom_key.setCurrentIndex(0)
+            else:
+                self.cb_twofa_custom_key.setEditText("")
+        finally:
+            self.cb_twofa_custom_key.blockSignals(False)
+            self._twofa_quick_updating = False
+
+    def _preferred_twofa_key_for_profile(self, p: BrowserProfile) -> tuple[str, str]:
+        entries = twofa_entries(p.custom_data)
+        if entries:
+            return entries[0]
+        names = twofa_key_names(p.custom_data)
+        if names:
+            key = names[0]
+            return key, secret_for_twofa_key(p.custom_data, key)
+        all_keys = collect_unique_twofa_keys(self._profiles)
+        if all_keys:
+            return all_keys[0], ""
+        return "", ""
+
+    def _sync_twofa_secret_for_current_key(self, profile_id: str | None) -> None:
+        if not profile_id or not hasattr(self, "ed_twofa_secret"):
+            return
+        p = next((x for x in self._profiles if x.profile_id == profile_id), None)
+        key = (self.cb_twofa_custom_key.currentText() or "").strip()
+        if not p or not key:
+            self.ed_twofa_secret.clear()
+            self._twofa_quick_old_key = None
+            return
+        secret = secret_for_twofa_key(p.custom_data, key)
+        self.ed_twofa_secret.setText(secret)
+        self._twofa_quick_old_key = key if key in twofa_key_names(p.custom_data) else None
+
+    def _on_twofa_custom_key_changed(self, _text: str) -> None:
+        if self._twofa_quick_updating:
+            return
+        profile_id = self.twofa_profile_picker.current_profile_id()
+        if not profile_id:
+            return
+        self._twofa_quick_updating = True
+        try:
+            self._sync_twofa_secret_for_current_key(profile_id)
+        finally:
+            self._twofa_quick_updating = False
+        self._update_twofa_quick_code_display()
+
+    def _refresh_twofa_page(self) -> None:
+        if not hasattr(self, "twofa_profile_picker"):
+            return
+        self._refresh_twofa_quick_profile_combo(select_profile_id=self._active_profile_id)
+        profile_id = self.twofa_profile_picker.current_profile_id()
+        if profile_id:
+            self._load_twofa_quick_panel_for_profile(profile_id)
+        self._update_twofa_quick_code_display()
+
+    def _refresh_twofa_quick_profile_combo(self, *, select_profile_id: str | None = None) -> None:
+        if not hasattr(self, "twofa_profile_picker"):
+            return
+        target = select_profile_id or self._active_profile_id
+        self._twofa_quick_updating = True
+        try:
+            self.twofa_profile_picker.set_profiles(self._profiles, select_profile_id=target)
+        finally:
+            self._twofa_quick_updating = False
+
+    def _load_twofa_quick_panel_for_profile(self, profile_id: str | None) -> None:
+        if not hasattr(self, "ed_twofa_secret"):
+            return
+        self._twofa_quick_updating = True
+        try:
+            self._refresh_twofa_custom_key_combo()
+            if not profile_id:
+                self.cb_twofa_custom_key.setEditText("")
+                self.ed_twofa_secret.clear()
+                self._twofa_quick_old_key = None
+                self._update_twofa_quick_code_display()
+                return
+            p = next((x for x in self._profiles if x.profile_id == profile_id), None)
+            if not p:
+                self.cb_twofa_custom_key.setEditText("")
+                self.ed_twofa_secret.clear()
+                self._twofa_quick_old_key = None
+                self._update_twofa_quick_code_display()
+                return
+            key, secret = self._preferred_twofa_key_for_profile(p)
+            self._refresh_twofa_custom_key_combo(select_key=key or None)
+            self.ed_twofa_secret.setText(secret)
+            self._twofa_quick_old_key = key if key and key in twofa_key_names(p.custom_data) else None
+            self._update_twofa_quick_code_display()
+        finally:
+            self._twofa_quick_updating = False
+
+    def _on_twofa_quick_profile_selected(self, profile_id: str) -> None:
+        if self._twofa_quick_updating:
+            return
+        self._load_twofa_quick_panel_for_profile(profile_id)
+
+    def _on_twofa_quick_profile_cleared(self) -> None:
+        if self._twofa_quick_updating:
+            return
+        self._load_twofa_quick_panel_for_profile(None)
+
+    def _update_twofa_quick_code_display(self) -> None:
+        if not hasattr(self, "lbl_twofa_quick_code"):
+            return
+        secret = (self.ed_twofa_secret.text() if hasattr(self, "ed_twofa_secret") else "") or ""
+        code, ok = self._totp_code_for_secret(secret)
+        remaining = totp_seconds_remaining()
+        self.lbl_twofa_quick_code.setText(code)
+        self.lbl_twofa_quick_timer.setText(f"{remaining} с" if ok else "—")
+        color = "#a5b4fc" if ok else "#94a3b8"
+        self.lbl_twofa_quick_timer.setStyleSheet(f"color: {color};")
+        if hasattr(self, "btn_twofa_quick_copy"):
+            copyable = ok and code not in ("—", "ошибка")
+            self.btn_twofa_quick_copy.setEnabled(copyable)
+            self.lbl_twofa_quick_code.setCursor(
+                QCursor(Qt.CursorShape.PointingHandCursor)
+                if copyable
+                else QCursor(Qt.CursorShape.ArrowCursor)
+            )
+            self.lbl_twofa_quick_code.setToolTip(
+                "Клик — скопировать код" if copyable else ""
+            )
+
+    def _on_twofa_quick_copy(self) -> None:
+        self._copy_twofa_code(self.lbl_twofa_quick_code.text())
+
+    def _on_twofa_quick_save(self) -> None:
+        profile_id = self.twofa_profile_picker.current_profile_id()
+        if not profile_id:
+            QMessageBox.information(self, "2FA", "Выберите профиль.")
+            return
+        key_raw = (self.cb_twofa_custom_key.currentText() or "").strip()
+        secret = (self.ed_twofa_secret.text() or "").strip()
+        try:
+            key = normalize_twofa_custom_key(key_raw)
+        except ValueError as e:
+            QMessageBox.warning(self, "2FA", str(e))
+            return
+        idx = next((i for i, p in enumerate(self._profiles) if p.profile_id == profile_id), None)
+        if idx is None:
+            QMessageBox.warning(self, "2FA", "Профиль не найден.")
+            return
+        p = self._profiles[idx]
+        try:
+            custom = set_twofa_in_custom_data(
+                p.custom_data,
+                key,
+                secret,
+                old_key=self._twofa_quick_old_key,
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "2FA", str(e))
+            return
+        self._profiles[idx] = replace(p, custom_data=custom)
+        save_profiles(self._profiles)
+        self._twofa_quick_old_key = key
+        self._refresh_twofa_page()
+
+    def _copy_twofa_code(self, code: str) -> None:
+        if code in ("—", "ошибка", ""):
+            return
+        QApplication.clipboard().setText(code)
+
+    def _on_twofa_timer_tick(self) -> None:
+        if self.pages.currentIndex() != _NAV_TWOFA:
+            return
+        self._update_twofa_quick_code_display()
 
     def _group_profiles_by_proxy(self) -> dict[tuple[str, str | None, str | None], list[BrowserProfile]]:
         """Одна строка таблицы = уникальный прокси (URL + логин + пароль), все профили в группе."""
@@ -3705,6 +4134,10 @@ class MainWindow(QMainWindow):
         self._profiles = [updated if x.profile_id == updated.profile_id else x for x in self._profiles]
         save_profiles(self._profiles)
         self._refresh_profiles_list()
+        if self.pages.currentIndex() == _NAV_PROXIES:
+            self._refresh_proxies_page_table()
+        elif self.pages.currentIndex() == _NAV_TWOFA:
+            self._refresh_twofa_page()
 
     def _blank_to_none(self, s: str) -> Optional[str]:
         s2 = (s or "").strip()

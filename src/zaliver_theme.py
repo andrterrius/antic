@@ -483,5 +483,147 @@ QPushButton#profileIdCopyBtn:hover {
 QScrollArea#proxyProfileIdsScroll {
     background: transparent;
 }
+
+/* Вкладка «2FA» */
+QFrame#twofaHeader {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 rgba(99, 102, 241, 0.14), stop:1 rgba(124, 58, 237, 0.10));
+    border: 1px solid #3d4258;
+    border-radius: 14px;
+    padding: 4px;
+}
+
+QLabel#twofaHeaderHint {
+    color: #94a3b8;
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+QFrame#twofaQuickPanel {
+    background-color: #1a1d26;
+    border: 1px solid #2d3142;
+    border-radius: 14px;
+}
+
+QLabel#twofaQuickTitle {
+    color: #a5b4fc;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+QLabel#twofaQuickHint {
+    color: #94a3b8;
+    font-size: 12px;
+}
+
+QFrame#twofaStatCard {
+    background-color: #1a1d26;
+    border: 1px solid #2d3142;
+    border-radius: 12px;
+}
+
+QFrame#twofaStatCardOk {
+    background-color: rgba(22, 163, 74, 0.10);
+    border: 1px solid rgba(22, 163, 74, 0.45);
+    border-radius: 12px;
+}
+
+QFrame#twofaStatCardUnknown {
+    background-color: rgba(100, 116, 139, 0.12);
+    border: 1px solid #3d4258;
+    border-radius: 12px;
+}
+
+QLabel#twofaStatValue {
+    font-size: 26px;
+    font-weight: 700;
+    color: #f1f5f9;
+}
+
+QLabel#twofaStatValueOk {
+    font-size: 26px;
+    font-weight: 700;
+    color: #86efac;
+}
+
+QLabel#twofaStatValueUnknown {
+    font-size: 26px;
+    font-weight: 700;
+    color: #cbd5e1;
+}
+
+QLabel#twofaStatLabel {
+    color: #94a3b8;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+}
+
+QFrame#twofaTableFrame {
+    background-color: #1a1d26;
+    border: 1px solid #2d3142;
+    border-radius: 14px;
+}
+
+QTableWidget#twofaTable {
+    background-color: #0f1118;
+    border: none;
+    border-radius: 10px;
+    gridline-color: #252836;
+    outline: none;
+    selection-background-color: rgba(99, 102, 241, 0.28);
+    selection-color: #f1f5f9;
+    alternate-background-color: rgba(255, 255, 255, 0.02);
+}
+
+QTableWidget#twofaTable::item {
+    padding: 8px 10px;
+    border: none;
+}
+
+QTableWidget#twofaTable QHeaderView::section {
+    background-color: #252836;
+    color: #a5b4fc;
+    font-weight: 600;
+    padding: 10px 12px;
+    border: none;
+    border-bottom: 1px solid #3d4258;
+}
+
+QLabel#twofaCodeLabel {
+    font-family: "Consolas", "Cascadia Mono", monospace;
+    font-size: 18px;
+    font-weight: 700;
+    color: #f1f5f9;
+    letter-spacing: 2px;
+    padding: 2px 4px;
+    border-radius: 6px;
+}
+
+QLabel#twofaCodeLabel:hover {
+    color: #c7d2fe;
+    background-color: rgba(99, 102, 241, 0.12);
+}
+
+QLabel#twofaTimerLabel {
+    font-family: "Consolas", "Cascadia Mono", monospace;
+    font-size: 14px;
+    font-weight: 600;
+    color: #a5b4fc;
+}
+
+QPushButton#twofaCopyBtn {
+    background-color: #252836;
+    border: 1px solid #3d4258;
+    border-radius: 8px;
+    padding: 4px 8px;
+    min-height: 0;
+    font-size: 12px;
+}
+
+QPushButton#twofaCopyBtn:hover {
+    background-color: #2e3245;
+    border: 1px solid #6366f1;
+}
 """
 
