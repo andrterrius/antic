@@ -107,6 +107,11 @@ from api_server import (
 from fingerprint_consistency import normalize_timezone_country
 from zaliver_theme import ZALIVER_DARK_QSS
 from app_icon import build_app_icon
+from profile_tags_filter_dialog import (
+    ProfileTagsFilterDialog,
+    collect_all_tags_from_profiles,
+    profile_matches_tag_filter,
+)
 
 
 class RunnerThread(QThread):
@@ -1114,6 +1119,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1060, 680)
 
         self._editable_tags: list[str] = []
+        self._profiles_tag_filter: frozenset[str] = frozenset()
         self._checked_profile_ids: set[str] = set()
         self._profile_id_to_checkbox: dict[str, QCheckBox] = {}
         self._profile_id_to_row: dict[str, QWidget] = {}
@@ -1357,10 +1363,22 @@ class MainWindow(QMainWindow):
         self._expand_field(self.ed_profiles_search, min_w=240)
         self.ed_profiles_search.textChanged.connect(lambda _t: self._refresh_profiles_list())
 
+        self.btn_profiles_filter_tags = QPushButton("По тэгам")
+        self.btn_profiles_filter_tags.setObjectName("secondary")
+        self.btn_profiles_filter_tags.setAutoDefault(False)
+        self.btn_profiles_filter_tags.setDefault(False)
+        self.btn_profiles_filter_tags.setToolTip(
+            "Отфильтровать список по выбранным тегам "
+            "(все теги загруженных профилей)."
+        )
+        self.btn_profiles_filter_tags.clicked.connect(self._open_profiles_tag_filter_dialog)
+
         search_row = QHBoxLayout()
         search_row.setSpacing(8)
         search_row.addWidget(self.ed_profiles_search, 1)
+        search_row.addWidget(self.btn_profiles_filter_tags)
         list_layout.addLayout(search_row)
+        self._sync_profiles_tag_filter_button()
 
         list_sel_row = QHBoxLayout()
         list_sel_row.addStretch(1)
@@ -1730,12 +1748,19 @@ class MainWindow(QMainWindow):
         """Выделить профиль в списке и загрузить его в редактор (без смены вкладки)."""
         if not any(p.profile_id == profile_id for p in self._profiles):
             return False
+        need_refresh = False
         if hasattr(self, "ed_profiles_search") and (self.ed_profiles_search.text() or "").strip():
             self.ed_profiles_search.blockSignals(True)
             try:
                 self.ed_profiles_search.clear()
             finally:
                 self.ed_profiles_search.blockSignals(False)
+            need_refresh = True
+        if getattr(self, "_profiles_tag_filter", frozenset()):
+            self._profiles_tag_filter = frozenset()
+            self._sync_profiles_tag_filter_button()
+            need_refresh = True
+        if need_refresh:
             self._refresh_profiles_list()
         elif profile_id not in self._profile_id_to_item:
             self._refresh_profiles_list()
@@ -2775,12 +2800,44 @@ class MainWindow(QMainWindow):
             self.profiles_list.blockSignals(False)
         self._set_profiles_list_vscroll(scroll)
 
+    def _sync_profiles_tag_filter_button(self) -> None:
+        if not hasattr(self, "btn_profiles_filter_tags"):
+            return
+        n = len(getattr(self, "_profiles_tag_filter", frozenset()) or ())
+        if n:
+            self.btn_profiles_filter_tags.setText(f"По тэгам ({n})")
+            self.btn_profiles_filter_tags.setToolTip(
+                f"Активен фильтр по {n} тег(ам). Нажмите, чтобы изменить или сбросить."
+            )
+        else:
+            self.btn_profiles_filter_tags.setText("По тэгам")
+            self.btn_profiles_filter_tags.setToolTip(
+                "Отфильтровать список по выбранным тегам "
+                "(все теги загруженных профилей)."
+            )
+
+    def _open_profiles_tag_filter_dialog(self) -> None:
+        tags = collect_all_tags_from_profiles(self._profiles)
+        dlg = ProfileTagsFilterDialog(
+            tags=tags,
+            initially_checked=self._profiles_tag_filter,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._profiles_tag_filter = frozenset(dlg.selected_tags())
+        self._sync_profiles_tag_filter_button()
+        self._refresh_profiles_list()
+
     def _refresh_profiles_list(self) -> None:
         list_scroll = self._profiles_list_vscroll()
         q_raw = (self.ed_profiles_search.text() if hasattr(self, "ed_profiles_search") else "") or ""
         tokens = [t for t in q_raw.lower().strip().split() if t]
+        tag_filter = getattr(self, "_profiles_tag_filter", frozenset()) or frozenset()
 
         def matches(p: BrowserProfile) -> bool:
+            if not profile_matches_tag_filter(p, tag_filter):
+                return False
             if not tokens:
                 return True
             pid = (p.profile_id or "").lower()

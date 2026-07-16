@@ -226,6 +226,47 @@ def cmd_profiles_recover(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_profiles_import_archive(args: argparse.Namespace) -> int:
+    path = Path((args.file or "").strip())
+    if not path.is_file():
+        raise SystemExit(f"File not found: {path}")
+
+    from profiles_bundle import import_profiles_zip
+
+    before_ids = {p.profile_id for p in load_profiles()}
+    progress: Callable[[str], None] | None = None
+    if not args.quiet:
+        progress = lambda msg: _eprint(msg)
+
+    try:
+        merged, added, remapped = import_profiles_zip(path, progress=progress)
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
+
+    if args.quiet:
+        return 0
+
+    new_profiles = [p for p in merged if p.profile_id not in before_ids]
+    if args.format == "json":
+        print(
+            _json_dump(
+                {
+                    "added": added,
+                    "remapped": remapped,
+                    "profiles": [asdict(p) for p in new_profiles],
+                }
+            )
+        )
+        return 0
+
+    print(f"Imported {added} profile(s) from {path.name}.")
+    if remapped:
+        print(f"Remapped {remapped} profile(s) due to ID conflicts.")
+    for p in new_profiles:
+        print(f"  {p.profile_id}\t{p.name}")
+    return 0
+
+
 def cmd_profiles_delete(args: argparse.Namespace) -> int:
     profiles = load_profiles()
     p = _require_profile(profiles, args.profile_id)
@@ -543,6 +584,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp_imp.add_argument("--format", choices=["text", "json"], default="text")
     sp_imp.add_argument("--quiet", action="store_true")
     sp_imp.set_defaults(func=cmd_profiles_import_proxies)
+
+    sp_arc = psub.add_parser(
+        "import-archive",
+        help="Import profiles from a ZIP export (full archive or cookies-only).",
+    )
+    sp_arc.add_argument("file", help="Path to .zip exported from Antidetect UI.")
+    sp_arc.add_argument("--format", choices=["text", "json"], default="text")
+    sp_arc.add_argument("--quiet", action="store_true")
+    sp_arc.set_defaults(func=cmd_profiles_import_archive)
 
     sp_del = psub.add_parser("delete", help="Delete a profile.")
     sp_del.add_argument("profile_id")
