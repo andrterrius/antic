@@ -39,7 +39,14 @@ a = Analysis(
     ["src/qt_main.py"],
     pathex=["src"],
     binaries=[],
-    datas=[*playwright_datas, *patchright_datas],
+    datas=[
+        *playwright_datas,
+        *patchright_datas,
+        (
+            "resources/extensions/anticaptcha-plugin",
+            "resources/extensions/anticaptcha-plugin",
+        ),
+    ],
     hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},

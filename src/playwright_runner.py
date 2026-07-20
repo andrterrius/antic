@@ -4,9 +4,11 @@ import traceback
 from dataclasses import replace
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse, urlunparse
 import os
+import re
+import shutil
 import subprocess
 import platform
 import io
@@ -22,6 +24,7 @@ from patchright.sync_api import sync_playwright
 
 
 from profiles_store import BrowserProfile, app_state_root
+from app_settings import get_anticaptcha_api_key, get_anticaptcha_auto_solve
 from fingerprint_consistency import (
     chromium_ua_metadata_from_user_agent,
     normalize_timezone_country,
@@ -377,44 +380,376 @@ def profile_user_data_dir(profile_id: str) -> Path:
     return d
 
 
-def _write_unpacked_profile_id_extension(user_data_dir: Path, profile_name: str) -> Path:
-    """
-    Unpacked MV3 extension: popup shows profile name + id (id = user_data_dir name).
-    Separate buttons copy name and id to the clipboard.
-    """
-    ext_root = user_data_dir / "_antidetect_profile_id_ext"
-    ext_root.mkdir(parents=True, exist_ok=True)
-    current_profile_id = (user_data_dir.name or "").strip()
-    display_name = (profile_name or "").strip() or "—"
-    tip = f"{display_name} · {current_profile_id}" if current_profile_id else display_name
-    if len(tip) > 120:
-        tip = tip[:117] + "..."
-    manifest = {
-        "manifest_version": 3,
-        "name": "Antic",
-        "version": "1.0",
-        "description": "Полоска: название и ID профиля; клик копирует отдельно.",
-        "permissions": ["clipboardWrite"],
-        "content_scripts": [
-            {
-                "matches": ["http://*/*", "https://*/*"],
-                "js": ["profile_strip.js"],
-                "css": ["profile_strip.css"],
-                "run_at": "document_idle",
-                "all_frames": False,
-            }
-        ],
-        "action": {
-            "default_popup": "popup.html",
-            "default_title": tip,
-        },
+def _anticaptcha_plugin_template_dir() -> Path | None:
+    """Bundled AntiCaptcha unpacked extension (resources/extensions/anticaptcha-plugin)."""
+    candidates: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "resources" / "extensions" / "anticaptcha-plugin")
+    candidates.append(
+        Path(__file__).resolve().parent.parent
+        / "resources"
+        / "extensions"
+        / "anticaptcha-plugin"
+    )
+    for c in candidates:
+        if (c / "manifest.json").is_file() and (c / "js" / "config_ac_api_key.js").is_file():
+            return c
+    return None
+
+
+def _js_single_quoted(value: str) -> str:
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+_ANTICAPTCHA_KEY_ASSIGN_RE = re.compile(
+    r"antiCapthaPredefinedApiKey\s*=\s*'(?:\\'|[^'])*'"
+)
+
+# Файлы Antic, которые нельзя затирать копией AntiCaptcha.
+_ANTIC_OWN_FILES = frozenset(
+    {
+        "manifest.json",
+        "popup.html",
+        "popup.js",
+        "profile_strip.js",
+        "profile_strip.css",
     }
-    (ext_root / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+)
+
+
+def _inject_anticaptcha_config(
+    ext_root: Path,
+    api_key: str,
+    *,
+    auto_solve: bool,
+    log: Callable[[str], None],
+) -> bool:
+    key = (api_key or "").strip()
+    cfg = ext_root / "js" / "config_ac_api_key.js"
+    if not cfg.is_file():
+        return False
+    text = cfg.read_text(encoding="utf-8")
+    # Всегда включать автоотправку формы по умолчанию.
+    text = re.sub(
+        r"auto_submit_form\s*:\s*(?:true|false)\b",
+        "auto_submit_form: true",
+        text,
+        count=1,
+    )
+    # ProxyOn ломает расширение без валидного прокси и провоцирует диалог авторизации.
+    text = re.sub(
+        r"solve_proxy_on_tasks\s*:\s*(?:true|false)\b",
+        "solve_proxy_on_tasks: false",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r"(user_proxy_server\s*:\s*)'(?:\\'|[^'])*'",
+        r"\1''",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r"(user_proxy_port\s*:\s*)'(?:\\'|[^'])*'",
+        r"\1''",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r"(user_proxy_login\s*:\s*)'(?:\\'|[^'])*'",
+        r"\1''",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r"(user_proxy_password\s*:\s*)'(?:\\'|[^'])*'",
+        r"\1''",
+        text,
+        count=1,
+    )
+    # Галочка «Автопрохождение капчи» → defaultConfig.enable
+    enable_js = "true" if auto_solve else "false"
+    if not re.search(r"enable\s*:\s*(?:true|false)\b", text):
+        log("AntiCaptcha: не удалось выставить enable в config_ac_api_key.js.")
+        return False
+    text = re.sub(
+        r"(enable\s*:\s*)(?:true|false)\b",
+        rf"\1{enable_js}",
+        text,
+        count=1,
+    )
+    if key:
+        replaced = _ANTICAPTCHA_KEY_ASSIGN_RE.sub(
+            f"antiCapthaPredefinedApiKey = {_js_single_quoted(key)}",
+            text,
+            count=1,
+        )
+        if replaced == text:
+            log("AntiCaptcha: не удалось подставить API key в config_ac_api_key.js.")
+            return False
+        text = replaced
+    cfg.write_text(text, encoding="utf-8")
+
+    # Popup и background читают chrome.storage независимо от defaultConfig.
+    # Патчим get/set у local+sync и жёстко фиксируем enable (и ключ).
+    key_js = _js_single_quoted(key)
+    checked_js = "true" if key else "false"
+    force_js = f"""/* injected by Antidetect: force AntiCaptcha settings */
+(function () {{
+  var FORCED = {{
+    enable: {enable_js},
+    auto_submit_form: true,
+    account_key: {key_js},
+    account_key_checked: {checked_js},
+    solve_proxy_on_tasks: false,
+    user_proxy_protocol: "HTTP",
+    user_proxy_server: "",
+    user_proxy_port: "",
+    user_proxy_login: "",
+    user_proxy_password: ""
+  }};
+  function applyForced(items) {{
+    items = Object.assign({{}}, items || {{}});
+    items.enable = FORCED.enable;
+    items.auto_submit_form = FORCED.auto_submit_form;
+    items.solve_proxy_on_tasks = false;
+    items.user_proxy_protocol = "HTTP";
+    items.user_proxy_server = "";
+    items.user_proxy_port = "";
+    items.user_proxy_login = "";
+    items.user_proxy_password = "";
+    // Всегда фиксируем ключ/checked из настроек приложения (storage не должен
+    // затирать predefined пустым значением из прошлой сессии).
+    items.account_key = FORCED.account_key;
+    items.account_key_checked = FORCED.account_key_checked;
+    return items;
+  }}
+  function patchStore(store) {{
+    if (!store || store.__antidetectPatched) return;
+    store.__antidetectPatched = true;
+    var origGet = store.get.bind(store);
+    var origSet = store.set.bind(store);
+    store.get = function (keys, cb) {{
+      if (typeof cb === "function") {{
+        return origGet(keys, function (items) {{ cb(applyForced(items)); }});
+      }}
+      var ret = origGet(keys);
+      if (ret && typeof ret.then === "function") {{
+        return ret.then(applyForced);
+      }}
+      return applyForced(ret);
+    }};
+    store.set = function (items, cb) {{
+      items = applyForced(Object.assign({{}}, items || {{}}));
+      if (typeof cb === "function") {{
+        return origSet(items, cb);
+      }}
+      return origSet(items);
+    }};
+  }}
+  try {{
+    if (chrome.storage && chrome.storage.local) patchStore(chrome.storage.local);
+    if (chrome.storage && chrome.storage.sync) patchStore(chrome.storage.sync);
+    var store =
+      chrome.storage.sync && typeof browser === "undefined"
+        ? chrome.storage.sync
+        : chrome.storage.local;
+    store.set(FORCED, function () {{
+      try {{
+        if (typeof window !== "undefined") window.__antidetectAcReady = true;
+      }} catch (e1) {{}}
+      try {{
+        if (typeof self !== "undefined") self.__antidetectAcReady = true;
+      }} catch (e2) {{}}
+    }});
+  }} catch (e) {{}}
+}})();
+"""
+    (ext_root / "js" / "zaliver_force_settings.js").write_text(force_js, encoding="utf-8")
+
+    # В antidetect/Chromium без Google-логина getProfileUserInfo часто висит,
+    # а background ждёт его ДО регистрации onMessage / interceptor'ов → капча
+    # показывает виджет, но не стартует решение.
+    boot_js = """/* injected by Antidetect: non-blocking identity for AntiCaptcha */
+(function () {
+  try {
+    if (!chrome.identity || !chrome.identity.getProfileUserInfo) return;
+    if (chrome.identity.__antidetectIdentityStub) return;
+    chrome.identity.__antidetectIdentityStub = true;
+    chrome.identity.getProfileUserInfo = function (options, callback) {
+      var cb = typeof options === "function" ? options : callback;
+      var result = { email: "", id: "" };
+      if (typeof cb === "function") {
+        try {
+          cb(result);
+        } catch (e) {}
+        return;
+      }
+      return Promise.resolve(result);
+    };
+  } catch (e) {}
+})();
+"""
+    (ext_root / "js" / "zaliver_fast_boot.js").write_text(boot_js, encoding="utf-8")
+
+    sw = ext_root / "js" / "service_worker.js"
+    sw.write_text(
+        "\n"
+        '    importScripts("/js/config_ac_api_key.js");\n'
+        '    importScripts("/js/zaliver_fast_boot.js");\n'
+        '    importScripts("/js/zaliver_force_settings.js");\n'
+        '    importScripts("/js/background.js");\n',
         encoding="utf-8",
     )
+
+    # Popup — отдельный контекст: без патча галочка читает старый chrome.storage.
+    # Убрать Google Fonts: через прокси fonts.googleapis.com часто висит минутами.
+    popup = ext_root / "popup_v3.html"
+    if popup.is_file():
+        html = popup.read_text(encoding="utf-8")
+        html = re.sub(
+            r'<link[^>]+fonts\.googleapis\.com[^>]*>\s*',
+            "",
+            html,
+            flags=re.IGNORECASE,
+        )
+        if "zaliver_force_settings.js" not in html:
+            html = html.replace(
+                '<script src="/js/options_all.js"></script>',
+                '<script src="/js/zaliver_force_settings.js"></script>\n'
+                '  <script src="/js/options_all.js"></script>',
+            )
+        popup.write_text(html, encoding="utf-8")
+    return True
+
+
+def _merge_anticaptcha_into_extension(
+    ext_root: Path,
+    api_key: str,
+    log: Callable[[str], None],
+    *,
+    auto_solve: bool = True,
+) -> bool:
+    """
+    Встроить файлы AntiCaptcha в расширение Antic (один --load-extension).
+    Popup Antic остаётся default; оригинальный UI — popup_v3.html.
+    """
+    template = _anticaptcha_plugin_template_dir()
+    if template is None:
+        log("AntiCaptcha: шаблон расширения не найден, пропускаю.")
+        return False
+    # Старая отдельная копия больше не нужна.
+    stale = ext_root.parent / "_anticaptcha_ext"
+    if stale.exists():
+        shutil.rmtree(stale, ignore_errors=True)
+    try:
+        for src in template.rglob("*"):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(template)
+            if rel.parts and rel.parts[0] == "_metadata":
+                continue
+            if len(rel.parts) == 1 and rel.name in _ANTIC_OWN_FILES:
+                continue
+            dest = ext_root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+
+        if not _inject_anticaptcha_config(
+            ext_root, api_key, auto_solve=auto_solve, log=log
+        ):
+            shutil.rmtree(ext_root / "_locales", ignore_errors=True)
+            return False
+
+        antic_path = ext_root / "manifest.json"
+        ac_path = template / "manifest.json"
+        antic = json.loads(antic_path.read_text(encoding="utf-8"))
+        ac = json.loads(ac_path.read_text(encoding="utf-8"))
+        if not isinstance(antic, dict) or not isinstance(ac, dict):
+            log("AntiCaptcha: некорректный manifest.")
+            shutil.rmtree(ext_root / "_locales", ignore_errors=True)
+            return False
+
+        perms: list[str] = []
+        seen_perm: set[str] = set()
+        for p in list(antic.get("permissions") or []) + list(ac.get("permissions") or []):
+            if isinstance(p, str) and p not in seen_perm:
+                seen_perm.add(p)
+                perms.append(p)
+
+        content_scripts: list[Any] = []
+        for block in list(antic.get("content_scripts") or []) + list(ac.get("content_scripts") or []):
+            if isinstance(block, dict):
+                content_scripts.append(block)
+
+        merged: dict[str, Any] = {
+            "manifest_version": 3,
+            "name": antic.get("name") or "Antic",
+            "version": str(antic.get("version") or "1.0"),
+            "description": antic.get("description") or "",
+            "permissions": perms,
+            "content_scripts": content_scripts,
+            "action": antic.get("action")
+            or {
+                "default_popup": "popup.html",
+            },
+            "background": ac.get("background"),
+            "host_permissions": ac.get("host_permissions") or ["<all_urls>"],
+            "web_accessible_resources": ac.get("web_accessible_resources") or [],
+            "declarative_net_request": ac.get("declarative_net_request"),
+            "content_security_policy": ac.get("content_security_policy"),
+            "options_ui": ac.get("options_ui"),
+            "options_page": ac.get("options_page"),
+            "icons": ac.get("icons"),
+            # _locales копируется из AntiCaptcha — без default_locale Chromium не грузит расширение.
+            "default_locale": str(ac.get("default_locale") or "en").strip() or "en",
+            "oauth2": ac.get("oauth2"),
+        }
+        # Убрать пустые optional-поля (default_locale оставляем всегда)
+        merged = {k: v for k, v in merged.items() if v is not None}
+        if (ext_root / "_locales").is_dir() and not merged.get("default_locale"):
+            merged["default_locale"] = "en"
+        antic_path.write_text(
+            json.dumps(merged, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        log(f"AntiCaptcha: ошибка встраивания в Antic: {exc}")
+        shutil.rmtree(ext_root / "_locales", ignore_errors=True)
+        return False
+    log(
+        "AntiCaptcha: встроено в Antic "
+        f"(auto_solve={'on' if auto_solve else 'off'}, popup_v3.html)."
+    )
+    return True
+
+
+def _write_antic_popup(
+    ext_root: Path,
+    *,
+    display_name: str,
+    profile_id: str,
+    with_anticaptcha: bool,
+) -> None:
     name_js = json.dumps(display_name, ensure_ascii=False)
-    id_js = json.dumps(current_profile_id, ensure_ascii=False)
+    id_js = json.dumps(profile_id, ensure_ascii=False)
+    ac_btn_js = ""
+    ac_btn_html = ""
+    if with_anticaptcha:
+        ac_btn_html = """
+  <div class="row ac-row">
+    <button type="button" id="btn-anticaptcha" class="ac">AntiCaptcha</button>
+  </div>
+"""
+        ac_btn_js = """
+  const btnAc = document.getElementById("btn-anticaptcha");
+  if (btnAc) {
+    btnAc.addEventListener("click", () => {
+      location.href = "popup_v3.html";
+    });
+  }
+"""
     popup_js = f"""(() => {{
   const PROFILE_NAME = {name_js};
   const PROFILE_ID = {id_js};
@@ -460,29 +795,38 @@ def _write_unpacked_profile_id_extension(user_data_dir: Path, profile_name: str)
 
   btnName.addEventListener("click", () => copyText(PROFILE_NAME, btnName));
   btnId.addEventListener("click", () => copyText(PROFILE_ID, btnId));
-}})();
+{ac_btn_js}}})();
 """
     (ext_root / "popup.js").write_text(popup_js, encoding="utf-8")
-    popup = """<!DOCTYPE html>
+    popup = f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8" />
   <title>Профиль</title>
   <style>
-    body { font: 14px system-ui, sans-serif; margin: 12px; min-width: 220px; max-width: 380px; }
-    .label { color: #666; font-size: 12px; margin-bottom: 4px; }
-    .value { word-break: break-word; font-weight: 600; margin-bottom: 8px; }
-    .mono { font-family: ui-monospace, monospace; font-size: 13px; }
-    .row { margin-bottom: 14px; }
-    button {
+    body {{ font: 14px system-ui, sans-serif; margin: 12px; min-width: 220px; max-width: 380px; }}
+    .label {{ color: #666; font-size: 12px; margin-bottom: 4px; }}
+    .value {{ word-break: break-word; font-weight: 600; margin-bottom: 8px; }}
+    .mono {{ font-family: ui-monospace, monospace; font-size: 13px; }}
+    .row {{ margin-bottom: 14px; }}
+    .ac-row {{ margin-bottom: 4px; margin-top: 4px; }}
+    button {{
       font: 13px system-ui, sans-serif;
       padding: 6px 10px;
       border-radius: 6px;
       border: 1px solid #ccc;
       background: #f5f5f5;
       cursor: pointer;
-    }
-    button:hover { background: #eaeaea; }
+    }}
+    button:hover {{ background: #eaeaea; }}
+    button.ac {{
+      width: 100%;
+      border-color: #1a73e8;
+      background: #1a73e8;
+      color: #fff;
+      font-weight: 600;
+    }}
+    button.ac:hover {{ background: #1557b0; }}
   </style>
 </head>
 <body>
@@ -496,11 +840,63 @@ def _write_unpacked_profile_id_extension(user_data_dir: Path, profile_name: str)
     <div id="pid" class="value mono"></div>
     <button type="button" id="btn-id">Копировать ID</button>
   </div>
-  <script src="popup.js"></script>
+{ac_btn_html}  <script src="popup.js"></script>
 </body>
 </html>
 """
     (ext_root / "popup.html").write_text(popup, encoding="utf-8")
+
+
+def _write_unpacked_profile_id_extension(
+    user_data_dir: Path,
+    profile_name: str,
+    *,
+    anticaptcha_api_key: str = "",
+    anticaptcha_auto_solve: bool = True,
+    log: Callable[[str], None] | None = None,
+) -> Path:
+    """
+    Unpacked MV3 extension: popup shows profile name + id (id = user_data_dir name).
+    Separate buttons copy name and id to the clipboard.
+    Optionally embeds AntiCaptcha (original popup_v3.html via button AntiCaptcha).
+    """
+    _log = log or (lambda _m: None)
+    ext_root = user_data_dir / "_antidetect_profile_id_ext"
+    # Чистый каталог: иначе старый _locales без default_locale ломает загрузку.
+    if ext_root.exists():
+        shutil.rmtree(ext_root, ignore_errors=True)
+    ext_root.mkdir(parents=True, exist_ok=True)
+    current_profile_id = (user_data_dir.name or "").strip()
+    display_name = (profile_name or "").strip() or "—"
+    tip = f"{display_name} · {current_profile_id}" if current_profile_id else display_name
+    if len(tip) > 120:
+        tip = tip[:117] + "..."
+    manifest = {
+        "manifest_version": 3,
+        "name": "Antic",
+        "version": "1.0",
+        "description": "Полоска: название и ID профиля; клик копирует отдельно.",
+        "permissions": ["clipboardWrite"],
+        "content_scripts": [
+            {
+                "matches": ["http://*/*", "https://*/*"],
+                "js": ["profile_strip.js"],
+                "css": ["profile_strip.css"],
+                "run_at": "document_idle",
+                "all_frames": False,
+            }
+        ],
+        "action": {
+            "default_popup": "popup.html",
+            "default_title": tip,
+        },
+    }
+    (ext_root / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    name_js = json.dumps(display_name, ensure_ascii=False)
+    id_js = json.dumps(current_profile_id, ensure_ascii=False)
 
     strip_css = """#__antic_prof_strip {
   position: fixed;
@@ -651,6 +1047,19 @@ def _write_unpacked_profile_id_extension(user_data_dir: Path, profile_name: str)
 }})();
 """
     (ext_root / "profile_strip.js").write_text(strip_js, encoding="utf-8")
+
+    with_ac = _merge_anticaptcha_into_extension(
+        ext_root,
+        anticaptcha_api_key or "",
+        _log,
+        auto_solve=bool(anticaptcha_auto_solve),
+    )
+    _write_antic_popup(
+        ext_root,
+        display_name=display_name,
+        profile_id=current_profile_id,
+        with_anticaptcha=with_ac,
+    )
 
     return ext_root
 
@@ -1204,9 +1613,12 @@ def run_profile(
 ) -> LaunchResult:
     """
     Launches a persistent Chromium context for a profile.
-    WebRTC IP будет подменен на IP прокси
+    WebRTC IP будет подменен на IP прокси.
+    Ключ AntiCaptcha — из Настройки → AntiCaptcha (app_settings.json).
     """
     try:
+        anticaptcha_api_key = get_anticaptcha_api_key()
+        anticaptcha_auto_solve = get_anticaptcha_auto_solve()
         # Получаем IP прокси для подмены
         proxy_ip = None
         if force_webrtc_proxy_ip and profile.proxy_server:
@@ -1260,7 +1672,13 @@ def run_profile(
 
             profile = normalize_timezone_country(profile)
             user_data_dir = profile_user_data_dir(profile.profile_id)
-            profile_ext_dir = _write_unpacked_profile_id_extension(user_data_dir, profile.name)
+            profile_ext_dir = _write_unpacked_profile_id_extension(
+                user_data_dir,
+                profile.name,
+                anticaptcha_api_key=anticaptcha_api_key or "",
+                anticaptcha_auto_solve=anticaptcha_auto_solve,
+                log=log,
+            )
             _ensure_extension_pinned_in_preferences(user_data_dir, profile_ext_dir, log)
 
             log("Success getted profile")
@@ -1279,12 +1697,14 @@ def run_profile(
                 desktop_vp = None
 
                 # Если используем прокси, обязательно применяем его
+                proxy_settings = None
                 try:
                     proxy_settings = _proxy_settings(profile)
                     if proxy_settings:
                         log(f"Using proxy: {proxy_settings['server']}")
                 except Exception as e:
                     log(f"Error: {e}")
+                    proxy_settings = None
                 log("Launching args...")
                 launch_args = list(extra_args)
                 launch_args.append(f"--load-extension={profile_ext_dir.resolve()}")
@@ -1396,7 +1816,10 @@ def run_profile(
                     log("Warning: WebRTC protection enabled but proxy IP not available")
 
                 log(f"Open: {start_url}")
-                page.goto(start_url, wait_until="domcontentloaded")
+                try:
+                    page.goto(start_url, wait_until="domcontentloaded", timeout=60_000)
+                except Exception as exc:
+                    log(f"Warning: start_url navigation failed ({exc}); browser left open.")
                 # page.add_init_script(
                 #     webgl_override_script(
                 #         vendor=profile.webgl_vendor,

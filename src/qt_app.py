@@ -107,6 +107,7 @@ from api_server import (
 from fingerprint_consistency import normalize_timezone_country
 from zaliver_theme import ZALIVER_DARK_QSS
 from app_icon import build_app_icon
+from app_settings import get_anticaptcha_api_key, set_anticaptcha_api_key, get_anticaptcha_auto_solve, set_anticaptcha_auto_solve
 from profile_tags_filter_dialog import (
     ProfileTagsFilterDialog,
     collect_all_tags_from_profiles,
@@ -211,6 +212,7 @@ _PROXY_COL_REFRESH = 7
 _NAV_PROFILES = 0
 _NAV_PROXIES = 1
 _NAV_TWOFA = 2
+_NAV_SETTINGS = 3
 
 
 class BatchImportProxyHealthThread(QThread):
@@ -1183,6 +1185,7 @@ class MainWindow(QMainWindow):
         self._side_nav.addItem("Профили")
         self._side_nav.addItem("Прокси")
         self._side_nav.addItem("2FA")
+        self._side_nav.addItem("Настройки")
         self._side_nav.setMinimumWidth(56)
         self._side_nav.setMaximumWidth(360)
         self._side_nav.setCurrentRow(0)
@@ -1192,9 +1195,11 @@ class MainWindow(QMainWindow):
         self.page_profiles = self._build_profiles_page()
         self.page_proxies = self._build_proxies_page()
         self.page_twofa = self._build_twofa_page()
+        self.page_settings = self._build_settings_page()
         self.pages.addWidget(self.page_profiles)
         self.pages.addWidget(self.page_proxies)
         self.pages.addWidget(self.page_twofa)
+        self.pages.addWidget(self.page_settings)
 
         self._api_bridge = ApiUiBridge(self)
         set_api_ui_hooks(
@@ -1726,6 +1731,9 @@ class MainWindow(QMainWindow):
         elif row == _NAV_TWOFA:
             self._refresh_twofa_page()
             self._twofa_tick_timer.start()
+        elif row == _NAV_SETTINGS:
+            self._twofa_tick_timer.stop()
+            self._load_settings_page()
         else:
             self._twofa_tick_timer.stop()
 
@@ -1933,6 +1941,99 @@ class MainWindow(QMainWindow):
             return get_totp_token(s), True
         except Exception:
             return "ошибка", False
+
+    def _build_settings_page(self) -> QWidget:
+        w = QWidget()
+        l = QVBoxLayout(w)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(14)
+
+        header = QFrame()
+        header.setObjectName("twofaHeader")
+        header_l = QVBoxLayout(header)
+        header_l.setContentsMargins(18, 16, 18, 16)
+        header_l.setSpacing(6)
+        title = QLabel("Настройки")
+        title.setObjectName("title")
+        hint = QLabel(
+            "Глобальные параметры браузера. Ключ и автопрохождение капчи "
+            "подставляются в расширение AntiCaptcha при каждом запуске профиля."
+        )
+        hint.setObjectName("twofaHeaderHint")
+        hint.setWordWrap(True)
+        header_l.addWidget(title)
+        header_l.addWidget(hint)
+        l.addWidget(header)
+
+        panel = QFrame()
+        panel.setObjectName("twofaQuickPanel")
+        panel_l = QVBoxLayout(panel)
+        panel_l.setContentsMargins(16, 14, 16, 14)
+        panel_l.setSpacing(10)
+        gb = QGroupBox("AntiCaptcha")
+        form = QFormLayout(gb)
+        form.setSpacing(10)
+        self.ed_anticaptcha_api_key = QLineEdit()
+        self.ed_anticaptcha_api_key.setPlaceholderText("API key anti-captcha.com…")
+        self.ed_anticaptcha_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ed_anticaptcha_api_key.setToolTip(
+            "Ключ из личного кабинета anti-captcha.com. "
+            "Хранится локально в app_settings.json."
+        )
+        self.chk_anticaptcha_show_key = QCheckBox("Показать ключ")
+        self.chk_anticaptcha_show_key.stateChanged.connect(self._on_anticaptcha_show_key)
+        self.chk_anticaptcha_auto_solve = QCheckBox("Автопрохождение капчи")
+        self.chk_anticaptcha_auto_solve.setChecked(True)
+        self.chk_anticaptcha_auto_solve.setToolTip(
+            "Если выключено — в расширении AntiCaptcha отключается авторешение "
+            "(enable в chrome.storage). Нужен перезапуск профиля после сохранения."
+        )
+        form.addRow("API key", self.ed_anticaptcha_api_key)
+        form.addRow("", self.chk_anticaptcha_show_key)
+        form.addRow("", self.chk_anticaptcha_auto_solve)
+        panel_l.addWidget(gb)
+
+        btn_row = QHBoxLayout()
+        self.btn_save_settings = QPushButton("Сохранить")
+        self.btn_save_settings.clicked.connect(self._save_settings_page)
+        self.lbl_settings_status = QLabel("")
+        self.lbl_settings_status.setObjectName("hint")
+        self.lbl_settings_status.setWordWrap(True)
+        btn_row.addWidget(self.btn_save_settings)
+        btn_row.addWidget(self.lbl_settings_status, 1)
+        panel_l.addLayout(btn_row)
+        l.addWidget(panel)
+        l.addStretch(1)
+        return w
+
+    def _load_settings_page(self) -> None:
+        if not hasattr(self, "ed_anticaptcha_api_key"):
+            return
+        self.ed_anticaptcha_api_key.setText(get_anticaptcha_api_key())
+        if hasattr(self, "chk_anticaptcha_auto_solve"):
+            self.chk_anticaptcha_auto_solve.setChecked(get_anticaptcha_auto_solve())
+        if hasattr(self, "lbl_settings_status"):
+            self.lbl_settings_status.setText("")
+
+    def _save_settings_page(self) -> None:
+        if not hasattr(self, "ed_anticaptcha_api_key"):
+            return
+        key = (self.ed_anticaptcha_api_key.text() or "").strip()
+        set_anticaptcha_api_key(key)
+        if hasattr(self, "chk_anticaptcha_auto_solve"):
+            set_anticaptcha_auto_solve(bool(self.chk_anticaptcha_auto_solve.isChecked()))
+        if hasattr(self, "lbl_settings_status"):
+            self.lbl_settings_status.setText("Сохранено.")
+
+    def _on_anticaptcha_show_key(self, _state: int) -> None:
+        if not hasattr(self, "ed_anticaptcha_api_key") or not hasattr(
+            self, "chk_anticaptcha_show_key"
+        ):
+            return
+        show = bool(self.chk_anticaptcha_show_key.isChecked())
+        self.ed_anticaptcha_api_key.setEchoMode(
+            QLineEdit.EchoMode.Normal if show else QLineEdit.EchoMode.Password
+        )
 
     def _build_twofa_page(self) -> QWidget:
         w = QWidget()
