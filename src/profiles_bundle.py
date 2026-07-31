@@ -85,9 +85,20 @@ def export_profiles_zip(
             for file in udir.rglob("*"):
                 if not file.is_file():
                     continue
+                name = file.name
+                # Chromium lock / singleton files — часто заняты на Windows и блокируют ZIP.
+                if name in {"LOCK", "lockfile", "SingletonLock", "SingletonCookie", "SingletonSocket"}:
+                    continue
+                if name.endswith(".lock") or name.endswith(".tmp"):
+                    continue
                 rel = file.relative_to(udir).as_posix()
                 arcname = f"{USERDATA_PREFIX}{p.profile_id}/{rel}"
-                zf.write(file, arcname)
+                try:
+                    # read_bytes быстрее падает на locked-файлах Windows, чем ZipFile.write
+                    zf.writestr(arcname, file.read_bytes())
+                except OSError as e:
+                    _emit(progress, f"Пропуск (занят/недоступен): {arcname} — {e}")
+                    continue
                 n_files += 1
                 if n_files % 200 == 0:
                     _emit(progress, f"Добавлено файлов в архив: {n_files}…")

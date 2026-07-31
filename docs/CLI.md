@@ -19,6 +19,7 @@
   - [delete](#profiles-delete)
   - [import-proxies](#profiles-import-proxies)
   - [import-archive](#profiles-import-archive)
+  - [export](#profiles-export)
   - [recover](#profiles-recover)
 - [Запуск браузера](#запуск-браузера)
   - [run](#run)
@@ -28,7 +29,7 @@
   - [install-chromium](#install-chromium)
   - [proxy-ip](#proxy-ip)
   - [geoip](#geoip)
-- [HTTP API (serve)](#http-api-serve)
+- [HTTP API и веб-UI (serve)](#http-api-и-веб-ui-serve)
 - [Коды возврата](#коды-возврата)
 - [Примеры сценариев](#примеры-сценариев)
 
@@ -73,6 +74,7 @@ antidetect-cli
 │   ├── delete
 │   ├── import-proxies
 │   ├── import-archive
+│   ├── export
 │   └── recover
 ├── run
 ├── run-all
@@ -349,7 +351,24 @@ python src/cli_main.py profiles import-archive backup.zip
 }
 ```
 
-> **Экспорт** архива доступен только в графическом UI. В CLI есть только импорт.
+> Экспорт: см. [`profiles export`](#profiles-export) или веб-UI / `POST /profiles/export`.
+
+---
+
+### `profiles export`
+
+Экспорт профилей в полный ZIP (`antidetect-profiles-v1`: metadata + `user-data`).
+
+```bash
+python src/cli_main.py profiles export
+python src/cli_main.py profiles export id1 id2 --out-dir ./backups
+```
+
+| Опция | Описание |
+|-------|----------|
+| `profile_ids` | Необязательные ID; без аргументов — все профили. |
+| `--out-dir` | Каталог для ZIP (по умолчанию `.`). |
+| `--quiet` | Без прогресса в stderr; путь к файлу всё равно печатается только без `--quiet`. |
 
 ---
 
@@ -472,47 +491,106 @@ python src/cli_main.py geoip 8.8.8.8
 
 ---
 
-## HTTP API (serve)
+## HTTP API и веб-UI (serve)
 
-Запуск локального HTTP API (FastAPI + uvicorn) — альтернатива прямому `run` для интеграций.
+Запуск HTTP API (FastAPI + uvicorn) и веб-интерфейса на том же порту. Zaliver и другие клиенты подключаются к этому API (по умолчанию `http://127.0.0.1:18765`).
 
 ```bash
+# собрать UI один раз
+cd web && npm install && npm run build && cd ..
+
 python src/cli_main.py serve
-python src/cli_main.py serve --host 0.0.0.0 --port 9000
+python src/cli_main.py serve --token "my-secret" --host 127.0.0.1 --port 18765
+python src/cli_main.py serve --host 0.0.0.0   # слушать снаружи (осторожно; лучше nginx)
+```
+
+### systemd (Linux)
+
+Как у Zaliver API: скрипт поднимает venv/зависимости, unit держит процесс.
+
+```bash
+# один раз: зависимости + проверка запуска
+bash scripts/api/run.sh
+# Ctrl+C
+
+sudo mkdir -p /etc/antidetect
+sudo cp scripts/api/antidetect-api.env.example /etc/antidetect/api.env
+sudo nano /etc/antidetect/api.env   # токен / host / port
+
+# путь /root/antidetect в .service поправьте под свой клон
+sudo cp scripts/api/antidetect-api.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now antidetect-api
+sudo systemctl status antidetect-api
+journalctl -u antidetect-api -f
 ```
 
 | Опция / переменная | По умолчанию | Описание |
 |------------------|--------------|----------|
 | `--host` / `ANTIDETECT_API_HOST` | `127.0.0.1` | Адрес привязки. |
 | `--port` / `ANTIDETECT_API_PORT` | `18765` | Порт. |
+| `--token` / `ANTIDETECT_API_TOKEN` | `secret` | Bearer-токен для `serve`. Если не задан — используется `secret`. Десктоп Qt **не** требует токен (API открыт на localhost), пока вы сами не зададите `ANTIDETECT_API_TOKEN`. |
 | `--log-level` | `info` | Уровень логов uvicorn. |
 | `--no-access-log` | — | Отключить access log. |
 
 После запуска:
 
-- Документация OpenAPI: `http://127.0.0.1:18765/docs`
-- Корень: `GET /` — ссылки на основные эндпоинты
+- Веб-UI: `http://127.0.0.1:18765/` (нужен собранный `src/web_dist` или `web/dist`)
+- OpenAPI: `http://127.0.0.1:18765/docs`
+- В UI токен нужен только если API запущен через `serve` с auth
+
+### Авторизация
+
+- **`python … serve`** — по умолчанию Bearer-токен `secret` (или `--token` / env).
+- **Десктоп (Qt)** — фоновый API без токена, zaliver ходит как раньше на `:18765` без Authorization.
+- Если задан `ANTIDETECT_API_TOKEN` в окружении — auth включён и для десктопа.
+
+```http
+Authorization: Bearer <token>
+```
+
+Публичный `GET /health` всегда без токена (удобно для nginx/probes).
+
+### nginx (снаружи)
+
+Обычно Antidetect слушает `127.0.0.1:18765`, а снаружи открывается только nginx:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:18765;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    client_max_body_size 2g;  # большие ZIP импорта/экспорта
+}
+```
+
+Токен по-прежнему проверяет Antidetect; при желании добавьте basic auth на стороне nginx.
 
 ### Основные эндпоинты
 
 | Метод | Путь | Описание |
 |-------|------|----------|
-| `GET` | `/health` | Проверка доступности. |
-| `GET` | `/profiles` | Список профилей. |
+| `GET` | `/health` | Проверка доступности (без токена). |
+| `GET` | `/profiles` | Список профилей (+ поле `running`). |
 | `GET` | `/profiles/{id}` | Один профиль. |
 | `PATCH` | `/profiles/{id}` | Обновить имя. |
 | `POST` | `/profiles/{id}/tags/{tag}` | Добавить тег. |
 | `DELETE` | `/profiles/{id}/tags/{tag}` | Удалить тег. |
 | `PUT/PATCH` | `/profiles/{id}/custom-data` | Замена / слияние `custom_data`. |
+| `POST` | `/profiles/import` | Импорт ZIP (`multipart` поле `file`). |
+| `POST` | `/profiles/export` | Экспорт ZIP (`mode`: `full` \| `cookies`). |
+| `POST` | `/profiles/cookie-hosts` | Домены cookies для экспорта. |
 | `POST` | `/profiles/{id}/launch` | Запустить профиль (фоновая сессия). |
+| `POST` | `/profiles/{id}/stop` | Остановить по profile_id. |
 | `GET` | `/sessions` | Активные и завершённые сессии. |
 | `GET` | `/sessions/{id}` | Одна сессия (в т.ч. CDP WebSocket URL). |
 | `POST` | `/sessions/{id}/stop` | Запросить остановку. |
 | `DELETE` | `/sessions/{id}` | Удалить запись завершённой сессии. |
 
-Полная схема запросов и тел — в Swagger UI (`/docs`).
+Полная схема запросов и тел — в Swagger UI (`/docs`). В Authorize укажите Bearer-токен для «Try it out».
 
-**Требования:** Python 3.10+ (или пакет `eval_type_backport` на 3.8–3.9).
+**Требования:** Python 3.10+ (или пакет `eval_type_backport` на 3.8–3.9), `python-multipart` для импорта файлов.
 
 Остановка сервера: **Ctrl+C**.
 
@@ -542,14 +620,17 @@ python src/cli_main.py run-all --parallel --url "https://2ip.ru"
 
 ### Бэкап и перенос на другую машину
 
-На исходной машине — экспорт через UI → `antidetect_profiles_*.zip`.
+```bash
+python src/cli_main.py profiles export --out-dir ./backups
+# или через веб-UI / POST /profiles/export
+```
 
 На новой машине:
 
 ```bash
 python -m pip install -r requirements.txt
 python src/cli_main.py install-chromium
-python src/cli_main.py profiles import-archive antidetect_profiles_20260101_120000.zip
+python src/cli_main.py profiles import-archive backups/antidetect_profiles_*.zip
 python src/cli_main.py profiles list --format json
 ```
 

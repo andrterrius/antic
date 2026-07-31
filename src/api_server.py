@@ -5,27 +5,33 @@ import shutil
 import subprocess
 import sys
 import socket
+import tempfile
 import time
 from pathlib import Path
 import threading
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, List, Literal
 
 if sys.version_info < (3, 10):
     import eval_type_backport  # noqa: F401  # Pydantic: list[str], str | None on 3.8–3.9
 
-from fastapi import FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.background import BackgroundTask
 
 from collections.abc import Callable
 
+from api_auth import get_configured_token, require_api_token
 from profiles_store import (
     BrowserProfile,
     get_profile,
     load_profiles,
     normalize_custom_data,
     normalize_tags_list,
+    save_profiles,
     update_profile_custom_data,
     update_profile_name,
     update_profile_tags,
@@ -37,6 +43,7 @@ from playwright_runner import (
     rewrite_cdp_public_urls,
     run_profile,
 )
+from static_ui import resolve_web_dist
 
 
 # --- OpenAPI / Pydantic-схемы (документация в /docs) ---
@@ -80,9 +87,118 @@ class ProfileOut(BaseModel):
     webgl_renderer: str | None = Field(None)
     webgl_version: str | None = Field(None)
     webgl_shading_language_version: str | None = Field(None)
+    running: bool = Field(
+        False,
+        description="True, если профиль сейчас запущен (API или UI)",
+    )
 
 
 _PROFILE_NAME_MAX_LEN = 256
+
+
+class ExportProfilesBody(BaseModel):
+    """Экспорт выбранных профилей в ZIP."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    profile_ids: list[str] = Field(
+        default_factory=list,
+        description="ID профилей; пустой список — все профили",
+    )
+    mode: Literal["full", "cookies"] = Field(
+        "full",
+        description="full — user-data; cookies — только cookies выбранных доменов",
+    )
+    hosts: list[str] = Field(
+        default_factory=list,
+        description="Домены для mode=cookies (обязательно непустой при cookies)",
+    )
+
+
+class CookieHostsBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile_ids: list[str] = Field(
+        default_factory=list,
+        description="ID профилей для сканирования cookie-хостов",
+    )
+
+
+class CookieHostOut(BaseModel):
+    host: str
+    count: int
+
+
+class CookieHostsOut(BaseModel):
+    hosts: list[CookieHostOut] = Field(default_factory=list)
+
+
+class ImportProfilesOut(BaseModel):
+    imported: int = Field(..., description="Сколько профилей добавлено")
+    remapped: int = Field(..., description="Сколько ID переназначено из-за конфликта")
+    total: int = Field(..., description="Всего профилей в базе после импорта")
+
+
+class ProxyProfileRef(BaseModel):
+    profile_id: str
+    name: str
+
+
+class ProxyGroupOut(BaseModel):
+    proxy_server: str
+    proxy_username: str | None = None
+    proxy_password: str | None = None
+    profile_count: int
+    profiles: list[ProxyProfileRef] = Field(default_factory=list)
+    health_ok: bool | None = None
+    health_checked_at: str | None = None
+    health_message: str | None = None
+
+
+class ProxyCheckBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    proxy_server: str = Field(..., min_length=1)
+    proxy_username: str | None = None
+    proxy_password: str | None = None
+
+
+class ProxyUpdateBody(BaseModel):
+    """Изменить прокси у всех профилей с теми же credentials."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    match_proxy_server: str = Field(..., min_length=1, description="Текущий proxy_server группы")
+    match_proxy_username: str | None = None
+    match_proxy_password: str | None = None
+    proxy_server: str = Field(..., min_length=1, description="Новый адрес прокси")
+    proxy_username: str | None = None
+    proxy_password: str | None = None
+
+
+class ProxyUpdateOut(BaseModel):
+    updated: int
+    group: ProxyGroupOut
+
+
+class ProxyCheckAllOut(BaseModel):
+    checked: int
+    ok: int
+    fail: int
+    groups: list[ProxyGroupOut] = Field(default_factory=list)
+
+
+class ProxyImportBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., description="Текст файла: строки host:port:user:pass")
+    proxy_scheme: Literal["http", "socks5"] = Field("http")
+
+
+class ProxyImportOut(BaseModel):
+    created: int
+    skipped: int
+    profiles: list[ProfileOut] = Field(default_factory=list)
 
 
 class ProfileNamePatch(BaseModel):
@@ -224,8 +340,79 @@ class RootLinksOut(BaseModel):
     profiles: str = Field("/profiles", description="Список профилей")
 
 
+def _is_profile_running(profile_id: str) -> bool:
+    pid = (profile_id or "").strip()
+    if not pid:
+        return False
+    if is_profile_running_via_api(pid):
+        return True
+    if is_profile_running_in_ui(pid):
+        return True
+    return _ui_tracked_session_active(pid)
+
+
 def _profile_to_out(p: BrowserProfile) -> ProfileOut:
-    return ProfileOut.model_validate(asdict(p))
+    d = asdict(p)
+    d["running"] = _is_profile_running(p.profile_id)
+    return ProfileOut.model_validate(d)
+
+
+def _newest_health_in_group(
+    members: list[BrowserProfile],
+) -> tuple[bool | None, str | None, str | None]:
+    with_ts = [m for m in members if m.proxy_health_checked_at]
+    if not with_ts:
+        return None, None, None
+    best = max(with_ts, key=lambda m: (m.proxy_health_checked_at or ""))
+    return best.proxy_health_ok, best.proxy_health_checked_at, best.proxy_health_message
+
+
+def _group_profiles_by_proxy(
+    profiles: list[BrowserProfile] | None = None,
+) -> dict[tuple[str, str | None, str | None], list[BrowserProfile]]:
+    from playwright_runner import canonical_proxy_key
+
+    groups: dict[tuple[str, str | None, str | None], list[BrowserProfile]] = {}
+    for p in profiles if profiles is not None else load_profiles():
+        key = canonical_proxy_key(p.proxy_server, p.proxy_username, p.proxy_password)
+        if not key:
+            continue
+        bucket = groups.setdefault(key, [])
+        if any(m.profile_id == p.profile_id for m in bucket):
+            continue
+        bucket.append(p)
+    return groups
+
+
+def _proxy_group_to_out(
+    key: tuple[str, str | None, str | None],
+    members: list[BrowserProfile],
+) -> ProxyGroupOut:
+    srv, user, password = key
+    ok, ts, msg = _newest_health_in_group(members)
+    return ProxyGroupOut(
+        proxy_server=srv,
+        proxy_username=user,
+        proxy_password=password,
+        profile_count=len(members),
+        profiles=[ProxyProfileRef(profile_id=m.profile_id, name=m.name) for m in members],
+        health_ok=ok,
+        health_checked_at=ts,
+        health_message=msg,
+    )
+
+
+def _list_proxy_groups_out() -> list[ProxyGroupOut]:
+    groups = _group_profiles_by_proxy()
+    rows = [_proxy_group_to_out(k, m) for k, m in groups.items()]
+    rows.sort(
+        key=lambda g: (
+            0 if g.health_ok is True else 1 if g.health_ok is False else 2,
+            (g.proxy_server or "").lower(),
+            (g.proxy_username or "").lower(),
+        )
+    )
+    return rows
 
 
 def _session_dict_to_out(d: dict[str, Any]) -> BrowserSessionOut:
@@ -799,13 +986,20 @@ def _session_worker(sess: ProfileRunSession, profile: BrowserProfile, body: Laun
 
 
 def build_app() -> FastAPI:
+    token_on = bool(get_configured_token())
+
     app = FastAPI(
         title="Antidetect — API профилей и сессий",
         version="1.0",
         description="""
 ## Назначение
-Локальный HTTP API для списка профилей, запуска Chromium (Playwright), получения **CDP** (`webSocketDebuggerUrl`) и остановки сессий.
-Сессии, запущенные из окна приложения, тоже видны в `GET /sessions` (`source: ui`).
+HTTP API для списка профилей, импорта/экспорта, запуска Chromium (Playwright), получения **CDP** и остановки сессий.
+Веб-UI раздаётся с того же порта (если собран `web_dist`).
+
+## Авторизация
+Если задан `ANTIDETECT_API_TOKEN` (или `serve --token`) — все эндпоинты кроме `GET /health`
+требуют `Authorization: Bearer <token>`.
+Без токена (типичный запуск десктопа) API открыт для localhost — как раньше для zaliver.
 
 ## Типичный сценарий (запуск по API)
 1. **`POST /profiles/{profile_id}/launch`** — в теле: `headless`, `expose_cdp`, `cdp_port`, `cdp_bind`, `cdp_public_host`, `start_url`.
@@ -814,13 +1008,15 @@ def build_app() -> FastAPI:
 4. **`POST /sessions/{session_id}/stop`** — запросить закрытие; после завершения запись может остаться (`finished`, `running: false`) — удалить **`DELETE /sessions/{session_id}`** при необходимости.
 
 ## Ошибки
+- **401** — нет или неверный Bearer-токен (только если токен настроен).
 - **404** — нет профиля / сессии.
 - **409** — профиль уже занят (другая сессия или запуск из UI).
 - **400** — неверное состояние (например, DELETE пока сессия ещё `running`).
         """.strip(),
         openapi_tags=[
             {"name": "Сервис", "description": "Проверка доступности и ссылки на документацию."},
-            {"name": "Профили", "description": "Чтение и запуск сохранённых профилей."},
+            {"name": "Профили", "description": "Чтение, импорт/экспорт и запуск сохранённых профилей."},
+            {"name": "Прокси", "description": "Группы прокси, проверка здоровья и импорт из файла."},
             {"name": "Сессии", "description": "Список активных сессий, CDP, остановка и очистка записей."},
         ],
     )
@@ -829,18 +1025,330 @@ def build_app() -> FastAPI:
     def health() -> HealthOut:
         return HealthOut()
 
-    @app.get("/profiles", response_model=List[ProfileOut], tags=["Профили"])
+    api_deps = [Depends(require_api_token)] if token_on else []
+    api = APIRouter(dependencies=api_deps)
+
+    @api.get("/profiles", response_model=List[ProfileOut], tags=["Профили"])
     def list_profiles() -> list[ProfileOut]:
         return [_profile_to_out(p) for p in load_profiles()]
 
-    @app.get("/profiles/{profile_id}", response_model=ProfileOut, tags=["Профили"])
-    def get_profile(profile_id: str) -> ProfileOut:
+    @api.post(
+        "/profiles/cookie-hosts",
+        response_model=CookieHostsOut,
+        tags=["Профили"],
+        summary="Список доменов cookies для экспорта",
+    )
+    def list_cookie_hosts_for_export(body: CookieHostsBody) -> CookieHostsOut:
+        from cookies_io import collect_hosts_for_profiles
+
+        ids = [str(x).strip() for x in (body.profile_ids or []) if str(x).strip()]
+        if not ids:
+            ids = [p.profile_id for p in load_profiles()]
+        rows = collect_hosts_for_profiles(ids)
+        return CookieHostsOut(hosts=[CookieHostOut(host=h, count=c) for h, c in rows])
+
+    @api.post(
+        "/profiles/export",
+        tags=["Профили"],
+        summary="Экспорт профилей в ZIP",
+        response_class=FileResponse,
+    )
+    def export_profiles(body: ExportProfilesBody) -> FileResponse:
+        from profiles_bundle import export_profiles_cookies_zip, export_profiles_zip
+
+        all_profiles = load_profiles()
+        by_id = {p.profile_id: p for p in all_profiles}
+        wanted = [str(x).strip() for x in (body.profile_ids or []) if str(x).strip()]
+        if wanted:
+            missing = [pid for pid in wanted if pid not in by_id]
+            if missing:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Profiles not found: {', '.join(missing[:8])}",
+                )
+            selected = [by_id[pid] for pid in wanted]
+        else:
+            selected = list(all_profiles)
+        if not selected:
+            raise HTTPException(status_code=400, detail="No profiles to export")
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="antidetect_export_"))
+        try:
+            if body.mode == "cookies":
+                hosts = {str(h).strip() for h in (body.hosts or []) if str(h).strip()}
+                if not hosts:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="hosts must be non-empty for mode=cookies",
+                    )
+                out_path = export_profiles_cookies_zip(tmp_dir, selected, hosts)
+            else:
+                out_path = export_profiles_zip(tmp_dir, selected)
+        except HTTPException:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
+        except ValueError as e:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise HTTPException(status_code=400, detail=str(e) or "Export failed") from e
+        except Exception as e:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise HTTPException(status_code=500, detail=f"Export failed: {e}") from e
+
+        def _cleanup() -> None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        return FileResponse(
+            path=str(out_path),
+            filename=out_path.name,
+            media_type="application/zip",
+            background=BackgroundTask(_cleanup),
+        )
+
+    @api.post(
+        "/profiles/import",
+        response_model=ImportProfilesOut,
+        tags=["Профили"],
+        summary="Импорт профилей из ZIP",
+    )
+    async def import_profiles(file: UploadFile = File(...)) -> ImportProfilesOut:
+        from profiles_bundle import import_profiles_zip
+
+        name = (file.filename or "").strip().lower()
+        if name and not name.endswith(".zip"):
+            raise HTTPException(status_code=400, detail="Expected a .zip archive")
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="antidetect_import_"))
+        zip_path = tmp_dir / "upload.zip"
+        try:
+            raw = await file.read()
+            if not raw:
+                raise HTTPException(status_code=400, detail="Empty upload")
+            zip_path.write_bytes(raw)
+            profiles, imported, remapped = import_profiles_zip(zip_path)
+            _ui_log(f"[API] импорт ZIP: +{imported} профилей (переназначено ID: {remapped})")
+            return ImportProfilesOut(imported=imported, remapped=remapped, total=len(profiles))
+        except HTTPException:
+            raise
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e) or "Import failed") from e
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Import failed: {e}") from e
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @api.get("/proxies", response_model=List[ProxyGroupOut], tags=["Прокси"], summary="Список уникальных прокси")
+    def list_proxies() -> list[ProxyGroupOut]:
+        return _list_proxy_groups_out()
+
+    @api.patch(
+        "/proxies",
+        response_model=ProxyUpdateOut,
+        tags=["Прокси"],
+        summary="Изменить прокси у группы профилей",
+    )
+    def update_proxy_group(body: ProxyUpdateBody) -> ProxyUpdateOut:
+        from playwright_runner import canonical_proxy_key, normalize_proxy_server_url
+        from proxy_import import apply_proxy_and_sync_geo
+
+        match_srv = (body.match_proxy_server or "").strip()
+        match_user = (body.match_proxy_username or "").strip() or None
+        match_pass = (body.match_proxy_password or "").strip() or None
+        old_key = canonical_proxy_key(match_srv, match_user, match_pass)
+        if not old_key:
+            raise HTTPException(status_code=400, detail="Invalid match_proxy_server")
+
+        new_raw = (body.proxy_server or "").strip()
+        if not new_raw:
+            raise HTTPException(status_code=400, detail="proxy_server is required")
+        new_srv = normalize_proxy_server_url(new_raw)
+        new_user = (body.proxy_username or "").strip() or None
+        new_pass = (body.proxy_password or "").strip() or None
+        new_key = canonical_proxy_key(new_srv, new_user, new_pass)
+        if not new_key:
+            raise HTTPException(status_code=400, detail="Invalid proxy_server")
+
+        profiles = load_profiles()
+        groups = _group_profiles_by_proxy(profiles)
+        members = groups.get(old_key)
+        if not members:
+            raise HTTPException(status_code=404, detail="Proxy group not found")
+
+        if new_key == old_key:
+            return ProxyUpdateOut(updated=0, group=_proxy_group_to_out(old_key, members))
+
+        id_set = {m.profile_id for m in members}
+        updated_n = 0
+        new_list: list[BrowserProfile] = []
+        for p in profiles:
+            if p.profile_id in id_set:
+                base = replace(
+                    p,
+                    proxy_health_ok=None,
+                    proxy_health_checked_at=None,
+                    proxy_health_message=None,
+                )
+                new_list.append(
+                    apply_proxy_and_sync_geo(
+                        base,
+                        proxy_server=new_srv,
+                        proxy_username=new_user,
+                        proxy_password=new_pass,
+                    )
+                )
+                updated_n += 1
+            else:
+                new_list.append(p)
+
+        save_profiles(new_list)
+        _ui_log(f"[API] правка прокси: {old_key[0]} → {new_key[0]} ({updated_n} профил.)")
+        fresh_groups = _group_profiles_by_proxy(new_list)
+        out_members = fresh_groups.get(new_key) or []
+        if not out_members:
+            raise HTTPException(status_code=500, detail="Proxy updated but group missing")
+        return ProxyUpdateOut(updated=updated_n, group=_proxy_group_to_out(new_key, out_members))
+
+    @api.post(
+        "/proxies/check",
+        response_model=ProxyGroupOut,
+        tags=["Прокси"],
+        summary="Проверить один прокси",
+    )
+    def check_one_proxy(body: ProxyCheckBody) -> ProxyGroupOut:
+        from playwright_runner import canonical_proxy_key
+        from proxy_health import probe_proxy_health_triple, update_all_profiles_matching_proxy_credentials
+
+        srv = (body.proxy_server or "").strip()
+        if not srv:
+            raise HTTPException(status_code=400, detail="proxy_server is required")
+        user = (body.proxy_username or "").strip() or None
+        password = (body.proxy_password or "").strip() or None
+        key = canonical_proxy_key(srv, user, password)
+        if not key:
+            raise HTTPException(status_code=400, detail="Invalid proxy_server")
+
+        ok, msg, ts = probe_proxy_health_triple(key[0], key[1], key[2])
+        profiles = load_profiles()
+        updated = update_all_profiles_matching_proxy_credentials(
+            profiles,
+            proxy_server=key[0],
+            proxy_username=key[1],
+            proxy_password=key[2],
+            ok=ok,
+            message=msg,
+            checked_at=ts,
+        )
+        save_profiles(updated)
+        groups = _group_profiles_by_proxy(updated)
+        members = groups.get(key)
+        if not members:
+            raise HTTPException(status_code=404, detail="No profiles use this proxy")
+        _ui_log(f"[API] проверка прокси {key[0]}: {'OK' if ok else 'FAIL'} — {msg}")
+        return _proxy_group_to_out(key, members)
+
+    @api.post(
+        "/proxies/check-all",
+        response_model=ProxyCheckAllOut,
+        tags=["Прокси"],
+        summary="Проверить все уникальные прокси",
+    )
+    def check_all_proxies() -> ProxyCheckAllOut:
+        from proxy_health import probe_proxy_health_triple, update_all_profiles_matching_proxy_credentials
+
+        profiles = load_profiles()
+        groups = _group_profiles_by_proxy(profiles)
+        if not groups:
+            return ProxyCheckAllOut(checked=0, ok=0, fail=0, groups=[])
+
+        ok_n = 0
+        fail_n = 0
+        for key in list(groups.keys()):
+            srv, user, password = key
+            ok, msg, ts = probe_proxy_health_triple(srv, user, password)
+            if ok:
+                ok_n += 1
+            else:
+                fail_n += 1
+            profiles = update_all_profiles_matching_proxy_credentials(
+                profiles,
+                proxy_server=srv,
+                proxy_username=user,
+                proxy_password=password,
+                ok=ok,
+                message=msg,
+                checked_at=ts,
+            )
+        save_profiles(profiles)
+        _ui_log(f"[API] проверка всех прокси: {ok_n} OK / {fail_n} FAIL из {len(groups)}")
+        return ProxyCheckAllOut(
+            checked=len(groups),
+            ok=ok_n,
+            fail=fail_n,
+            groups=_list_proxy_groups_out(),
+        )
+
+    @api.post(
+        "/proxies/import",
+        response_model=ProxyImportOut,
+        tags=["Прокси"],
+        summary="Импорт прокси из текста (host:port:user:pass)",
+    )
+    def import_proxies_text(body: ProxyImportBody) -> ProxyImportOut:
+        from fingerprint_generator import generate_test_fingerprint
+        from proxy_health import profile_with_recorded_proxy_health
+        from proxy_import import apply_proxy_and_sync_geo, parse_host_port_user_pass_line, proxy_server_url
+
+        scheme = body.proxy_scheme
+        profiles = load_profiles()
+        existing_ids = {p.profile_id for p in profiles}
+        created: list[BrowserProfile] = []
+        skipped = 0
+
+        for line in (body.text or "").splitlines():
+            parsed = parse_host_port_user_pass_line(line)
+            if parsed is None:
+                if (line or "").strip():
+                    skipped += 1
+                continue
+            host, port, user, pwd = parsed
+            server = proxy_server_url(host, port, scheme)
+            profile_id = uuid.uuid4().hex[:12]
+            while profile_id in existing_ids or any(c.profile_id == profile_id for c in created):
+                profile_id = uuid.uuid4().hex[:12]
+            idx = len(profiles) + len(created) + 1
+            base = BrowserProfile(profile_id=profile_id, name=f"Profile {idx}")
+            p = generate_test_fingerprint(base)
+            p = apply_proxy_and_sync_geo(
+                p,
+                proxy_server=server,
+                proxy_username=user,
+                proxy_password=pwd,
+            )
+            p = profile_with_recorded_proxy_health(p)
+            created.append(p)
+
+        if not created:
+            raise HTTPException(
+                status_code=400,
+                detail="No valid proxy lines (expected host:port:user:pass per line)",
+            )
+
+        profiles.extend(created)
+        save_profiles(profiles)
+        _ui_log(f"[API] импорт прокси: +{len(created)} профилей (пропущено строк: {skipped})")
+        return ProxyImportOut(
+            created=len(created),
+            skipped=skipped,
+            profiles=[_profile_to_out(p) for p in created],
+        )
+
+    @api.get("/profiles/{profile_id}", response_model=ProfileOut, tags=["Профили"])
+    def get_profile_route(profile_id: str) -> ProfileOut:
         p = _find_profile(profile_id)
         if not p:
             raise HTTPException(status_code=404, detail="Profile not found")
         return _profile_to_out(p)
 
-    @app.patch(
+    @api.patch(
         "/profiles/{profile_id}",
         response_model=ProfileOut,
         tags=["Профили"],
@@ -859,7 +1367,7 @@ def build_app() -> FastAPI:
         _ui_sync_profile_metadata(pid)
         return _profile_to_out(updated)
 
-    @app.post(
+    @api.post(
         "/profiles/{profile_id}/tags/{tag}",
         response_model=ProfileOut,
         tags=["Профили"],
@@ -880,7 +1388,7 @@ def build_app() -> FastAPI:
         _ui_sync_profile_metadata(pid)
         return _profile_to_out(updated)
 
-    @app.put(
+    @api.put(
         "/profiles/{profile_id}/custom-data",
         response_model=ProfileOut,
         tags=["Профили"],
@@ -890,7 +1398,7 @@ def build_app() -> FastAPI:
         """Полностью заменяет словарь custom_data (пустой объект очищает поле)."""
         return _mutate_profile_custom_data(profile_id, replace=body.data)
 
-    @app.patch(
+    @api.patch(
         "/profiles/{profile_id}/custom-data",
         response_model=ProfileOut,
         tags=["Профили"],
@@ -900,7 +1408,7 @@ def build_app() -> FastAPI:
         """Добавляет/перезаписывает ключи из тела запроса, остальные ключи сохраняются."""
         return _mutate_profile_custom_data(profile_id, merge=body.data)
 
-    @app.put(
+    @api.put(
         "/profiles/{profile_id}/custom-data/{key}",
         response_model=ProfileOut,
         tags=["Профили"],
@@ -909,7 +1417,7 @@ def build_app() -> FastAPI:
     def set_profile_custom_data_key(profile_id: str, key: str, body: CustomDataValueBody) -> ProfileOut:
         return _mutate_profile_custom_data(profile_id, set_key=(key, body.value))
 
-    @app.delete(
+    @api.delete(
         "/profiles/{profile_id}/custom-data/{key}",
         response_model=ProfileOut,
         tags=["Профили"],
@@ -918,7 +1426,7 @@ def build_app() -> FastAPI:
     def delete_profile_custom_data_key(profile_id: str, key: str) -> ProfileOut:
         return _mutate_profile_custom_data(profile_id, delete_key=key)
 
-    @app.delete(
+    @api.delete(
         "/profiles/{profile_id}/tags/{tag}",
         response_model=ProfileOut,
         tags=["Профили"],
@@ -939,7 +1447,7 @@ def build_app() -> FastAPI:
         _ui_sync_profile_metadata(pid)
         return _profile_to_out(updated)
 
-    @app.post(
+    @api.post(
         "/profiles/{profile_id}/launch",
         response_model=LaunchProfileAccepted,
         tags=["Профили"],
@@ -1037,7 +1545,25 @@ def build_app() -> FastAPI:
             note="Опрашивайте GET /sessions/{session_id}, пока не появится cdp_ws_url (при expose_cdp: true). Playwright: chromium.connect_over_cdp(ws).",
         )
 
-    @app.get(
+    @api.post(
+        "/profiles/{profile_id}/stop",
+        response_model=SimpleStatusOut,
+        tags=["Профили"],
+        summary="Остановить профиль по ID",
+    )
+    def stop_profile(profile_id: str) -> SimpleStatusOut:
+        pid = (profile_id or "").strip()
+        if not pid:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        if not _is_profile_running(pid):
+            raise HTTPException(status_code=400, detail="Profile is not running")
+        ok = request_stop_by_profile_id(pid)
+        if not ok:
+            raise HTTPException(status_code=400, detail="Could not stop profile")
+        _ui_sync_profile(pid)
+        return SimpleStatusOut(status="stop_requested")
+
+    @api.get(
         "/sessions",
         response_model=List[BrowserSessionOut],
         tags=["Сессии"],
@@ -1049,7 +1575,7 @@ def build_app() -> FastAPI:
             ui_rows = [u.to_public_dict() for u in _ui_sessions.values()]
         return [_session_dict_to_out(x) for x in api_rows + ui_rows]
 
-    @app.get(
+    @api.get(
         "/sessions/{session_id}",
         response_model=BrowserSessionOut,
         tags=["Сессии"],
@@ -1065,7 +1591,7 @@ def build_app() -> FastAPI:
                 return _session_dict_to_out(u.to_public_dict())
         raise HTTPException(status_code=404, detail="Session not found")
 
-    @app.post(
+    @api.post(
         "/sessions/{session_id}/stop",
         response_model=SimpleStatusOut,
         tags=["Сессии"],
@@ -1102,7 +1628,7 @@ def build_app() -> FastAPI:
             return SimpleStatusOut(status="stop_requested")
         raise HTTPException(status_code=404, detail="Session not found")
 
-    @app.delete(
+    @api.delete(
         "/sessions/{session_id}",
         response_model=SimpleStatusOut,
         tags=["Сессии"],
@@ -1130,14 +1656,44 @@ def build_app() -> FastAPI:
                 return SimpleStatusOut(status="removed")
         raise HTTPException(status_code=404, detail="Session not found")
 
-    @app.get("/", response_model=RootLinksOut, tags=["Сервис"])
-    def root() -> RootLinksOut:
+    @api.get("/api", response_model=RootLinksOut, tags=["Сервис"])
+    def api_root() -> RootLinksOut:
         return RootLinksOut()
+
+    app.include_router(api)
+
+    web_dist = resolve_web_dist()
+    if web_dist is not None:
+        _mount_web_ui(app, web_dist)
+    else:
+
+        @app.get("/", response_model=RootLinksOut, tags=["Сервис"])
+        def root() -> RootLinksOut:
+            return RootLinksOut()
 
     return app
 
 
 _app: FastAPI | None = None
+
+
+def _mount_web_ui(app: FastAPI, dist: Path) -> None:
+    """
+    Раздаёт собранный SPA.
+
+    Важно: не вешаем catch-all ``/{full_path:path}`` — он перехватывает API вроде
+    ``GET /proxies`` и отдаёт index.html. Клиентский роутер не используется
+    (вкладки — state в React), достаточно ``/`` + ``/assets``.
+    """
+    assets = dist / "assets"
+    if assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(assets)), name="web-assets")
+
+    index = dist / "index.html"
+
+    @app.get("/")
+    def web_index() -> FileResponse:
+        return FileResponse(index)
 
 
 def start_profile_api_background() -> str | None:
@@ -1146,7 +1702,6 @@ def start_profile_api_background() -> str | None:
     Host/port: ANTIDETECT_API_HOST (default 127.0.0.1), ANTIDETECT_API_PORT (default 18765).
     Returns base URL (e.g. http://127.0.0.1:18765) on first start, or None if already running.
     """
-    import tempfile
     import traceback
 
     global _app
@@ -1160,6 +1715,8 @@ def start_profile_api_background() -> str | None:
     except ValueError:
         port = 18765
 
+    # Desktop: не генерируем токен. Auth включается только если пользователь сам
+    # задал ANTIDETECT_API_TOKEN в окружении.
     _app = build_app()
 
     # PyInstaller windowed (console=False): stdout/stderr are None — uvicorn/logging падают.
@@ -1195,5 +1752,19 @@ def start_profile_api_background() -> str | None:
     t = threading.Thread(target=_serve, name="antidetect-fastapi", daemon=True)
     t.start()
     base = f"http://{host}:{port}"
-    print(f"Antidetect local API: {base}/docs (profiles, launch, CDP)", file=sys.stderr, flush=True)
+    from api_auth import get_configured_token
+
+    tok = get_configured_token()
+    if tok:
+        print(
+            f"Antidetect local API: {base}/docs (Bearer auth ON)",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            f"Antidetect local API: {base}/docs (open, no token — desktop mode)",
+            file=sys.stderr,
+            flush=True,
+        )
     return base

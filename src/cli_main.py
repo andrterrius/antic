@@ -481,6 +481,32 @@ def cmd_geoip(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_profiles_export_archive(args: argparse.Namespace) -> int:
+    from profiles_bundle import export_profiles_zip
+
+    profiles = load_profiles()
+    wanted = [str(x).strip() for x in (args.profile_ids or []) if str(x).strip()]
+    if wanted:
+        by_id = {p.profile_id: p for p in profiles}
+        missing = [pid for pid in wanted if pid not in by_id]
+        if missing:
+            raise SystemExit(f"Profiles not found: {', '.join(missing)}")
+        selected = [by_id[pid] for pid in wanted]
+    else:
+        selected = list(profiles)
+    if not selected:
+        raise SystemExit("No profiles to export.")
+
+    out_dir = Path((args.out_dir or ".").strip() or ".")
+    progress: Callable[[str], None] | None = None
+    if not args.quiet:
+        progress = lambda msg: _eprint(msg)
+    path = export_profiles_zip(out_dir, selected, progress=progress)
+    if not args.quiet:
+        print(str(path.resolve()))
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     if sys.version_info < (3, 10):
         try:
@@ -495,6 +521,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     import uvicorn
 
+    from api_auth import ensure_api_token
     from api_server import build_app
 
     host = (args.host or os.environ.get("ANTIDETECT_API_HOST") or "127.0.0.1").strip() or "127.0.0.1"
@@ -507,6 +534,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         except ValueError:
             port = 18765
 
+    token_arg = getattr(args, "token", None)
+    token, generated = ensure_api_token(explicit=token_arg)
+
     opts: dict[str, object] = {
         "host": host,
         "port": port,
@@ -518,7 +548,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
         opts["http"] = "h11"
 
     base = f"http://{host}:{port}"
+    print(f"Antidetect UI:  {base}/", flush=True)
     print(f"Antidetect API: {base}/docs (Ctrl+C to stop)", flush=True)
+    if generated:
+        print(f"API token (default): {token}", flush=True)
+        print("Override with --token or ANTIDETECT_API_TOKEN.", flush=True)
+    else:
+        print("API token: (from --token / ANTIDETECT_API_TOKEN)", flush=True)
+    print("Authorize requests with: Authorization: Bearer <token>", flush=True)
     try:
         uvicorn.run(build_app(), **opts)
     except KeyboardInterrupt:
@@ -594,6 +631,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp_arc.add_argument("--quiet", action="store_true")
     sp_arc.set_defaults(func=cmd_profiles_import_archive)
 
+    sp_exp = psub.add_parser(
+        "export",
+        help="Export profiles to a full ZIP archive (user-data + metadata).",
+    )
+    sp_exp.add_argument(
+        "profile_ids",
+        nargs="*",
+        help="Profile IDs to export (default: all).",
+    )
+    sp_exp.add_argument(
+        "--out-dir",
+        default=".",
+        help="Directory for the ZIP file (default: current directory).",
+    )
+    sp_exp.add_argument("--quiet", action="store_true")
+    sp_exp.set_defaults(func=cmd_profiles_export_archive)
+
     sp_del = psub.add_parser("delete", help="Delete a profile.")
     sp_del.add_argument("profile_id")
     sp_del.add_argument("--purge-data", action="store_true", default=True, help="Also delete user-data dir (default: true).")
@@ -668,7 +722,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp_geo.add_argument("ip")
     sp_geo.set_defaults(func=cmd_geoip)
 
-    sp_serve = sub.add_parser("serve", help="Run local HTTP API (FastAPI + uvicorn).")
+    sp_serve = sub.add_parser("serve", help="Run HTTP API + web UI (FastAPI + uvicorn).")
     sp_serve.add_argument(
         "--host",
         default=None,
@@ -679,6 +733,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         type=int,
         help="Bind port (default: ANTIDETECT_API_PORT or 18765).",
+    )
+    sp_serve.add_argument(
+        "--token",
+        default=None,
+        help="Bearer API token (default: ANTIDETECT_API_TOKEN, or secret).",
     )
     sp_serve.add_argument(
         "--log-level",
