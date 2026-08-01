@@ -139,6 +139,28 @@ class ImportProfilesOut(BaseModel):
     total: int = Field(..., description="Всего профилей в базе после импорта")
 
 
+class DeleteProfilesBody(BaseModel):
+    """Удаление выбранных профилей."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    profile_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        description="ID профилей для удаления",
+    )
+    purge_data: bool = Field(
+        True,
+        description="Удалить каталог user-data профиля (как в десктопном UI)",
+    )
+
+
+class DeleteProfilesOut(BaseModel):
+    deleted: int = Field(..., description="Сколько профилей удалено")
+    deleted_ids: list[str] = Field(default_factory=list, description="Удалённые profile_id")
+    total: int = Field(..., description="Всего профилей в базе после удаления")
+
+
 class ProxyProfileRef(BaseModel):
     profile_id: str
     name: str
@@ -1135,6 +1157,59 @@ HTTP API для списка профилей, импорта/экспорта, 
             raise HTTPException(status_code=500, detail=f"Import failed: {e}") from e
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @api.post(
+        "/profiles/delete",
+        response_model=DeleteProfilesOut,
+        tags=["Профили"],
+        summary="Удалить выбранные профили",
+    )
+    def delete_profiles(body: DeleteProfilesBody) -> DeleteProfilesOut:
+        wanted = [str(x).strip() for x in (body.profile_ids or []) if str(x).strip()]
+        # Preserve order, drop duplicates
+        seen: set[str] = set()
+        ids: list[str] = []
+        for pid in wanted:
+            if pid not in seen:
+                seen.add(pid)
+                ids.append(pid)
+        if not ids:
+            raise HTTPException(status_code=400, detail="profile_ids must be non-empty")
+
+        profiles = load_profiles()
+        by_id = {p.profile_id: p for p in profiles}
+        missing = [pid for pid in ids if pid not in by_id]
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Profiles not found: {', '.join(missing[:8])}",
+            )
+
+        running = [pid for pid in ids if _is_profile_running(pid)]
+        if running:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Cannot delete while browser is running. Stop first: "
+                    + ", ".join(running[:8])
+                ),
+            )
+
+        remove_ids = set(ids)
+        if body.purge_data:
+            root = chromium_user_data_parent()
+            for pid in ids:
+                try:
+                    shutil.rmtree(root / pid, ignore_errors=True)
+                except Exception:
+                    pass
+
+        remaining = [p for p in profiles if p.profile_id not in remove_ids]
+        save_profiles(remaining)
+        for pid in ids:
+            _ui_sync_profile_metadata(pid)
+        _ui_log(f"[API] удалено профилей: {len(ids)}")
+        return DeleteProfilesOut(deleted=len(ids), deleted_ids=ids, total=len(remaining))
 
     @api.get("/proxies", response_model=List[ProxyGroupOut], tags=["Прокси"], summary="Список уникальных прокси")
     def list_proxies() -> list[ProxyGroupOut]:

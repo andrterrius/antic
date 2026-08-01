@@ -76,6 +76,12 @@ export type ImportResult = {
   total: number;
 };
 
+export type DeleteProfilesResult = {
+  deleted: number;
+  deleted_ids: string[];
+  total: number;
+};
+
 export type CookieHost = { host: string; count: number };
 
 export type ProxyProfileRef = {
@@ -166,6 +172,12 @@ export const api = {
     fd.append("file", file);
     return request<ImportResult>("/profiles/import", { method: "POST", body: fd });
   },
+
+  deleteProfiles: (profileIds: string[], purgeData = true) =>
+    request<DeleteProfilesResult>("/profiles/delete", {
+      method: "POST",
+      body: JSON.stringify({ profile_ids: profileIds, purge_data: purgeData }),
+    }),
 
   cookieHosts: (profileIds: string[]) =>
     request<{ hosts: CookieHost[] }>("/profiles/cookie-hosts", {

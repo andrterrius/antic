@@ -224,6 +224,46 @@ export function ProfilesPage() {
     }
   }
 
+  async function deleteSelected() {
+    const ids = [...selected];
+    if (!ids.length) {
+      setError("Нет выбранных профилей");
+      return;
+    }
+    const running = profiles.filter((p) => ids.includes(p.profile_id) && p.running);
+    if (running.length) {
+      setError(
+        "Нельзя удалить, пока браузер запущен. Остановите: " +
+          running.map((p) => p.name || p.profile_id).slice(0, 8).join(", "),
+      );
+      return;
+    }
+    const names = profiles
+      .filter((p) => ids.includes(p.profile_id))
+      .map((p) => `• ${p.name || "Без имени"} (${p.profile_id})`);
+    const preview = names.slice(0, 20).join("\n");
+    const more = names.length > 20 ? `\n… и ещё ${names.length - 20}` : "";
+    const msg =
+      ids.length === 1
+        ? `Удалить профиль?\n\n${preview}\n\nДанные браузера будут удалены без возможности восстановления.`
+        : `Удалить выбранные профили (${ids.length} шт.)?\n\n${preview}${more}\n\nДанные браузера будут удалены без возможности восстановления.`;
+    if (!window.confirm(msg)) return;
+
+    setBusy(true);
+    setError("");
+    setInfo("");
+    try {
+      const res = await api.deleteProfiles(ids);
+      setSelected(new Set());
+      setInfo(`Удалено профилей: ${res.deleted}. Осталось: ${res.total}.`);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <>
       <div className="stats">
@@ -261,6 +301,16 @@ export function ProfilesPage() {
         <button type="button" className="btn" onClick={() => void startExport()} disabled={busy}>
           Экспорт{selected.size ? ` (${selected.size})` : ""}
         </button>
+        {selected.size ? (
+          <button
+            type="button"
+            className="btn btn-danger"
+            onClick={() => void deleteSelected()}
+            disabled={busy}
+          >
+            Удалить ({selected.size})
+          </button>
+        ) : null}
         <input
           ref={fileRef}
           type="file"
