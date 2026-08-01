@@ -3,7 +3,7 @@
 # Run from any directory: bash scripts/api/run.sh
 #
 # Env (optional): ANTIDETECT_API_HOST, ANTIDETECT_API_PORT, ANTIDETECT_API_TOKEN,
-#                 ANTIDETECT_DATA_ROOT (default: /root/antidetect-data when root)
+#                 ANTIDETECT_DATA_ROOT (default: /root/.antidetect-data when root)
 
 set -euo pipefail
 
@@ -89,9 +89,9 @@ ensure_chromium
 # Данные профилей вне репо (не стираются при git fetch/reset).
 if [[ -z "${ANTIDETECT_DATA_ROOT:-}" ]]; then
   if [[ "$(id -u)" -eq 0 ]]; then
-    export ANTIDETECT_DATA_ROOT="/root/antidetect-data"
+    export ANTIDETECT_DATA_ROOT="/root/.antidetect-data"
   else
-    export ANTIDETECT_DATA_ROOT="${HOME}/antidetect-data"
+    export ANTIDETECT_DATA_ROOT="${HOME}/.antidetect-data"
   fi
 fi
 mkdir -p "$ANTIDETECT_DATA_ROOT"

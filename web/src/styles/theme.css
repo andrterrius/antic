@@ -485,6 +485,19 @@ code {
   gap: 8px;
 }
 
+.list.drag-selecting {
+  user-select: none;
+  cursor: default;
+}
+
+.list.drag-selecting .row {
+  cursor: default;
+}
+
+.row input[type="checkbox"] {
+  pointer-events: none;
+}
+
 .row {
   display: grid;
   grid-template-columns: 22px 1fr auto;

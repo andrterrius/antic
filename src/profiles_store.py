@@ -131,10 +131,10 @@ def _repo_legacy_linux_root() -> Path:
 
 def _default_linux_data_root() -> Path:
     """
-    Стабильный каталог вне репо: ~/antidetect-data
-    (для root на Ubuntu → /root/antidetect-data).
+    Стабильный каталог вне репо: ~/.antidetect-data
+    (для root на Ubuntu → /root/.antidetect-data).
     """
-    return Path.home() / "antidetect-data"
+    return Path.home() / ".antidetect-data"
 
 
 def _legacy_has_payload(legacy_root: Path) -> bool:
@@ -201,9 +201,10 @@ def app_state_root() -> Path:
     1. ANTIDETECT_DATA_ROOT
     2. Windows: %APPDATA%\\AntidetectUI
     3. macOS: ~/Library/Application Support/AntidetectUI
-    4. Linux: ~/antidetect-data (для root → /root/antidetect-data)
+    4. Linux: ~/.antidetect-data (для root → /root/.antidetect-data)
 
-    На Linux при первом запуске пытается перенести данные из старого ./data репозитория.
+    На Linux при первом запуске пытается перенести данные из старого ./data репозитория
+    и из прежнего ~/antidetect-data (без точки).
     """
     env = (os.environ.get(ENV_DATA_ROOT) or "").strip()
     if env:
@@ -224,10 +225,40 @@ def app_state_root() -> Path:
         pass
 
     if sys.platform not in ("win32", "darwin"):
+        _migrate_undotted_home_if_needed(root)
         _migrate_linux_legacy_if_needed(root)
 
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def _migrate_undotted_home_if_needed(new_root: Path) -> None:
+    """Перенос ~/antidetect-data → ~/.antidetect-data, если новый корень ещё пуст."""
+    try:
+        old = Path.home() / "antidetect-data"
+        if not old.is_dir():
+            return
+        try:
+            if old.resolve() == new_root.resolve():
+                return
+        except OSError:
+            return
+        if (new_root / "data" / DB_FILENAME).is_file():
+            return
+        if not _legacy_has_payload(old):
+            return
+        new_root.mkdir(parents=True, exist_ok=True)
+        for name in ("data", "user-data"):
+            src = old / name
+            dst = new_root / name
+            if src.exists() and not dst.exists():
+                shutil.move(str(src), str(dst))
+        print(
+            f"Данные профилей перенесены из {old} → {new_root}.",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"WARNING: не удалось перенести antidetect-data → .antidetect-data: {e}", flush=True)
 
 
 def _data_dir() -> Path:

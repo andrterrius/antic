@@ -110,16 +110,16 @@ antidetect-cli
 |-----------|------|
 | Windows | `%APPDATA%\AntidetectUI\` |
 | macOS | `~/Library/Application Support/AntidetectUI/` |
-| Linux | `~/antidetect-data/` (для root → `/root/antidetect-data/`) |
+| Linux | `~/.antidetect-data/` (для root → `/root/.antidetect-data/`) |
 
-Переопределение: переменная окружения `ANTIDETECT_DATA_ROOT` (например `/root/antidetect-data`).
+Переопределение: переменная окружения `ANTIDETECT_DATA_ROOT` (например `/root/.antidetect-data`).
 
 На Linux при первом запуске данные из старого `./data` внутри репозитория автоматически переносятся в новый корень (если новый ещё пуст).
 
 Структура:
 
 ```
-/root/antidetect-data/          # или другой ANTIDETECT_DATA_ROOT
+/root/.antidetect-data/         # или другой ANTIDETECT_DATA_ROOT
 ├── data/
 │   ├── profiles.db          # SQLite-база профилей
 │   └── profiles.db.bak.*    # автобэкапы перед импортом
@@ -534,7 +534,7 @@ journalctl -u antidetect-api -f
 | `--host` / `ANTIDETECT_API_HOST` | `127.0.0.1` | Адрес привязки. |
 | `--port` / `ANTIDETECT_API_PORT` | `18765` | Порт. |
 | `--token` / `ANTIDETECT_API_TOKEN` | `secret` | Bearer-токен для `serve`. Если не задан — используется `secret`. Десктоп Qt **не** требует токен (API открыт на localhost), пока вы сами не зададите `ANTIDETECT_API_TOKEN`. |
-| `ANTIDETECT_DATA_ROOT` | Linux: `~/antidetect-data` | Корень `data/` + `user-data/` вне репозитория. Для root: `/root/antidetect-data`. |
+| `ANTIDETECT_DATA_ROOT` | Linux: `~/.antidetect-data` | Корень `data/` + `user-data/` вне репозитория. Для root: `/root/.antidetect-data`. |
 | `--log-level` | `info` | Уровень логов uvicorn. |
 | `--no-access-log` | — | Отключить access log. |
 

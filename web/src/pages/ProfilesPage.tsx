@@ -46,7 +46,23 @@ export function ProfilesPage() {
   const [info, setInfo] = useState("");
   const [busy, setBusy] = useState(false);
   const [exportModal, setExportModal] = useState<ExportModal>(null);
+  const [dragSelecting, setDragSelecting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
+  const filteredRef = useRef<Profile[]>([]);
+  const dragRef = useRef<{
+    pointerId: number;
+    additive: boolean;
+    base: Set<string>;
+    visited: Set<string>;
+    lastIndex: number | null;
+    originX: number;
+    originY: number;
+    moved: boolean;
+    anchorId: string;
+  } | null>(null);
 
   const refresh = useCallback(async () => {
     setError("");
@@ -83,13 +99,128 @@ export function ProfilesPage() {
     });
   }, [profiles, search, tagFilter]);
 
-  function toggleSelect(id: string) {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+  filteredRef.current = filtered;
+
+  function applyDragSelection(drag: {
+    additive: boolean;
+    base: Set<string>;
+    visited: Set<string>;
+  }) {
+    const next = drag.additive
+      ? new Set([...drag.base, ...drag.visited])
+      : new Set(drag.visited);
+    setSelected(next);
+  }
+
+  function visitDragRange(from: number, to: number) {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const list = filteredRef.current;
+    const lo = Math.max(0, Math.min(from, to));
+    const hi = Math.min(list.length - 1, Math.max(from, to));
+    if (lo > hi) return;
+    let changed = false;
+    for (let i = lo; i <= hi; i++) {
+      const id = list[i]?.profile_id;
+      if (id && !drag.visited.has(id)) {
+        drag.visited.add(id);
+        changed = true;
+      }
+    }
+    if (changed) applyDragSelection(drag);
+  }
+
+  function rowFromPoint(clientX: number, clientY: number): { id: string; index: number } | null {
+    const el = document.elementFromPoint(clientX, clientY);
+    if (!el || !listRef.current?.contains(el)) return null;
+    const row = el.closest("[data-profile-id]") as HTMLElement | null;
+    if (!row || !listRef.current.contains(row)) return null;
+    const id = row.dataset.profileId;
+    const index = Number(row.dataset.index);
+    if (!id || !Number.isFinite(index)) return null;
+    return { id, index };
+  }
+
+  function endDragSelect(pointerId?: number) {
+    const drag = dragRef.current;
+    if (!drag) return;
+    if (pointerId != null && drag.pointerId !== pointerId) return;
+
+    if (!drag.moved) {
+      // Клик без протягивания — переключить якорь (как чекбокс в десктопе)
+      const id = drag.anchorId;
+      setSelected((prev) => {
+        const next = new Set(prev);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        return next;
+      });
+    }
+
+    dragRef.current = null;
+    setDragSelecting(false);
+  }
+
+  function onListPointerDown(e: React.PointerEvent) {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    if (target.closest(".row-actions, button, a")) return;
+
+    const row = target.closest("[data-profile-id]") as HTMLElement | null;
+    if (!row || !listRef.current?.contains(row)) return;
+
+    const id = row.dataset.profileId;
+    const index = Number(row.dataset.index);
+    if (!id || !Number.isFinite(index)) return;
+
+    e.preventDefault();
+    const additive = e.ctrlKey || e.metaKey;
+    dragRef.current = {
+      pointerId: e.pointerId,
+      additive,
+      base: additive ? new Set(selectedRef.current) : new Set(),
+      visited: new Set(),
+      lastIndex: index,
+      originX: e.clientX,
+      originY: e.clientY,
+      moved: false,
+      anchorId: id,
+    };
+    setDragSelecting(true);
+    listRef.current.setPointerCapture(e.pointerId);
+    // Пока не сдвинули — не затираем выделение; после порога — режим «краски»
+  }
+
+  function onListPointerMove(e: React.PointerEvent) {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+
+    const dist = Math.abs(e.clientX - drag.originX) + Math.abs(e.clientY - drag.originY);
+    if (!drag.moved && dist < 5) return;
+
+    if (!drag.moved) {
+      drag.moved = true;
+      drag.visited.add(drag.anchorId);
+      applyDragSelection(drag);
+    }
+
+    const hit = rowFromPoint(e.clientX, e.clientY);
+    if (!hit) return;
+    const last = drag.lastIndex;
+    drag.lastIndex = hit.index;
+    if (last == null) visitDragRange(hit.index, hit.index);
+    else visitDragRange(last, hit.index);
+  }
+
+  function onListPointerUp(e: React.PointerEvent) {
+    if (dragRef.current?.pointerId === e.pointerId) {
+      try {
+        listRef.current?.releasePointerCapture(e.pointerId);
+      } catch {
+        /* already released */
+      }
+      endDragSelect(e.pointerId);
+    }
   }
 
   function toggleTag(tag: string) {
@@ -344,13 +475,26 @@ export function ProfilesPage() {
           <p>Нет профилей{search || tagFilter.size ? " по текущему фильтру" : ""}.</p>
         </div>
       ) : (
-        <div className="list">
-          {filtered.map((p) => (
-            <div className={`row${selected.has(p.profile_id) ? " selected" : ""}`} key={p.profile_id}>
+        <div
+          className={`list${dragSelecting ? " drag-selecting" : ""}`}
+          ref={listRef}
+          onPointerDown={onListPointerDown}
+          onPointerMove={onListPointerMove}
+          onPointerUp={onListPointerUp}
+          onPointerCancel={onListPointerUp}
+        >
+          {filtered.map((p, index) => (
+            <div
+              className={`row${selected.has(p.profile_id) ? " selected" : ""}`}
+              key={p.profile_id}
+              data-profile-id={p.profile_id}
+              data-index={index}
+            >
               <input
                 type="checkbox"
                 checked={selected.has(p.profile_id)}
-                onChange={() => toggleSelect(p.profile_id)}
+                readOnly
+                tabIndex={-1}
                 aria-label={`Выбрать ${p.name}`}
               />
               <div className="row-main">
