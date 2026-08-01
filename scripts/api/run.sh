@@ -58,6 +58,28 @@ ensure_chromium() {
     echo "Предупреждение: patchright install chromium завершился с ошибкой." >&2
     echo "API всё равно запустится; браузер поставится при первом launch профиля." >&2
   fi
+  # Playwright ≥1.57 on Linux x64 installs chrome-linux64/; older checks expect chrome-linux/.
+  ensure_chrome_linux_symlink
+}
+
+ensure_chrome_linux_symlink() {
+  local cache="${PLAYWRIGHT_BROWSERS_PATH:-${XDG_CACHE_HOME:-$HOME/.cache}/ms-playwright}"
+  [[ -d "$cache" ]] || return 0
+
+  local d linked=0
+  shopt -s nullglob
+  for d in "$cache"/chromium-*; do
+    [[ -d "$d" ]] || continue
+    if [[ -d "$d/chrome-linux64" && ! -e "$d/chrome-linux" ]]; then
+      ln -s chrome-linux64 "$d/chrome-linux"
+      echo "Symlink: $d/chrome-linux -> chrome-linux64"
+      linked=1
+    fi
+  done
+  shopt -u nullglob
+  if [[ "$linked" -eq 0 ]]; then
+    echo "chrome-linux symlink: не требуется (или chromium ещё не установлен)."
+  fi
 }
 
 ensure_python_deps

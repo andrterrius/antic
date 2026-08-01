@@ -517,7 +517,7 @@ sudo mkdir -p /etc/antidetect
 sudo cp scripts/api/antidetect-api.env.example /etc/antidetect/api.env
 sudo nano /etc/antidetect/api.env   # токен / host / port
 
-# путь /root/antidetect в .service поправьте под свой клон
+# путь в .service по умолчанию /root/antic
 sudo cp scripts/api/antidetect-api.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now antidetect-api

@@ -1,6 +1,6 @@
 # Antidetect API — systemd unit
 #
-# Install (path к репо поправьте при необходимости):
+# Install (path к репо — /root/antic):
 #   cp scripts/api/antidetect-api.service /etc/systemd/system/
 #   mkdir -p /etc/antidetect
 #   cp scripts/api/antidetect-api.env.example /etc/antidetect/api.env
@@ -11,12 +11,12 @@
 #   journalctl -u antidetect-api -f
 #
 # Первый запуск зависимостей (один раз):
-#   bash /root/antidetect/scripts/api/run.sh
+#   bash /root/antic/scripts/api/run.sh
 #   # Ctrl+C после проверки, затем enable unit
 
 [Unit]
 Description=Antidetect API (profiles + web UI)
-Documentation=file:///root/antidetect/docs/CLI.md
+Documentation=file:///root/antic/docs/CLI.md
 After=network-online.target
 Wants=network-online.target
 
@@ -24,18 +24,18 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/root/antidetect
+WorkingDirectory=/root/antic
 
 # Optional env overrides (token, host, port). File may be missing.
 EnvironmentFile=-/etc/antidetect/api.env
 
-Environment=PYTHONPATH=/root/antidetect/src
+Environment=PYTHONPATH=/root/antic/src
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=ANTIDETECT_API_HOST=127.0.0.1
 Environment=ANTIDETECT_API_PORT=18765
 
 # Prefer .venv if present; otherwise system python3.
-ExecStart=/bin/bash -lc 'if [ -x /root/antidetect/.venv/bin/python ]; then exec /root/antidetect/.venv/bin/python /root/antidetect/src/cli_main.py serve; else exec /usr/bin/python3 /root/antidetect/src/cli_main.py serve; fi'
+ExecStart=/bin/bash -lc 'if [ -x /root/antic/.venv/bin/python ]; then exec /root/antic/.venv/bin/python /root/antic/src/cli_main.py serve; else exec /usr/bin/python3 /root/antic/src/cli_main.py serve; fi'
 
 Restart=always
 RestartSec=5

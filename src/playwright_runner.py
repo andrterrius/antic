@@ -244,19 +244,29 @@ def _chromium_executable_exists(browsers_root: Path, log: Callable[[str], None])
         if chromium_dirs:
             log(f"Found chromium directories: {[str(d) for d in chromium_dirs[:8]]}")
 
+        # Playwright ≥1.57 on Linux x64 uses chrome-linux64 / chrome-win64 (CfT layout).
         for exe in root.glob("chromium-*/chrome-win*/chrome.exe"):
             if exe.is_file():
                 log(f"Found Chromium at: {exe}")
                 return True
-        for exe in root.glob("chromium-*/chrome-linux/chrome"):
+        for exe in root.glob("chromium-*/chrome-linux*/chrome"):
             if exe.is_file():
                 log(f"Found Chromium at: {exe}")
                 return True
-        for exe in root.glob("chromium-*/chrome-linux/headless_shell"):
+        for exe in root.glob("chromium-*/chrome-linux*/headless_shell"):
             if exe.is_file():
                 log(f"Found Chromium at: {exe}")
                 return True
-        for exe in root.glob("chromium_headless_shell-*/chrome-linux/headless_shell"):
+        for exe in root.glob(
+            "chromium_headless_shell-*/chrome-linux*/headless_shell"
+        ):
+            if exe.is_file():
+                log(f"Found Chromium at: {exe}")
+                return True
+        for exe in root.glob(
+            "chromium_headless_shell-*/chrome-headless-shell-linux*/"
+            "chrome-headless-shell"
+        ):
             if exe.is_file():
                 log(f"Found Chromium at: {exe}")
                 return True
