@@ -120,19 +120,114 @@ CREATE TABLE IF NOT EXISTS profiles (
 """
 
 
+# Env override: absolute/relative path to the app data root (data/ + user-data/).
+ENV_DATA_ROOT = "ANTIDETECT_DATA_ROOT"
+
+
+def _repo_legacy_linux_root() -> Path:
+    """Старый Linux-путь внутри репозитория (опасно при git reset/fetch)."""
+    return Path(__file__).resolve().parent.parent / "data"
+
+
+def _default_linux_data_root() -> Path:
+    """
+    Стабильный каталог вне репо: ~/antidetect-data
+    (для root на Ubuntu → /root/antidetect-data).
+    """
+    return Path.home() / "antidetect-data"
+
+
+def _legacy_has_payload(legacy_root: Path) -> bool:
+    if (legacy_root / "data" / DB_FILENAME).is_file():
+        return True
+    ud = legacy_root / "user-data"
+    if not ud.is_dir():
+        return False
+    try:
+        next(ud.iterdir())
+        return True
+    except StopIteration:
+        return False
+
+
+def _migrate_linux_legacy_if_needed(new_root: Path) -> None:
+    """
+    Однократно переносит data/ и user-data/ из ./data репозитория в новый корень,
+    если новый ещё пуст, а старый содержит данные.
+    """
+    try:
+        legacy = _repo_legacy_linux_root()
+        if legacy.resolve() == new_root.resolve():
+            return
+        if (new_root / "data" / DB_FILENAME).is_file():
+            return
+        if not _legacy_has_payload(legacy):
+            return
+
+        new_root.mkdir(parents=True, exist_ok=True)
+        for name in ("data", "user-data"):
+            src = legacy / name
+            dst = new_root / name
+            if not src.exists():
+                continue
+            if dst.exists():
+                continue
+            shutil.move(str(src), str(dst))
+
+        marker = legacy / "MIGRATED_TO.txt"
+        try:
+            marker.write_text(
+                f"Data moved to {new_root}\n"
+                f"Set {ENV_DATA_ROOT} to override.\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+        print(
+            f"Данные профилей перенесены из {legacy} → {new_root} "
+            f"(вне репозитория; не пропадают при git fetch/reset).",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"WARNING: не удалось перенести legacy data/: {e}", flush=True)
+
+
 def app_state_root() -> Path:
     """
     Корень данных приложения: рядом лежат подкаталоги `data/` (profiles.db) и `user-data/` (Chromium).
-    Windows: %APPDATA%\\AntidetectUI; macOS: ~/Library/Application Support/AntidetectUI; иначе ./data от репо.
+
+    Приоритет:
+    1. ANTIDETECT_DATA_ROOT
+    2. Windows: %APPDATA%\\AntidetectUI
+    3. macOS: ~/Library/Application Support/AntidetectUI
+    4. Linux: ~/antidetect-data (для root → /root/antidetect-data)
+
+    На Linux при первом запуске пытается перенести данные из старого ./data репозитория.
     """
-    if sys.platform == "win32":
+    env = (os.environ.get(ENV_DATA_ROOT) or "").strip()
+    if env:
+        root = Path(env).expanduser()
+    elif sys.platform == "win32":
         appdata = os.environ.get("APPDATA")
         if appdata:
             return Path(appdata) / "AntidetectUI"
         return Path(__file__).resolve().parent.parent / "data"
-    if sys.platform == "darwin":
+    elif sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "AntidetectUI"
-    return Path(__file__).resolve().parent.parent / "data"
+    else:
+        root = _default_linux_data_root()
+
+    try:
+        root = root.resolve()
+    except OSError:
+        pass
+
+    if sys.platform not in ("win32", "darwin"):
+        _migrate_linux_legacy_if_needed(root)
+
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def _data_dir() -> Path:

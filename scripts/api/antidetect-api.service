@@ -33,6 +33,8 @@ Environment=PYTHONPATH=/root/antic/src
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=ANTIDETECT_API_HOST=127.0.0.1
 Environment=ANTIDETECT_API_PORT=18765
+# Данные вне репо /root/antic — не пропадают при git fetch/reset
+Environment=ANTIDETECT_DATA_ROOT=/root/antidetect-data
 
 # Prefer .venv if present; otherwise system python3.
 ExecStart=/bin/bash -lc 'if [ -x /root/antic/.venv/bin/python ]; then exec /root/antic/.venv/bin/python /root/antic/src/cli_main.py serve; else exec /usr/bin/python3 /root/antic/src/cli_main.py serve; fi'
