@@ -1498,6 +1498,15 @@ class MainWindow(QMainWindow):
         self.ed_proxy_pass.setEchoMode(QLineEdit.EchoMode.Password)
 
         self.ed_ua = QLineEdit()
+        self.cb_device = QComboBox()
+        self.cb_device.addItem("Desktop", userData=None)
+        self.cb_device.addItem("iPhone 12 Pro", userData="iPhone 12 Pro")
+        self.cb_device.addItem("iPhone 13", userData="iPhone 13")
+        self.cb_device.addItem("Pixel 7", userData="Pixel 7")
+        self.cb_device.setToolTip(
+            "Пресет Playwright: is_mobile + touch + viewport + мобильный UA. "
+            "Нужен для мобильной версии Instagram и подобных сайтов."
+        )
         self.ed_locale = QLineEdit()
         self.ed_locale.setPlaceholderText("en-US")
         self.ed_tz = QLineEdit()
@@ -1577,6 +1586,7 @@ class MainWindow(QMainWindow):
             self.ed_proxy_user,
             self.ed_proxy_pass,
             self.ed_ua,
+            self.cb_device,
             self.ed_locale,
             self.ed_tz,
             self.ed_country,
@@ -1637,6 +1647,7 @@ class MainWindow(QMainWindow):
         form.addRow("Прокси (пароль)", self.ed_proxy_pass)
         form.addRow(self._hr())
         form.addRow("Отпечаток", self.ed_ua)
+        form.addRow("Устройство", self.cb_device)
         form.addRow("Страна прокси", self.ed_tz)
         form.addRow(self._hr())
         # WebGL parameters are stored in profiles, but intentionally hidden from UI.
@@ -3687,6 +3698,10 @@ class MainWindow(QMainWindow):
         self.ed_proxy_user.setText(p.proxy_username or "")
         self.ed_proxy_pass.setText(p.proxy_password or "")
         self.ed_ua.setText(p.user_agent or "")
+        preset = (p.device_preset or "").strip() or None
+        if preset and self.cb_device.findData(preset) < 0:
+            self.cb_device.addItem(preset, userData=preset)
+        self._set_combo_by_data(self.cb_device, preset)
         self.ed_locale.setText(p.locale or "")
         self.ed_tz.setText(p.timezone_id or "")
         self.ed_country.setText(p.country_code or "")
@@ -3786,6 +3801,7 @@ class MainWindow(QMainWindow):
 
         # Update form fields (but don't save yet).
         self.ed_ua.setText(regen.user_agent or "")
+        self._set_combo_by_data(self.cb_device, regen.device_preset)
         self.ed_locale.setText(regen.locale or "")
         self.ed_tz.setText(regen.timezone_id or "")
         self.ed_country.setText(regen.country_code or "")
@@ -4265,7 +4281,7 @@ class MainWindow(QMainWindow):
             proxy_username=proxy_user,
             proxy_password=proxy_pass,
             engine="chromium",
-            device_preset=None,
+            device_preset=self.cb_device.currentData(),
             user_agent=self._blank_to_none(self.ed_ua.text()),
             # If no proxy is set, keep system-default locale/timezone.
             locale=None if no_proxy else self._blank_to_none(self.ed_locale.text()),
@@ -4273,6 +4289,7 @@ class MainWindow(QMainWindow):
             country_code=self._blank_to_none(self.ed_country.text()),
             color_scheme=self.cb_color.currentData(),
             # Window/viewport size is system-default and not user-configurable in UI.
+            # (Mobile device_preset still applies its own viewport at launch.)
             viewport_width=None,
             viewport_height=None,
             geo_lat=self._geo_or_none(self.sp_lat.value()),

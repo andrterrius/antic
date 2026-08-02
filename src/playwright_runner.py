@@ -1723,22 +1723,29 @@ def run_profile(
                     bind = (cdp_debug_bind or "127.0.0.1").strip() or "127.0.0.1"
                     if bind not in ("127.0.0.1", "localhost"):
                         launch_args.append(f"--remote-debugging-address={bind}")
-                # Desktop: let CDP set window bounds after launch (work-area sized).
-                # For mobile presets we keep explicit viewport.
-                if not device_opts.get("is_mobile"):
-                    # Keep a stable top-left; CDP will adjust further.
-                    launch_args.append("--window-position=0,0")
+                # Desktop: стабильная позиция; размер окна — дефолт Chromium (как раньше).
+                # Mobile: viewport пресета маленький, но OS-окно — обычное (~1280×900),
+                # не на весь экран, иначе Chromium сжимается под iPhone viewport.
+                launch_args.append("--window-position=0,0")
+                if device_opts.get("is_mobile"):
+                    launch_args.append("--window-size=1280,900")
                 log("Getting context...")
                 # Playwright defaults headless=True to the stripped "chromium-headless-shell"
                 # binary, which is trivially fingerprinted (no window.chrome, empty plugins, etc.).
                 # channel="chromium" keeps the full Chromium build with --headless — same approach as
                 # Playwright's "new headless" / avoid-headless-shell guidance.
+                effective_ua = _effective_user_agent(profile, device_opts)
+                if device_opts.get("is_mobile"):
+                    log(
+                        f"Mobile device_preset={profile.device_preset!r}: "
+                        f"is_mobile=True, ua={(effective_ua or '')[:72]!r}…"
+                    )
                 _launch_kw: dict = dict(
                     user_data_dir=str(user_data_dir),
                     headless=headless,
                     proxy=proxy_settings,
                     viewport=(desktop_vp or _launch_viewport(profile, device_opts)),
-                    user_agent=profile.user_agent or device_opts.get("user_agent"),
+                    user_agent=effective_ua,
                     locale=(profile.locale if profile.proxy_server else None),
                     timezone_id=(profile.timezone_id if profile.proxy_server else None),
                     color_scheme=profile.color_scheme,
@@ -1763,6 +1770,18 @@ def run_profile(
                     page = context.pages[0]
                 else:
                     page = context.new_page()
+
+                # Mobile: только OS-окно до обычного размера (viewport iPhone не трогаем).
+                if device_opts.get("is_mobile"):
+                    _try_set_os_window_bounds_chromium(
+                        context,
+                        page,
+                        log,
+                        width=1280,
+                        height=900,
+                        left=0,
+                        top=0,
+                    )
 
                 if cdp_debug_port is not None and on_cdp_ready:
                     ws = fetch_chromium_cdp_browser_ws_url(
@@ -1805,16 +1824,34 @@ def run_profile(
                         pass
 
                 # Fingerprint consistency: platform (UA-aligned) + WebGL overrides.
-                effective_ua = profile.user_agent or device_opts.get("user_agent")
                 platform_value = platform_from_user_agent(effective_ua)
 
                 # Chromium-only: also align UA-CH metadata where possible.
+                # Без userAgentMetadata.mobile Instagram/Meta часто оставляют desktop-бандл.
                 try:
                     if (profile.engine or "chromium").lower() == "chromium" and effective_ua:
                         meta = chromium_ua_metadata_from_user_agent(effective_ua)
                         if meta:
                             sess = context.new_cdp_session(page)
-                            sess.send("Emulation.setUserAgentOverride", {"userAgent": effective_ua, "userAgentMetadata": meta})
+                            sess.send(
+                                "Emulation.setUserAgentOverride",
+                                {
+                                    "userAgent": effective_ua,
+                                    "platform": platform_value or "",
+                                    "userAgentMetadata": meta,
+                                },
+                            )
+                            try:
+                                sess.send(
+                                    "Network.setUserAgentOverride",
+                                    {
+                                        "userAgent": effective_ua,
+                                        "platform": platform_value or "",
+                                        "userAgentMetadata": meta,
+                                    },
+                                )
+                            except Exception:
+                                pass
                 except Exception:
                     # Best-effort; don't block launch if CDP is unavailable.
                     pass
@@ -1871,46 +1908,84 @@ def run_profile(
         log("ERROR:")
         log(str(e))
 
-def _try_set_window_to_work_area_chromium(context: BrowserContext, page: Page, log: Callable[[str], None]) -> None:
-    """
-    Chromium-only, best-effort.
-    Resizes the current window to the OS work-area (screen minus taskbar/docks).
-
-    This yields a "max size" window without using F11 fullscreen.
-    """
+def _try_set_os_window_bounds_chromium(
+    context: BrowserContext,
+    page: Page,
+    log: Callable[[str], None],
+    *,
+    width: int,
+    height: int,
+    left: int = 0,
+    top: int = 0,
+) -> None:
+    """Chromium-only: задать размер OS-окна без смены page viewport."""
     try:
+        if width < 640 or height < 480:
+            return
         sess = context.new_cdp_session(page)
         info = sess.send("Browser.getWindowForTarget")
         win_id = info.get("windowId")
         if not win_id:
             return
+        sess.send(
+            "Browser.setWindowBounds",
+            {"windowId": win_id, "bounds": {"windowState": "normal"}},
+        )
+        sess.send(
+            "Browser.setWindowBounds",
+            {
+                "windowId": win_id,
+                "bounds": {
+                    "left": int(left),
+                    "top": int(top),
+                    "width": int(width),
+                    "height": int(height),
+                },
+            },
+        )
+        log(f"OS window sized to {int(width)}x{int(height)} (viewport unchanged)")
+    except Exception:
+        log("Warning: could not resize OS window; using default window state")
 
+
+def _try_set_window_to_work_area_chromium(
+    context: BrowserContext,
+    page: Page,
+    log: Callable[[str], None],
+    *,
+    sync_viewport: bool = True,
+) -> None:
+    """
+    Chromium-only, best-effort.
+    Resizes the current window to the OS work-area (screen minus taskbar/docks).
+
+    This yields a "max size" window without using F11 fullscreen.
+
+    ``sync_viewport=False`` — только OS-окно (для mobile preset: оставляем
+    viewport iPhone/Pixel, но окно большое как у desktop).
+    """
+    try:
         left, top, width, height = _work_area_logical()
         if width is None or height is None:
             return
         if width < 640 or height < 480:
             return
 
-        # Ensure the window is resizable via explicit bounds.
-        sess.send("Browser.setWindowBounds", {"windowId": win_id, "bounds": {"windowState": "normal"}})
-        sess.send(
-            "Browser.setWindowBounds",
-            {
-                "windowId": win_id,
-                "bounds": {
-                    "left": int(left or 0),
-                    "top": int(top or 0),
-                    "width": int(width),
-                    "height": int(height),
-                },
-            },
+        _try_set_os_window_bounds_chromium(
+            context,
+            page,
+            log,
+            width=int(width),
+            height=int(height),
+            left=int(left or 0),
+            top=int(top or 0),
         )
 
-        # Align JS-visible viewport with the window sizing (CSS px).
-        try:
-            page.set_viewport_size({"width": int(width), "height": int(height)})
-        except Exception:
-            pass
+        if sync_viewport:
+            try:
+                page.set_viewport_size({"width": int(width), "height": int(height)})
+            except Exception:
+                pass
     except Exception:
         # Don't block launch if CDP/permission is unavailable.
         log("Warning: could not resize window to work area; using default window state")
@@ -1991,7 +2066,32 @@ def _browser_type(pw: Playwright, engine: str | None):
     except:
         return pw.chromium
 
+def _ua_looks_mobile(user_agent: str | None) -> bool:
+    u = (user_agent or "").lower()
+    return any(x in u for x in ("mobile", "iphone", "ipad", "ipod", "android"))
+
+
+def _effective_user_agent(profile: BrowserProfile, device_opts: dict) -> str | None:
+    """
+    For mobile presets the Playwright device UA must win over a stored desktop
+    persona UA — otherwise sites (Instagram) keep serving the desktop bundle.
+    """
+    device_ua = device_opts.get("user_agent")
+    profile_ua = (profile.user_agent or "").strip() or None
+    if device_opts.get("is_mobile"):
+        if profile_ua and _ua_looks_mobile(profile_ua):
+            return profile_ua
+        return device_ua or profile_ua
+    return profile_ua or device_ua
+
+
 def _device_options(pw: Playwright, preset: str | None) -> dict:
+    """
+    Normalize Playwright/Patchright device descriptor.
+
+    Python bindings expose snake_case (user_agent, is_mobile); some versions
+    still use camelCase (userAgent, isMobile). Support both.
+    """
     try:
         if not preset:
             return {}
@@ -2002,19 +2102,30 @@ def _device_options(pw: Playwright, preset: str | None) -> dict:
         if not d:
             return {}
 
+        def _get(*keys: str):
+            for k in keys:
+                if k in d and d[k] is not None:
+                    return d[k]
+            return None
+
         out: dict = {}
-        if "userAgent" in d:
-            out["user_agent"] = d["userAgent"]
-        if "viewport" in d:
-            out["viewport"] = d["viewport"]
-        if "deviceScaleFactor" in d:
-            out["device_scale_factor"] = d["deviceScaleFactor"]
-        if "isMobile" in d:
-            out["is_mobile"] = d["isMobile"]
-        if "hasTouch" in d:
-            out["has_touch"] = d["hasTouch"]
+        ua = _get("user_agent", "userAgent")
+        if ua is not None:
+            out["user_agent"] = ua
+        vp = _get("viewport")
+        if vp is not None:
+            out["viewport"] = vp
+        dpr = _get("device_scale_factor", "deviceScaleFactor")
+        if dpr is not None:
+            out["device_scale_factor"] = dpr
+        mobile = _get("is_mobile", "isMobile")
+        if mobile is not None:
+            out["is_mobile"] = bool(mobile)
+        touch = _get("has_touch", "hasTouch")
+        if touch is not None:
+            out["has_touch"] = bool(touch)
         return out
-    except:
+    except Exception:
         return {}
 
 

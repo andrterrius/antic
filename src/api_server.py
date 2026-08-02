@@ -292,6 +292,15 @@ class LaunchProfileBody(BaseModel):
         max_length=4096,
         description="Путь к пользовательскому Python-скрипту с функцией run(page, log=None)",
     )
+    device_preset: str | None = Field(
+        None,
+        max_length=128,
+        description=(
+            "Пресет Playwright на этот запуск (напр. iPhone 12 Pro, Pixel 7). "
+            "Включает is_mobile/has_touch/viewport/UA. Перекрывает device_preset профиля; "
+            "null/пусто — брать из профиля."
+        ),
+    )
 
     @field_validator("cdp_public_host")
     @classmethod
@@ -973,8 +982,14 @@ def _session_worker(sess: ProfileRunSession, profile: BrowserProfile, body: Laun
             else None
         )
 
+        run_profile_obj = profile
+        launch_device = (body.device_preset or "").strip() or None
+        if launch_device:
+            run_profile_obj = replace(profile, device_preset=launch_device)
+            log(f"Launch device_preset override: {launch_device!r}")
+
         res = run_profile(
-            profile,
+            run_profile_obj,
             start_url=(body.start_url or "https://studio.youtube.com").strip() or "https://studio.youtube.com",
             script_path=(body.script_path or "").strip() or None,
             log=log,

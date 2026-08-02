@@ -59,9 +59,20 @@ _DESKTOP_VIEWPORTS_WEIGHTED: list[tuple[tuple[int, int], float]] = [
 
 _DEVICES_WEIGHTED: list[tuple[str | None, float]] = [
     (None, 0.80),
-    ("iPhone 13", 0.10),
+    ("iPhone 12 Pro", 0.05),
+    ("iPhone 13", 0.05),
     ("Pixel 7", 0.10),
 ]
+
+# Align with Playwright device descriptors (mobile shell / Instagram).
+_UA_IPHONE_12_PRO = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_4 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/604.1"
+)
+_UA_IPHONE_13 = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1"
+)
 
 _COLOR_SCHEMES_WEIGHTED: list[tuple[str | None, float]] = [
     ("dark", 0.42),
@@ -262,7 +273,7 @@ def generate_test_fingerprint(profile: BrowserProfile, *, seed: str | None = Non
     else:
         vw, vh = (None, None)
 
-    ua = _pick_ua(rnd, engine)
+    ua = _pick_ua(rnd, engine, device=device)
     wv, wr, wver, wslv = _webgl_params(rnd, engine=engine, device=device, user_agent=ua)
 
     return replace(
@@ -282,7 +293,21 @@ def generate_test_fingerprint(profile: BrowserProfile, *, seed: str | None = Non
     )
 
 
-def _pick_ua(rnd: random.Random, engine: str) -> str | None:
+def _chrome_ua_android_pixel7(rnd: random.Random) -> str:
+    build = rnd.choice(CHROMIUM_RELEASE_VERSIONS)
+    return (
+        "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{build} Mobile Safari/537.36"
+    )
+
+
+def _pick_ua(rnd: random.Random, engine: str, *, device: str | None = None) -> str | None:
+    if device == "iPhone 12 Pro":
+        return _UA_IPHONE_12_PRO
+    if device == "iPhone 13":
+        return _UA_IPHONE_13
+    if device == "Pixel 7":
+        return _chrome_ua_android_pixel7(rnd)
     e = (engine or "chromium").lower()
     if e == "firefox":
         return _firefox_ua_windows(rnd) if rnd.random() < 0.82 else _firefox_ua_macos(rnd)
@@ -304,7 +329,7 @@ def _webgl_params(
     eng = (engine or "chromium").lower()
     ua = (user_agent or "").lower()
 
-    if device == "iPhone 13":
+    if device in ("iPhone 12 Pro", "iPhone 13"):
         v, r, ver, slv = rnd.choice(_WGL_IPHONE)
         return v, r, ver, slv
 

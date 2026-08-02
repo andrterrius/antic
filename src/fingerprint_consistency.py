@@ -104,28 +104,50 @@ def chromium_ua_metadata_from_user_agent(user_agent: str | None) -> dict | None:
         return None
 
     u = ua.lower()
+    # iPhone/iPad UA содержит «like Mac OS X» — проверять iOS раньше macOS.
     if "windows nt" in u:
         platform_name = "Windows"
-    elif "mac os x" in u or "macintosh" in u:
-        platform_name = "macOS"
-    elif "android" in u:
-        platform_name = "Android"
     elif "iphone" in u or "ipad" in u or "ipod" in u:
         platform_name = "iOS"
+    elif "android" in u:
+        platform_name = "Android"
+    elif "mac os x" in u or "macintosh" in u:
+        platform_name = "macOS"
     elif "linux" in u:
         platform_name = "Linux"
     else:
         platform_name = "Windows"
 
-    mobile = "mobile" in u or "android" in u or "iphone" in u
+    mobile = (
+        "mobile" in u
+        or "android" in u
+        or "iphone" in u
+        or "ipad" in u
+        or "ipod" in u
+    )
 
-    # Chromium brand/version parsing (Chrome/123.0.0.0). If absent, skip.
+    # Chromium brand/version parsing (Chrome/123.0.0.0).
     m = re.search(r"chrome/(\d+)\.", u, re.IGNORECASE)
     major = m.group(1) if m else None
     if not major:
+        # Safari / WebKit mobile UA (iPhone presets): still need mobile Client Hint.
+        model = "iPhone" if platform_name == "iOS" else ""
         return {
+            "brands": [
+                {"brand": "Not.A/Brand", "version": "99"},
+                {"brand": "Safari", "version": "14"},
+            ],
+            "fullVersionList": [
+                {"brand": "Not.A/Brand", "version": "99.0.0.0"},
+                {"brand": "Safari", "version": "14.0.0"},
+            ],
             "platform": platform_name,
+            "platformVersion": "14.4.0" if platform_name == "iOS" else "0.0.0",
+            "architecture": "",
+            "model": model,
             "mobile": bool(mobile),
+            "bitness": "",
+            "wow64": False,
         }
 
     return {
@@ -135,10 +157,12 @@ def chromium_ua_metadata_from_user_agent(user_agent: str | None) -> dict | None:
             {"brand": "Not;A=Brand", "version": "99"},
         ],
         "platform": platform_name,
-        "platformVersion": "10.0.0",
-        "architecture": "x86",
-        "model": "",
+        "platformVersion": "14.0.0" if platform_name == "Android" else "10.0.0",
+        "architecture": "" if mobile else "x86",
+        "model": "Pixel 7" if "pixel 7" in u else ("" if not mobile else "K"),
         "mobile": bool(mobile),
+        "bitness": "" if mobile else "64",
+        "wow64": False,
     }
 
 
