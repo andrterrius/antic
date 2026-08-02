@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -16,7 +17,7 @@ from typing import Any, List, Literal
 if sys.version_info < (3, 10):
     import eval_type_backport  # noqa: F401  # Pydantic: list[str], str | None on 3.8–3.9
 
-from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -24,11 +25,15 @@ from starlette.background import BackgroundTask
 
 from collections.abc import Callable
 
-from api_auth import get_configured_token, require_api_token
+from api_auth import auth_from_request, get_configured_token, require_api_token
+from auth_routes import build_auth_router
+from auth_runtime import get_users_store
 from profiles_store import (
     BrowserProfile,
     get_profile,
     load_profiles,
+    set_data_username,
+    user_data_scope,
     normalize_custom_data,
     normalize_tags_list,
     save_profiles,
@@ -1024,6 +1029,9 @@ def _session_worker(sess: ProfileRunSession, profile: BrowserProfile, body: Laun
 
 def build_app() -> FastAPI:
     token_on = bool(get_configured_token())
+    if token_on:
+        # Ensure private users store exists (bootstrap admin on first serve).
+        get_users_store()
 
     app = FastAPI(
         title="Antidetect — API профилей и сессий",
@@ -1034,9 +1042,13 @@ HTTP API для списка профилей, импорта/экспорта, 
 Веб-UI раздаётся с того же порта (если собран `web_dist`).
 
 ## Авторизация
-Если задан `ANTIDETECT_API_TOKEN` (или `serve --token`) — все эндпоинты кроме `GET /health`
-требуют `Authorization: Bearer <token>`.
-Без токена (типичный запуск десктопа) API открыт для localhost — как раньше для zaliver.
+В режиме `serve` (задан `ANTIDETECT_API_TOKEN`, по умолчанию `secret`):
+- логин/пароль → `POST /auth/login` (сессионный Bearer);
+- тот же Bearer, что у Zaliver web (файл сессий Zaliver);
+- машинный токен `ANTIDETECT_API_TOKEN` / `secret` (автоматизация).
+
+Профили и прокси изолированы по пользователю (`users/<login>/`).
+Десктоп Qt без токена — API открыт, общее хранилище как раньше.
 
 ## Типичный сценарий (запуск по API)
 1. **`POST /profiles/{profile_id}/launch`** — в теле: `headless`, `expose_cdp`, `cdp_port`, `cdp_bind`, `cdp_public_host`, `start_url`.
@@ -1052,6 +1064,7 @@ HTTP API для списка профилей, импорта/экспорта, 
         """.strip(),
         openapi_tags=[
             {"name": "Сервис", "description": "Проверка доступности и ссылки на документацию."},
+            {"name": "Авторизация", "description": "Логин / сессии / пользователи."},
             {"name": "Профили", "description": "Чтение, импорт/экспорт и запуск сохранённых профилей."},
             {"name": "Прокси", "description": "Группы прокси, проверка здоровья и импорт из файла."},
             {"name": "Сессии", "description": "Список активных сессий, CDP, остановка и очистка записей."},
@@ -1062,8 +1075,41 @@ HTTP API для списка профилей, импорта/экспорта, 
     def health() -> HealthOut:
         return HealthOut()
 
+    # Login is public; other auth routes use require_api_token themselves.
+    app.include_router(build_auth_router())
+
     api_deps = [Depends(require_api_token)] if token_on else []
     api = APIRouter(dependencies=api_deps)
+
+    if token_on:
+        from auth_runtime import multiuser_enabled
+        from api_auth import _resolve_bearer
+
+        @app.middleware("http")
+        async def _bind_multiuser_data_root(request: Request, call_next):
+            """
+            Set ContextVar in the async request context so sync route handlers
+            (threadpool) inherit the per-user data root via anyio context copy.
+            """
+            if multiuser_enabled():
+                name = None
+                auth = request.headers.get("Authorization") or ""
+                if auth.lower().startswith("bearer "):
+                    raw = auth.split(" ", 1)[1].strip()
+                    if raw:
+                        try:
+                            ctx = _resolve_bearer(raw)
+                            name = ctx.user.username
+                        except HTTPException:
+                            name = None
+                # Prefer ContextVar (propagates to worker threads).
+                user_data_scope.set(name.lower() if name else None)
+                set_data_username(name)
+            try:
+                return await call_next(request)
+            finally:
+                user_data_scope.set(None)
+                set_data_username(None)
 
     @api.get("/profiles", response_model=List[ProfileOut], tags=["Профили"])
     def list_profiles() -> list[ProfileOut]:
@@ -1161,7 +1207,10 @@ HTTP API для списка профилей, импорта/экспорта, 
             if not raw:
                 raise HTTPException(status_code=400, detail="Empty upload")
             zip_path.write_bytes(raw)
-            profiles, imported, remapped = import_profiles_zip(zip_path)
+            # Sync Playwright (cookies inject) must not run on the asyncio loop thread.
+            profiles, imported, remapped = await asyncio.to_thread(
+                import_profiles_zip, zip_path
+            )
             _ui_log(f"[API] импорт ZIP: +{imported} профилей (переназначено ID: {remapped})")
             return ImportProfilesOut(imported=imported, remapped=remapped, total=len(profiles))
         except HTTPException:
@@ -1609,9 +1658,24 @@ HTTP API для списка профилей, импорта/экспорта, 
                 start_url=su,
                 script_path=sp,
             )
+            scope_user = user_data_scope.get()
+
+            def _run_session(
+                sess=sess,
+                profile=p,
+                launch_body=body,
+                scoped=scope_user,
+            ) -> None:
+                from profiles_store import set_data_username
+
+                set_data_username(scoped)
+                try:
+                    _session_worker(sess, profile, launch_body)
+                finally:
+                    set_data_username(None)
+
             th = threading.Thread(
-                target=_session_worker,
-                args=(sess, p, body),
+                target=_run_session,
                 name=f"profile-run-{profile_id}",
                 daemon=True,
             )

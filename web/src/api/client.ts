@@ -1,14 +1,26 @@
 const TOKEN_KEY = "antidetect_api_token";
 
+export type AuthUser = {
+  username: string;
+  locale: string;
+  is_admin?: boolean;
+};
+
 export function getToken(): string {
-  const v = localStorage.getItem(TOKEN_KEY);
-  // null = ключ ещё не задавали → дефолт для serve; "" = пользователь сбросил
-  if (v === null) return "secret";
-  return v;
+  return localStorage.getItem(TOKEN_KEY) || "";
 }
 
 export function setToken(token: string): void {
-  localStorage.setItem(TOKEN_KEY, token.trim());
+  const t = token.trim();
+  if (!t) {
+    localStorage.removeItem(TOKEN_KEY);
+    return;
+  }
+  localStorage.setItem(TOKEN_KEY, t);
+}
+
+export function clearToken(): void {
+  localStorage.removeItem(TOKEN_KEY);
 }
 
 export class ApiError extends Error {
@@ -40,6 +52,9 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   const res = await fetch(path, { ...init, headers });
   if (!res.ok) {
+    if (res.status === 401) {
+      clearToken();
+    }
     throw new ApiError(res.status, await parseDetail(res));
   }
   if (res.status === 204) return undefined as T;
@@ -108,6 +123,35 @@ export type ProxyImportResult = {
 
 export const api = {
   health: () => request<{ status: string }>("/health", { method: "GET" }),
+
+  login: (username: string, password: string) =>
+    request<{ token: string; user: AuthUser }>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+
+  logout: () => request<{ ok: boolean }>("/auth/logout", { method: "POST" }),
+
+  me: () => request<AuthUser>("/auth/me"),
+
+  createUser: (body: {
+    username: string;
+    password: string;
+    locale?: string;
+    is_admin?: boolean;
+  }) =>
+    request<AuthUser>("/auth/users", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  listUsers: () => request<AuthUser[]>("/auth/users"),
+
+  deleteUser: (username: string) =>
+    request<{ ok: boolean; username: string; purged_data: boolean }>(
+      `/auth/users/${encodeURIComponent(username)}`,
+      { method: "DELETE" },
+    ),
 
   listProfiles: () => request<Profile[]>("/profiles"),
 

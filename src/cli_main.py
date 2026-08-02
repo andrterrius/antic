@@ -536,6 +536,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     token_arg = getattr(args, "token", None)
     token, generated = ensure_api_token(explicit=token_arg)
+    # Per-user profiles/proxies for serve/web; desktop Qt leaves this unset.
+    os.environ.setdefault("ANTIDETECT_MULTIUSER", "1")
+    from auth_runtime import get_users_store, private_dir
+
+    get_users_store()
+    print(f"Auth users file: {private_dir() / 'users.json'}", flush=True)
+    print("Login: POST /auth/login  (bootstrap admin / admin unless ANTIDETECT_ADMIN_PASSWORD)", flush=True)
+    print("Also accepts Zaliver session Bearer tokens.", flush=True)
 
     opts: dict[str, object] = {
         "host": host,

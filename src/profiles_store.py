@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import threading
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,26 @@ from typing import Any, Callable, Iterator
 DB_FILENAME = "profiles.db"
 LEGACY_JSON_FILENAME = "profiles.json"
 LEGACY_JSON_BACKUP_SUFFIX = ".migrated"
+
+# Per-request username for serve/web multi-user isolation (desktop leaves unset).
+# threading.local: FastAPI may run sync deps/routes across ContextVar copies.
+_user_data_tls = threading.local()
+user_data_scope: ContextVar[str | None] = ContextVar("user_data_scope", default=None)
+
+
+def set_data_username(username: str | None) -> None:
+    name = (username or "").strip().lower() or None
+    _user_data_tls.username = name
+    user_data_scope.set(name)
+
+
+def get_data_username() -> str | None:
+    # ContextVar first — set by async middleware and copied into worker threads.
+    cv = user_data_scope.get()
+    if cv:
+        return cv
+    return getattr(_user_data_tls, "username", None)
+
 
 
 @dataclass
@@ -203,9 +224,45 @@ def app_state_root() -> Path:
     3. macOS: ~/Library/Application Support/AntidetectUI
     4. Linux: ~/.antidetect-data (для root → /root/.antidetect-data)
 
-    На Linux при первом запуске пытается перенести данные из старого ./data репозитория
-    и из прежнего ~/antidetect-data (без точки).
+    В режиме multi-user (serve/web) при установленном user_data_scope
+    данные изолируются в `<root>/users/<username>/`.
+    Десктоп Qt scope не ставит — остаётся общий каталог как раньше.
     """
+    base = _app_state_root_base()
+    scope = get_data_username()
+    if scope:
+        # Sanitize: username already validated; still strip path bits.
+        safe = _sanitize_username_dir(scope)
+        if safe:
+            return base / "users" / safe
+    return base
+
+
+def _sanitize_username_dir(username: str) -> str:
+    return "".join(
+        c for c in username if c not in {"/", "\\", ":", "*", "?", '"', "<", ">", "|"}
+    ).strip()
+
+
+def purge_user_storage(username: str) -> bool:
+    """Remove multi-user data dir for username (`<root>/users/<login>/`)."""
+    safe = _sanitize_username_dir(username)
+    if not safe:
+        return False
+    base = _app_state_root_base().resolve()
+    users_root = (base / "users").resolve()
+    target = (users_root / safe).resolve()
+    try:
+        target.relative_to(users_root)
+    except ValueError:
+        return False
+    if not target.is_dir():
+        return False
+    shutil.rmtree(target, ignore_errors=True)
+    return True
+
+
+def _app_state_root_base() -> Path:
     env = (os.environ.get(ENV_DATA_ROOT) or "").strip()
     if env:
         root = Path(env).expanduser()

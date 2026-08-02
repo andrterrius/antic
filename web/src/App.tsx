@@ -1,9 +1,10 @@
 import { Component, FormEvent, type ErrorInfo, type ReactNode, useEffect, useState } from "react";
-import { ApiError, api, getToken, setToken } from "./api/client";
+import { ApiError, api, clearToken, getToken, setToken, type AuthUser } from "./api/client";
 import { ProfilesPage } from "./pages/ProfilesPage";
 import { ProxiesPage } from "./pages/ProxiesPage";
+import { UsersPage } from "./pages/UsersPage";
 
-type Section = "profiles" | "proxies";
+type Section = "profiles" | "proxies" | "users";
 
 class SectionErrorBoundary extends Component<
   { children: ReactNode; onReset?: () => void },
@@ -44,8 +45,9 @@ class SectionErrorBoundary extends Component<
 }
 
 export default function App() {
-  const [token, setTokenState] = useState(() => getToken());
-  const [draft, setDraft] = useState(() => getToken());
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState("");
   const [ready, setReady] = useState(false);
@@ -54,22 +56,32 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
+    const token = getToken();
+    if (!token) {
+      setNeedsAuth(true);
+      setReady(false);
+      setChecking(false);
+      return;
+    }
     setChecking(true);
     setError("");
     void (async () => {
       try {
-        await api.listProfiles();
+        const me = await api.me();
         if (cancelled) return;
+        setUser(me);
         setNeedsAuth(false);
         setReady(true);
       } catch (e) {
         if (cancelled) return;
         setReady(false);
+        setUser(null);
         if (e instanceof ApiError && e.status === 401) {
           setNeedsAuth(true);
-          if (token) setError("Неверный токен");
+          clearToken();
+          setError("Сессия истекла — войдите снова");
         } else {
-          setNeedsAuth(Boolean(token));
+          setNeedsAuth(true);
           setError(e instanceof Error ? e.message : String(e));
         }
       } finally {
@@ -79,13 +91,43 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [token]);
+  }, []);
 
-  function onSubmit(e: FormEvent) {
+  async function onSubmit(e: FormEvent) {
     e.preventDefault();
-    const next = draft.trim();
-    setToken(next);
-    setTokenState(next);
+    setError("");
+    setChecking(true);
+    try {
+      const res = await api.login(username.trim(), password);
+      setToken(res.token);
+      setUser(res.user);
+      setPassword("");
+      setNeedsAuth(false);
+      setReady(true);
+    } catch (err) {
+      setReady(false);
+      setNeedsAuth(true);
+      if (err instanceof ApiError && err.status === 401) {
+        setError("Неверный логин или пароль");
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  async function onLogout() {
+    try {
+      await api.logout();
+    } catch {
+      /* ignore */
+    }
+    clearToken();
+    setUser(null);
+    setReady(false);
+    setNeedsAuth(true);
+    setSection("profiles");
   }
 
   if (!ready) {
@@ -112,31 +154,36 @@ export default function App() {
             <div className="brand-mark" aria-hidden />
             <div>
               <h1>Antidetect</h1>
-              <p className="brand-sub">Веб-панель профилей</p>
+              <p className="brand-sub">Вход в веб-панель</p>
             </div>
           </div>
-          <p>
-            {needsAuth
-              ? "API защищён токеном. Введите Bearer из вывода serve / ANTIDETECT_API_TOKEN."
-              : "Не удалось подключиться к API. Если включена авторизация — введите токен."}
-          </p>
           {error ? <div className="error">{error}</div> : null}
-          <label htmlFor="api-token">API token</label>
+          <label htmlFor="login-user">Логин</label>
           <input
-            id="api-token"
-            type="password"
-            autoComplete="off"
-            placeholder="Вставьте токен…"
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            id="login-user"
+            autoComplete="username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            required
           />
-          <button className="btn" type="submit" disabled={checking || !draft.trim()}>
-            {checking ? "Проверка…" : "Войти"}
+          <label htmlFor="login-pass">Пароль</label>
+          <input
+            id="login-pass"
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required
+          />
+          <button className="btn" type="submit" disabled={checking}>
+            {checking ? "Вход…" : "Войти"}
           </button>
         </form>
       </div>
     );
   }
+
+  const isAdmin = Boolean(user?.is_admin);
 
   return (
     <div className="app">
@@ -145,24 +192,16 @@ export default function App() {
           <div className="brand-mark" aria-hidden />
           <div>
             <h1 className="brand">Antidetect</h1>
-            <p className="brand-sub">Профили · прокси · импорт / экспорт</p>
+            <p className="brand-sub">
+              {user?.username
+                ? `${user.username}${isAdmin ? " · админ" : ""} · профили · прокси`
+                : "Профили · прокси · импорт / экспорт"}
+            </p>
           </div>
         </div>
-        {needsAuth || token ? (
-          <button
-            type="button"
-            className="btn btn-ghost btn-sm"
-            onClick={() => {
-              setToken("");
-              setTokenState("");
-              setDraft("");
-              setReady(false);
-              setNeedsAuth(true);
-            }}
-          >
-            Сменить токен
-          </button>
-        ) : null}
+        <button type="button" className="btn btn-ghost btn-sm" onClick={onLogout}>
+          Выйти
+        </button>
       </header>
 
       <nav className="section-nav" aria-label="Разделы">
@@ -180,10 +219,21 @@ export default function App() {
         >
           Прокси
         </button>
+        {isAdmin ? (
+          <button
+            type="button"
+            className={`section-tab${section === "users" ? " active" : ""}`}
+            onClick={() => setSection("users")}
+          >
+            Пользователи
+          </button>
+        ) : null}
       </nav>
 
       <SectionErrorBoundary key={section}>
-        {section === "profiles" ? <ProfilesPage /> : <ProxiesPage />}
+        {section === "profiles" ? <ProfilesPage /> : null}
+        {section === "proxies" ? <ProxiesPage /> : null}
+        {section === "users" && user && isAdmin ? <UsersPage currentUser={user} /> : null}
       </SectionErrorBoundary>
     </div>
   );

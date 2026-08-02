@@ -4,8 +4,11 @@ import traceback
 from dataclasses import replace
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypeVar
 from urllib.parse import urlparse, urlunparse
+import asyncio
+import concurrent.futures
+import contextvars
 import os
 import re
 import shutil
@@ -21,6 +24,20 @@ import time
 import patchright
 from playwright.sync_api import ProxySettings, BrowserContext, Page, Playwright
 from patchright.sync_api import sync_playwright
+
+_T = TypeVar("_T")
+
+
+def _run_sync_outside_asyncio(fn: Callable[[], _T]) -> _T:
+    """Playwright Sync API cannot run on a thread that already has an asyncio loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return fn()
+    ctx = contextvars.copy_context()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(ctx.run, fn).result()
+
 
 
 from profiles_store import BrowserProfile, app_state_root
@@ -1579,30 +1596,33 @@ def inject_cookies_into_profile(
     user_data_dir = profile_user_data_dir(profile.profile_id)
     proxy_settings = _proxy_settings(profile)
 
-    with sync_playwright() as pw:
-        launch_kw: dict = dict(
-            user_data_dir=str(user_data_dir),
-            headless=True,
-            channel="chromium",
-            proxy=proxy_settings,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-breakpad"],
-        )
-        context: BrowserContext = pw.chromium.launch_persistent_context(**launch_kw)
-        try:
+    def _inject() -> None:
+        with sync_playwright() as pw:
+            launch_kw: dict = dict(
+                user_data_dir=str(user_data_dir),
+                headless=True,
+                channel="chromium",
+                proxy=proxy_settings,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-breakpad"],
+            )
+            context: BrowserContext = pw.chromium.launch_persistent_context(**launch_kw)
             try:
-                context.add_cookies(playwright_cookies)
-                written = len(playwright_cookies)
-            except Exception:
-                written = 0
-                for item in playwright_cookies:
-                    try:
-                        context.add_cookies([item])
-                        written += 1
-                    except Exception:
-                        pass
-            _log(f"Записано cookies: {written} / {len(playwright_cookies)}")
-        finally:
-            context.close()
+                try:
+                    context.add_cookies(playwright_cookies)
+                    written = len(playwright_cookies)
+                except Exception:
+                    written = 0
+                    for item in playwright_cookies:
+                        try:
+                            context.add_cookies([item])
+                            written += 1
+                        except Exception:
+                            pass
+                _log(f"Записано cookies: {written} / {len(playwright_cookies)}")
+            finally:
+                context.close()
+
+    _run_sync_outside_asyncio(_inject)
 
 
 def run_profile(
