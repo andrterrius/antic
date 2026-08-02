@@ -75,7 +75,10 @@ def get_users_store() -> UsersStore:
         if _users is None:
             path = private_dir() / "users.json"
             _users = UsersStore(path)
-            if not _users.list_users():
+            # Bootstrap only on first install (file never existed). If the file
+            # exists but has no admin / is empty, do not recreate admin/admin —
+            # the operator removed accounts on purpose.
+            if not path.is_file() and not _users.list_users():
                 pw = (os.environ.get("ANTIDETECT_ADMIN_PASSWORD") or "").strip() or "admin"
                 created = _users.ensure_bootstrap_admin(username="admin", password=pw)
                 if created is not None and pw == "admin":

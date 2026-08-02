@@ -117,13 +117,14 @@ def _resolve_bearer(provided: str) -> AuthContext:
             None,
         )
         if admin is None:
-            users.ensure_bootstrap_admin(username="admin", password="admin")
-            admin = users.get("admin")
-        if admin is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid API token",
-                headers={"WWW-Authenticate": "Bearer"},
+            # Machine token stays usable for automation without recreating
+            # a loginable admin/admin row in users.json.
+            admin = UserRecord(
+                username="admin",
+                password_hash="",
+                locale="ru",
+                is_admin=True,
+                created_at=0.0,
             )
         return AuthContext(user=admin, token=provided, source="machine")
 
