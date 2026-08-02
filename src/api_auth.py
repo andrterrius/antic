@@ -18,7 +18,6 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from auth_runtime import (
-    ensure_local_user_for_external,
     get_sessions_store,
     get_users_store,
     lookup_zaliver_session,
@@ -71,7 +70,18 @@ def ensure_api_token(*, explicit: str | None = None) -> tuple[str, bool]:
     return token, True
 
 
+def _sync_users_and_revoke_removed() -> None:
+    """Pick up users.json edits and drop sessions for accounts removed from the file."""
+    removed = get_users_store().reload_if_stale()
+    if not removed:
+        return
+    sessions = get_sessions_store()
+    for name in removed:
+        sessions.revoke_user(name)
+
+
 def _resolve_bearer(provided: str) -> AuthContext:
+    _sync_users_and_revoke_removed()
     sessions = get_sessions_store()
     users = get_users_store()
 
@@ -80,11 +90,25 @@ def _resolve_bearer(provided: str) -> AuthContext:
         user = users.get(session.username)
         if user is not None:
             return AuthContext(user=user, token=provided, source="session")
+        # User deleted from users.json (or store) — kill orphan session, deny access.
+        sessions.revoke(provided)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Пользователь удалён или сессия недействительна",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     zaliver_user = lookup_zaliver_session(provided)
     if zaliver_user:
-        user = ensure_local_user_for_external(zaliver_user)
-        return AuthContext(user=user, token=provided, source="zaliver")
+        # Do not auto-recreate: deleting the local user must cut off access.
+        user = users.get(zaliver_user)
+        if user is not None:
+            return AuthContext(user=user, token=provided, source="zaliver")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Пользователь удалён или не зарегистрирован",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     expected = get_configured_token()
     if expected and secrets.compare_digest(provided, expected):

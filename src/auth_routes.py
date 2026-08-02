@@ -72,7 +72,14 @@ def build_auth_router() -> APIRouter:
         ctx = auth_from_request(request)
         if ctx is None:
             raise HTTPException(status_code=401, detail="Требуется авторизация")
-        fresh = get_users_store().get(ctx.user.username) or ctx.user
+        fresh = get_users_store().get(ctx.user.username)
+        if fresh is None:
+            if ctx.source == "session":
+                get_sessions_store().revoke(ctx.token)
+            raise HTTPException(
+                status_code=401,
+                detail="Пользователь удалён или сессия недействительна",
+            )
         return UserPublic(**fresh.public_dict())
 
     @router.patch("/auth/me", response_model=UserPublic)

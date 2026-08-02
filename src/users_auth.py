@@ -131,21 +131,36 @@ class UsersStore:
         self._lock = threading.RLock()
         _secure_mkdir(self._path.parent)
         self._users: dict[str, UserRecord] = {}
+        self._mtime: float | None = None
         self._load()
 
     @property
     def path(self) -> Path:
         return self._path
 
+    def _stat_mtime(self) -> float | None:
+        try:
+            if not self._path.is_file():
+                return None
+            return self._path.stat().st_mtime
+        except OSError:
+            return None
+
     def _load(self) -> None:
-        if not self._path.is_file():
+        mtime = self._stat_mtime()
+        if mtime is None:
+            self._users = {}
+            self._mtime = None
             return
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, UnicodeError):
+            self._mtime = mtime
             return
         items = raw.get("users") if isinstance(raw, dict) else None
         if not isinstance(items, list):
+            self._users = {}
+            self._mtime = mtime
             return
         loaded: dict[str, UserRecord] = {}
         for item in items:
@@ -167,6 +182,23 @@ class UsersStore:
                 created_at=float(item.get("created_at") or 0.0) or time.time(),
             )
         self._users = loaded
+        self._mtime = mtime
+
+    def _reload_if_stale_unlocked(self) -> list[str]:
+        """
+        Re-read users.json when the file changes on disk (e.g. manual edit).
+        Returns lowercase usernames that disappeared since the previous load.
+        """
+        mtime = self._stat_mtime()
+        if mtime == self._mtime:
+            return []
+        before = set(self._users.keys())
+        self._load()
+        return sorted(before - set(self._users.keys()))
+
+    def reload_if_stale(self) -> list[str]:
+        with self._lock:
+            return self._reload_if_stale_unlocked()
 
     def _dump(self) -> None:
         payload = {
@@ -182,14 +214,17 @@ class UsersStore:
             ]
         }
         _secure_write_json(self._path, payload)
+        self._mtime = self._stat_mtime()
 
     def list_users(self) -> list[UserRecord]:
         with self._lock:
+            self._reload_if_stale_unlocked()
             return sorted(self._users.values(), key=lambda u: u.username.lower())
 
     def get(self, username: str) -> UserRecord | None:
         key = normalize_username(username).lower()
         with self._lock:
+            self._reload_if_stale_unlocked()
             return self._users.get(key)
 
     def authenticate(self, username: str, password: str) -> UserRecord | None:
@@ -214,6 +249,7 @@ class UsersStore:
         pw = validate_password(password)
         loc = validate_locale(locale)
         with self._lock:
+            self._reload_if_stale_unlocked()
             if name.lower() in self._users:
                 raise ValueError("User already exists")
             user = UserRecord(
@@ -230,6 +266,7 @@ class UsersStore:
     def set_locale(self, username: str, locale: str) -> UserRecord:
         loc = validate_locale(locale)
         with self._lock:
+            self._reload_if_stale_unlocked()
             user = self._users.get(normalize_username(username).lower())
             if user is None:
                 raise ValueError("User not found")
@@ -247,6 +284,7 @@ class UsersStore:
     def set_password(self, username: str, password: str) -> UserRecord:
         pw = validate_password(password)
         with self._lock:
+            self._reload_if_stale_unlocked()
             user = self._users.get(normalize_username(username).lower())
             if user is None:
                 raise ValueError("User not found")
@@ -265,6 +303,7 @@ class UsersStore:
         """Remove a user. Raises ValueError if missing or last admin."""
         key = normalize_username(username).lower()
         with self._lock:
+            self._reload_if_stale_unlocked()
             user = self._users.get(key)
             if user is None:
                 raise ValueError("Пользователь не найден")
@@ -281,6 +320,7 @@ class UsersStore:
     ) -> UserRecord | None:
         """Create the first admin if the store is empty. Returns created user or None."""
         with self._lock:
+            self._reload_if_stale_unlocked()
             if self._users:
                 return None
         return self.create_user(username, password, locale="ru", is_admin=True)
@@ -303,17 +343,32 @@ class SessionStore:
         self._lock = threading.RLock()
         _secure_mkdir(self._path.parent)
         self._sessions: dict[str, SessionRecord] = {}
+        self._mtime: float | None = None
         self._load()
 
+    def _stat_mtime(self) -> float | None:
+        try:
+            if not self._path.is_file():
+                return None
+            return self._path.stat().st_mtime
+        except OSError:
+            return None
+
     def _load(self) -> None:
-        if not self._path.is_file():
+        mtime = self._stat_mtime()
+        if mtime is None:
+            self._sessions = {}
+            self._mtime = None
             return
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, UnicodeError):
+            self._mtime = mtime
             return
         items = raw.get("sessions") if isinstance(raw, dict) else None
         if not isinstance(items, list):
+            self._sessions = {}
+            self._mtime = mtime
             return
         now = time.time()
         loaded: dict[str, SessionRecord] = {}
@@ -334,6 +389,13 @@ class SessionStore:
                 expires_at=expires or (now + self._ttl),
             )
         self._sessions = loaded
+        self._mtime = mtime
+
+    def _reload_if_stale_unlocked(self) -> None:
+        mtime = self._stat_mtime()
+        if mtime == self._mtime:
+            return
+        self._load()
 
     def _dump(self) -> None:
         payload = {
@@ -348,6 +410,7 @@ class SessionStore:
             ]
         }
         _secure_write_json(self._path, payload)
+        self._mtime = self._stat_mtime()
 
     def create(self, username: str) -> SessionRecord:
         now = time.time()
@@ -358,6 +421,7 @@ class SessionStore:
             expires_at=now + self._ttl,
         )
         with self._lock:
+            self._reload_if_stale_unlocked()
             self._sessions[session.token] = session
             self._dump()
         return session
@@ -367,6 +431,7 @@ class SessionStore:
         if not tok:
             return None
         with self._lock:
+            self._reload_if_stale_unlocked()
             session = self._sessions.get(tok)
             if session is None:
                 return None
@@ -381,6 +446,7 @@ class SessionStore:
         if not tok:
             return
         with self._lock:
+            self._reload_if_stale_unlocked()
             if tok in self._sessions:
                 self._sessions.pop(tok, None)
                 self._dump()
@@ -388,6 +454,7 @@ class SessionStore:
     def revoke_user(self, username: str) -> None:
         key = normalize_username(username).lower()
         with self._lock:
+            self._reload_if_stale_unlocked()
             drop = [t for t, s in self._sessions.items() if s.username.lower() == key]
             if not drop:
                 return
