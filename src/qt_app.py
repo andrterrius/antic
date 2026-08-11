@@ -105,7 +105,7 @@ from api_server import (
     start_profile_api_background,
 )
 from fingerprint_consistency import normalize_timezone_country
-from zaliver_theme import ZALIVER_DARK_QSS
+from zaliver_theme import apply_zaliver_dark_theme
 from app_icon import build_app_icon
 from app_settings import get_anticaptcha_api_key, set_anticaptcha_api_key, get_anticaptcha_auto_solve, set_anticaptcha_auto_solve
 from profile_tags_filter_dialog import (
@@ -1341,7 +1341,7 @@ class MainWindow(QMainWindow):
     def _apply_theme(self) -> None:
         app = QApplication.instance()
         if app:
-            app.setStyleSheet(ZALIVER_DARK_QSS)
+            apply_zaliver_dark_theme(app)
 
     def _build_profiles_page(self) -> QWidget:
         w = QWidget()
@@ -4448,7 +4448,7 @@ def run_qt() -> None:
     app.setApplicationName("Antidetect UI")
     _ico = build_app_icon()
     app.setWindowIcon(_ico)
-    app.setStyleSheet(ZALIVER_DARK_QSS)
+    apply_zaliver_dark_theme(app)
     _offer_json_migration_dialog()
     w = MainWindow()
     w.setWindowIcon(_ico)

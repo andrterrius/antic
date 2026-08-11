@@ -39,6 +39,10 @@
   box-sizing: border-box;
 }
 
+html {
+  color-scheme: dark;
+}
+
 html,
 body,
 #root {
@@ -52,6 +56,7 @@ body {
   font-weight: 450;
   color: var(--text);
   background-color: var(--bg);
+  color-scheme: dark;
   background-image:
     radial-gradient(900px 520px at 8% -8%, rgba(109, 116, 255, 0.22), transparent 58%),
     radial-gradient(760px 480px at 96% 4%, rgba(139, 92, 246, 0.14), transparent 52%),
@@ -314,6 +319,7 @@ code {
 
 .search {
   width: 100%;
+  color: var(--text);
   background: var(--input-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -747,6 +753,7 @@ code {
 
 .field-input {
   width: 100%;
+  color: var(--text);
   background: var(--input-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -763,6 +770,17 @@ code {
 
 .field-input::placeholder {
   color: var(--hint);
+}
+
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+select:-webkit-autofill {
+  -webkit-text-fill-color: var(--text);
+  caret-color: var(--text);
+  box-shadow: 0 0 0 1000px #0c0e16 inset;
+  transition: background-color 99999s ease-out 0s;
 }
 
 .export-progress {

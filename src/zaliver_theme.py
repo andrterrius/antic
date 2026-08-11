@@ -1,3 +1,24 @@
+"""Zaliver dark theme — QSS + forced dark QPalette for Windows light OS theme."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from PyQt6.QtWidgets import QApplication
+
+# Shared palette tokens (keep in sync with QSS below)
+_BG = "#12141c"
+_PANEL = "#1a1d26"
+_BASE = "#0f1118"
+_BORDER = "#2d3142"
+_TEXT = "#e4e6ef"
+_MUTED = "#94a3b8"
+_HINT = "#6b7280"
+_ACCENT = "#6366f1"
+_HIGHLIGHT_TEXT = "#f8fafc"
+
+
 ZALIVER_DARK_QSS = r"""
 /* Zaliver dark theme — indigo / violet accents */
 
@@ -9,6 +30,77 @@ ZALIVER_DARK_QSS = r"""
 
 QMainWindow, QWidget#zaliverRoot {
     background-color: #12141c;
+}
+
+/* Force dark chrome for surfaces that inherit Windows light palette */
+QDialog, QMessageBox, QProgressDialog, QFileDialog {
+    background-color: #12141c;
+    color: #e4e6ef;
+}
+
+QMessageBox QLabel, QDialog QLabel {
+    color: #e4e6ef;
+    background: transparent;
+}
+
+QMenu {
+    background-color: #1a1d26;
+    color: #e4e6ef;
+    border: 1px solid #2d3142;
+    padding: 4px;
+}
+
+QMenu::item {
+    padding: 8px 24px 8px 12px;
+    border-radius: 6px;
+    background: transparent;
+}
+
+QMenu::item:selected {
+    background-color: #2e3245;
+    color: #f1f5f9;
+}
+
+QMenu::separator {
+    height: 1px;
+    background: #2d3142;
+    margin: 4px 8px;
+}
+
+QToolTip {
+    background-color: #1a1d26;
+    color: #e4e6ef;
+    border: 1px solid #3d4258;
+    padding: 6px 8px;
+    border-radius: 6px;
+}
+
+QAbstractItemView {
+    background-color: #0f1118;
+    color: #e4e6ef;
+    border: 1px solid #2d3142;
+    outline: none;
+    selection-background-color: #6366f1;
+    selection-color: #f8fafc;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #0f1118;
+    color: #e4e6ef;
+    border: 1px solid #2d3142;
+    selection-background-color: #6366f1;
+    selection-color: #f8fafc;
+    outline: none;
+    padding: 4px;
+}
+
+QHeaderView::section {
+    background-color: #252836;
+    color: #a5b4fc;
+    font-weight: 600;
+    padding: 8px 10px;
+    border: none;
+    border-bottom: 1px solid #3d4258;
 }
 
 QGroupBox {
@@ -33,11 +125,23 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     border: 1px solid #2d3142;
     border-radius: 8px;
     padding: 8px 10px;
+    color: #e4e6ef;
     selection-background-color: #6366f1;
+    selection-color: #f8fafc;
 }
 
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
     border: 1px solid #6366f1;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 28px;
+}
+
+QComboBox::down-arrow {
+    width: 10px;
+    height: 10px;
 }
 
 QPushButton {
@@ -106,23 +210,36 @@ QProgressBar::chunk {
         stop:0 #6366f1, stop:1 #a855f7);
 }
 
-QCheckBox {
+QCheckBox, QRadioButton {
     spacing: 10px;
     color: #c7c9d9;
+    background: transparent;
 }
 
-QCheckBox::indicator {
+QCheckBox::indicator, QRadioButton::indicator {
     width: 20px;
     height: 20px;
-    border-radius: 6px;
     border: 1px solid #3d4258;
     background-color: #0f1118;
 }
 
-QCheckBox::indicator:checked {
+QCheckBox::indicator {
+    border-radius: 6px;
+}
+
+QRadioButton::indicator {
+    border-radius: 10px;
+}
+
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
         stop:0 #6366f1, stop:1 #7c3aed);
     border: 1px solid #818cf8;
+}
+
+QLabel {
+    color: #e4e6ef;
+    background: transparent;
 }
 
 QLabel#title {
@@ -400,11 +517,13 @@ QTableWidget#proxiesTable {
     selection-background-color: rgba(99, 102, 241, 0.28);
     selection-color: #f1f5f9;
     alternate-background-color: rgba(255, 255, 255, 0.02);
+    color: #e4e6ef;
 }
 
 QTableWidget#proxiesTable::item {
     padding: 8px 10px;
     border: none;
+    color: #e4e6ef;
 }
 
 QTableWidget#proxiesTable QHeaderView::section {
@@ -574,11 +693,13 @@ QTableWidget#twofaTable {
     selection-background-color: rgba(99, 102, 241, 0.28);
     selection-color: #f1f5f9;
     alternate-background-color: rgba(255, 255, 255, 0.02);
+    color: #e4e6ef;
 }
 
 QTableWidget#twofaTable::item {
     padding: 8px 10px;
     border: none;
+    color: #e4e6ef;
 }
 
 QTableWidget#twofaTable QHeaderView::section {
@@ -627,3 +748,63 @@ QPushButton#twofaCopyBtn:hover {
 }
 """
 
+
+def apply_zaliver_dark_theme(app: "QApplication") -> None:
+    """Force dark UI regardless of Windows light / high-contrast OS theme."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QColor, QPalette
+
+    # Fusion paints consistently with QPalette; native Windows style ignores parts of QSS.
+    app.setStyle("Fusion")
+
+    try:
+        app.styleHints().setColorScheme(Qt.ColorScheme.Dark)
+    except Exception:
+        pass
+
+    bg = QColor(_BG)
+    panel = QColor(_PANEL)
+    base = QColor(_BASE)
+    text = QColor(_TEXT)
+    muted = QColor(_MUTED)
+    hint = QColor(_HINT)
+    accent = QColor(_ACCENT)
+    highlight_text = QColor(_HIGHLIGHT_TEXT)
+    border = QColor(_BORDER)
+
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, bg)
+    palette.setColor(QPalette.ColorRole.WindowText, text)
+    palette.setColor(QPalette.ColorRole.Base, base)
+    palette.setColor(QPalette.ColorRole.AlternateBase, panel)
+    palette.setColor(QPalette.ColorRole.Text, text)
+    palette.setColor(QPalette.ColorRole.BrightText, highlight_text)
+    palette.setColor(QPalette.ColorRole.Button, panel)
+    palette.setColor(QPalette.ColorRole.ButtonText, text)
+    palette.setColor(QPalette.ColorRole.Light, border)
+    palette.setColor(QPalette.ColorRole.Midlight, QColor("#252836"))
+    palette.setColor(QPalette.ColorRole.Mid, border)
+    palette.setColor(QPalette.ColorRole.Dark, base)
+    palette.setColor(QPalette.ColorRole.Shadow, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Highlight, accent)
+    palette.setColor(QPalette.ColorRole.HighlightedText, highlight_text)
+    palette.setColor(QPalette.ColorRole.Link, accent)
+    palette.setColor(QPalette.ColorRole.LinkVisited, QColor("#a855f7"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, panel)
+    palette.setColor(QPalette.ColorRole.ToolTipText, text)
+    palette.setColor(QPalette.ColorRole.PlaceholderText, muted)
+
+    for role in (
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+        QPalette.ColorRole.ButtonText,
+        QPalette.ColorRole.ToolTipText,
+    ):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, hint)
+
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Base, panel)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Button, panel)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Window, bg)
+
+    app.setPalette(palette)
+    app.setStyleSheet(ZALIVER_DARK_QSS)
