@@ -1504,8 +1504,8 @@ class MainWindow(QMainWindow):
         self.cb_device.addItem("iPhone 13", userData="iPhone 13")
         self.cb_device.addItem("Pixel 7", userData="Pixel 7")
         self.cb_device.setToolTip(
-            "Пресет Playwright: is_mobile + touch + viewport + мобильный UA. "
-            "Нужен для мобильной версии Instagram и подобных сайтов."
+            "Пресет Playwright: Desktop (по умолчанию) или is_mobile + touch + viewport + мобильный UA. "
+            "Mobile — только если нужна мобильная версия сайта."
         )
         self.ed_locale = QLineEdit()
         self.ed_locale.setPlaceholderText("en-US")

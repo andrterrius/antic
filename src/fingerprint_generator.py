@@ -57,14 +57,12 @@ _DESKTOP_VIEWPORTS_WEIGHTED: list[tuple[tuple[int, int], float]] = [
     ((1920, 1200), 3.0),
 ]
 
+# Новые профили — всегда desktop. Mobile (iPhone/Pixel) только если выбрать вручную.
 _DEVICES_WEIGHTED: list[tuple[str | None, float]] = [
-    (None, 0.80),
-    ("iPhone 12 Pro", 0.05),
-    ("iPhone 13", 0.05),
-    ("Pixel 7", 0.10),
+    (None, 1.0),
 ]
 
-# Align with Playwright device descriptors (mobile shell / Instagram).
+# Align with Playwright device descriptors if a mobile preset is chosen manually.
 _UA_IPHONE_12_PRO = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 14_4 like Mac OS X) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/604.1"
@@ -260,6 +258,7 @@ def generate_test_fingerprint(profile: BrowserProfile, *, seed: str | None = Non
     """
     Generates a varied set of Playwright context options for QA/testing.
     This is NOT stealth fingerprint spoofing. It's a "persona preset" generator.
+    Device is always desktop Chromium; mobile presets are not rolled randomly.
     """
     rnd = random.Random(seed or profile.profile_id)
 
