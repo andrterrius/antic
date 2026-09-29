@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,6 +20,13 @@ _SAMESITE_TO_STR: dict[int, str] = {
     1: "Lax",
     2: "Strict",
 }
+
+# Chromium mock keychain / --password-store=basic (Playwright on macOS).
+_CHROMIUM_DEFAULT_PASSWORD = b"peanuts"
+_OSX_KEYCHAIN_CANDIDATES: tuple[tuple[str, str], ...] = (
+    ("Chromium Safe Storage", "Chromium"),
+    ("Chrome Safe Storage", "Chrome"),
+)
 
 
 def _cookies_db_candidates(profile_id: str) -> list[Path]:
@@ -126,10 +135,123 @@ def collect_hosts_for_profiles(profile_ids: list[str]) -> list[tuple[str, int]]:
     return sorted(totals.items(), key=lambda x: (-x[1], x[0].lower()))
 
 
+def _osx_keychain_passwords() -> list[bytes]:
+    """Passwords Chromium may have used to derive the cookie AES key.
+
+    Playwright persistent contexts on macOS typically run with the mock keychain
+    (password ``peanuts``). A normal Chromium/Chrome install uses Keychain
+    ("Chromium Safe Storage" / "Chrome Safe Storage"). browser-cookie3 only tries
+    one of those and raises "Unable to get key for cookie decryption".
+    """
+    found: list[bytes] = [_CHROMIUM_DEFAULT_PASSWORD]
+    seen = {found[0]}
+    for service, account in _OSX_KEYCHAIN_CANDIDATES:
+        try:
+            proc = subprocess.run(
+                [
+                    "/usr/bin/security",
+                    "-q",
+                    "find-generic-password",
+                    "-w",
+                    "-a",
+                    account,
+                    "-s",
+                    service,
+                ],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.returncode != 0:
+            continue
+        secret = proc.stdout.strip()
+        if secret and secret not in seen:
+            seen.add(secret)
+            found.append(secret)
+    return found
+
+
+def _pbkdf2_sha1(password: bytes, iterations: int) -> bytes:
+    from Cryptodome.Protocol.KDF import PBKDF2
+
+    return PBKDF2(password, b"saltysalt", 16, iterations)
+
+
+def _cookie_aes_keys() -> list[bytes]:
+    if sys.platform == "darwin":
+        return [_pbkdf2_sha1(p, 1003) for p in _osx_keychain_passwords()]
+    if sys.platform.startswith("linux"):
+        keys = [_pbkdf2_sha1(_CHROMIUM_DEFAULT_PASSWORD, 1), _pbkdf2_sha1(b"", 1)]
+        return keys
+    return []
+
+
+def _aes_cbc_decrypt(blob: bytes, key: bytes) -> str | None:
+    from Cryptodome.Cipher import AES
+    from Cryptodome.Util.Padding import unpad
+
+    try:
+        decrypted = unpad(AES.new(key, AES.MODE_CBC, b" " * 16).decrypt(blob), AES.block_size)
+    except (ValueError, KeyError):
+        return None
+    if len(decrypted) >= 32:
+        body = decrypted[32:]
+        try:
+            return body.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+    try:
+        return decrypted.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _decrypt_cookie_value(encrypted: bytes, keys: list[bytes]) -> str:
+    if not encrypted:
+        return ""
+    prefix = encrypted[:3]
+    if prefix not in (b"v10", b"v11"):
+        try:
+            return encrypted.decode("utf-8")
+        except UnicodeDecodeError:
+            return ""
+    blob = encrypted[3:]
+    for key in keys:
+        text = _aes_cbc_decrypt(blob, key)
+        if text is not None:
+            return text
+    return ""
+
+
 def _decrypted_values_map(profile_id: str, cookie_file: Path) -> dict[tuple[str, str, str], str]:
-    local_state = _local_state_path(profile_id)
     if not cookie_file.is_file():
         return {}
+    if sys.platform == "win32":
+        return _decrypted_values_map_win(profile_id, cookie_file)
+    keys = _cookie_aes_keys()
+    if not keys:
+        return {}
+    out: dict[tuple[str, str, str], str] = {}
+    con = sqlite3.connect(str(cookie_file))
+    try:
+        rows = con.execute(
+            "SELECT host_key, path, name, encrypted_value FROM cookies"
+        ).fetchall()
+    finally:
+        con.close()
+    for host, path, name, enc in rows:
+        if not isinstance(enc, (bytes, bytearray)) or not enc:
+            continue
+        value = _decrypt_cookie_value(bytes(enc), keys)
+        if value:
+            out[(str(host), str(path), str(name))] = value
+    return out
+
+
+def _decrypted_values_map_win(profile_id: str, cookie_file: Path) -> dict[tuple[str, str, str], str]:
+    local_state = _local_state_path(profile_id)
     try:
         import browser_cookie3
     except ImportError as e:
