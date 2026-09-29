@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import sqlite3
 import tempfile
@@ -50,27 +49,36 @@ def samesite_to_str(code: int) -> str:
 
 
 @contextmanager
-def _open_cookies_db(db_path: Path) -> Iterator[sqlite3.Connection]:
-    """Copy DB to temp file so read works even if Chromium left a lock."""
-    tmp_fd, tmp_name = tempfile.mkstemp(suffix=".cookies")
-    os.close(tmp_fd)
-    tmp = Path(tmp_name)
+def _open_cookies_db(db_path: Path) -> Iterator[tuple[sqlite3.Connection, Path]]:
+    """Copy DB to a temp dir so read works even if Chromium left a lock.
+
+    Chromium (especially on macOS) keeps new rows in Cookies-wal until checkpoint.
+    Copying only the main file yields an empty cookies table. The yielded path is
+    the checkpointed snapshot (safe to pass to browser-cookie3).
+    """
+    tmp_dir = Path(tempfile.mkdtemp(prefix="cookies-"))
+    tmp = tmp_dir / "Cookies"
     try:
         shutil.copy2(db_path, tmp)
-        con = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+        for suffix in ("-wal", "-shm"):
+            side = Path(str(db_path) + suffix)
+            if side.is_file():
+                shutil.copy2(side, Path(str(tmp) + suffix))
+        con = sqlite3.connect(str(tmp))
         try:
-            yield con
+            con.execute("PRAGMA wal_checkpoint(FULL)")
+            yield con, tmp
         finally:
             con.close()
     finally:
-        tmp.unlink(missing_ok=True)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def list_cookie_hosts(profile_id: str) -> list[tuple[str, int]]:
     db_path = _cookies_db_path(profile_id)
     if not db_path.is_file():
         return []
-    with _open_cookies_db(db_path) as con:
+    with _open_cookies_db(db_path) as (con, _snapshot):
         rows = con.execute(
             "SELECT host_key, COUNT(*) FROM cookies GROUP BY host_key ORDER BY host_key"
         ).fetchall()
@@ -85,10 +93,9 @@ def collect_hosts_for_profiles(profile_ids: list[str]) -> list[tuple[str, int]]:
     return sorted(totals.items(), key=lambda x: (-x[1], x[0].lower()))
 
 
-def _decrypted_values_map(profile_id: str) -> dict[tuple[str, str, str], str]:
-    db_path = _cookies_db_path(profile_id)
+def _decrypted_values_map(profile_id: str, cookie_file: Path) -> dict[tuple[str, str, str], str]:
     local_state = _local_state_path(profile_id)
-    if not db_path.is_file():
+    if not cookie_file.is_file():
         return {}
     try:
         import browser_cookie3
@@ -97,7 +104,7 @@ def _decrypted_values_map(profile_id: str) -> dict[tuple[str, str, str], str]:
 
     key_file = str(local_state) if local_state.is_file() else None
     out: dict[tuple[str, str, str], str] = {}
-    cj = browser_cookie3.chromium(cookie_file=str(db_path), key_file=key_file)
+    cj = browser_cookie3.chromium(cookie_file=str(cookie_file), key_file=key_file)
     for c in cj:
         out[(c.domain, c.path, c.name)] = c.value
     return out
@@ -111,8 +118,8 @@ def read_profile_cookies(
     if not db_path.is_file():
         return []
 
-    values = _decrypted_values_map(profile_id)
-    with _open_cookies_db(db_path) as con:
+    with _open_cookies_db(db_path) as (con, snapshot):
+        values = _decrypted_values_map(profile_id, snapshot)
         rows = con.execute(
             """
             SELECT host_key, name, path, expires_utc, is_secure, is_httponly, samesite, value
