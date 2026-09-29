@@ -1579,7 +1579,8 @@ def inject_cookies_into_profile(
     *,
     log: Callable[[str], None] | None = None,
 ) -> None:
-    """Headless launch, add_cookies, close — Chromium сохранит cookies в user-data."""
+    """Stage imported cookies for the next real browser launch, including sessions."""
+    import json
     from cookies_io import cookie_to_playwright
 
     def _log(msg: str) -> None:
@@ -1589,40 +1590,27 @@ def inject_cookies_into_profile(
     if not cookies:
         return
 
-    if not ensure_playwright_chromium_installed(_log):
-        raise RuntimeError("Chromium is not installed (patchright install chromium).")
-
     playwright_cookies = [cookie_to_playwright(c) for c in cookies]
     user_data_dir = profile_user_data_dir(profile.profile_id)
-    proxy_settings = _proxy_settings(profile)
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+    pending = user_data_dir / "imported-cookies.json"
+    temp = pending.with_suffix(".tmp")
+    temp.write_text(json.dumps(playwright_cookies, ensure_ascii=False), encoding="utf-8")
+    temp.replace(pending)
+    _log(f"Cookies подготовлены к запуску профиля: {len(playwright_cookies)}")
 
-    def _inject() -> None:
-        with sync_playwright() as pw:
-            launch_kw: dict = dict(
-                user_data_dir=str(user_data_dir),
-                headless=True,
-                channel="chromium",
-                proxy=proxy_settings,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-breakpad"],
-            )
-            context: BrowserContext = pw.chromium.launch_persistent_context(**launch_kw)
-            try:
-                try:
-                    context.add_cookies(playwright_cookies)
-                    written = len(playwright_cookies)
-                except Exception:
-                    written = 0
-                    for item in playwright_cookies:
-                        try:
-                            context.add_cookies([item])
-                            written += 1
-                        except Exception:
-                            pass
-                _log(f"Записано cookies: {written} / {len(playwright_cookies)}")
-            finally:
-                context.close()
 
-    _run_sync_outside_asyncio(_inject)
+def _apply_imported_cookies(context: BrowserContext, user_data_dir: Path, log: Callable[[str], None]) -> None:
+    import json
+
+    pending = user_data_dir / "imported-cookies.json"
+    if not pending.is_file():
+        return
+    cookies = json.loads(pending.read_text(encoding="utf-8"))
+    # Keep the file if Chromium rejects the payload so the failure is retryable.
+    context.add_cookies(cookies)
+    pending.unlink()
+    log(f"Импортированные cookies применены: {len(cookies)}")
 
 
 def run_profile(
@@ -1779,6 +1767,8 @@ def run_profile(
                 if headless:
                     _launch_kw["channel"] = "chromium"
                 context: BrowserContext = browser_type.launch_persistent_context(**_launch_kw)
+
+                _apply_imported_cookies(context, user_data_dir, log)
 
                 # Poll until extensions.settings exists (first cold profile); then pin once.
                 _ensure_extension_pinned_in_preferences(

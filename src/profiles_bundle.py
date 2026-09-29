@@ -79,6 +79,13 @@ def export_profiles_zip(
         for p in profiles:
             if not is_safe_profile_id(p.profile_id):
                 continue
+            # Cookie databases are encrypted with OS/user-specific keys. Include
+            # a portable payload as well as user-data for imports on another PC.
+            cookies = read_profile_cookies(p.profile_id)
+            zf.writestr(
+                f"{COOKIES_PREFIX}{p.profile_id}.json",
+                json.dumps(cookies, ensure_ascii=False, indent=2) + "\n",
+            )
             udir = profile_user_data_dir(p.profile_id)
             if not udir.is_dir():
                 continue
@@ -369,5 +376,6 @@ def import_profiles_zip(
 
         _emit(progress, "Распаковка каталогов user-data…")
         _extract_userdata_from_zip(zf, orig_to_final, progress=progress)
+        _import_cookies_from_zip(zf, additions, orig_to_final, progress=progress)
         _emit(progress, "Сохранено.")
     return load_profiles(), len(additions), remapped

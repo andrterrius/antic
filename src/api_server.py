@@ -1207,7 +1207,7 @@ HTTP API для списка профилей, импорта/экспорта, 
             if not raw:
                 raise HTTPException(status_code=400, detail="Empty upload")
             zip_path.write_bytes(raw)
-            # Sync Playwright (cookies inject) must not run on the asyncio loop thread.
+            # ZIP extraction and profile writes must not block the asyncio loop.
             profiles, imported, remapped = await asyncio.to_thread(
                 import_profiles_zip, zip_path
             )

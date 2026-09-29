@@ -21,6 +21,12 @@ _SAMESITE_TO_STR: dict[int, str] = {
     2: "Strict",
 }
 
+_SAMESITE_FROM_STR: dict[str, int] = {
+    "None": 0,
+    "Lax": 1,
+    "Strict": 2,
+}
+
 # Chromium mock keychain / --password-store=basic (Playwright on macOS).
 _CHROMIUM_DEFAULT_PASSWORD = b"peanuts"
 _OSX_KEYCHAIN_CANDIDATES: tuple[tuple[str, str], ...] = (
@@ -88,6 +94,10 @@ def unix_expires_to_nt(expires: float | None) -> int:
 
 def samesite_to_str(code: int) -> str:
     return _SAMESITE_TO_STR.get(code, "Lax")
+
+
+def samesite_from_str(name: str | None) -> int:
+    return _SAMESITE_FROM_STR.get(str(name or "Lax"), 1)
 
 
 @contextmanager
@@ -274,7 +284,8 @@ def read_profile_cookies(
         return []
 
     with _open_cookies_db(db_path) as (con, snapshot):
-        values = _decrypted_values_map(profile_id, snapshot)
+        encrypted = _cookie_is_encrypted(con)
+        values = _decrypted_values_map(profile_id, snapshot) if encrypted else {}
         rows = con.execute(
             """
             SELECT host_key, name, path, expires_utc, is_secure, is_httponly, samesite, value
@@ -306,20 +317,175 @@ def read_profile_cookies(
     return cookies
 
 
+def _encrypt_cookie_value(value: str) -> bytes:
+    """v10 CBC, Chromium mock-keychain password ``peanuts`` (Playwright on macOS)."""
+    from Cryptodome.Cipher import AES
+    from Cryptodome.Util.Padding import pad
+
+    key = _pbkdf2_sha1(_CHROMIUM_DEFAULT_PASSWORD, 1003 if sys.platform == "darwin" else 1)
+    blob = AES.new(key, AES.MODE_CBC, b" " * 16).encrypt(pad(value.encode("utf-8"), AES.block_size))
+    return b"v10" + blob
+
+
+_COOKIE_COLUMNS = (
+    "creation_utc",
+    "host_key",
+    "top_frame_site_key",
+    "name",
+    "value",
+    "encrypted_value",
+    "path",
+    "expires_utc",
+    "is_secure",
+    "is_httponly",
+    "last_access_utc",
+    "has_expires",
+    "is_persistent",
+    "priority",
+    "samesite",
+    "source_scheme",
+    "source_port",
+    "last_update_utc",
+)
+
+
+def _cookie_is_encrypted(con: sqlite3.Connection) -> bool:
+    row = con.execute(
+        "SELECT 1 FROM cookies WHERE length(encrypted_value) > 0 LIMIT 1"
+    ).fetchone()
+    return row is not None
+
+
+def _cookie_row(cookie: dict[str, Any], now_nt: int, columns: set[str]) -> dict[str, Any]:
+    host = str(cookie["host"])
+    expires = cookie.get("expires")
+    expires_nt = unix_expires_to_nt(float(expires) if expires is not None else None)
+    has_expires = 1 if expires_nt else 0
+    secure = 1 if cookie.get("secure") else 0
+    value = str(cookie.get("value") or "")
+    encrypted = b""
+    plain = value
+    if sys.platform == "darwin":
+        encrypted = _encrypt_cookie_value(value)
+        plain = ""
+    row = {
+        "creation_utc": now_nt,
+        "host_key": host,
+        "top_frame_site_key": "",
+        "name": str(cookie["name"]),
+        "value": plain,
+        "encrypted_value": encrypted,
+        "path": str(cookie.get("path") or "/"),
+        "expires_utc": expires_nt,
+        "is_secure": secure,
+        "is_httponly": 1 if cookie.get("httpOnly") else 0,
+        "last_access_utc": now_nt,
+        "has_expires": has_expires,
+        "is_persistent": has_expires,
+        "priority": 1,
+        "samesite": samesite_from_str(cookie.get("sameSite")),
+        "source_scheme": 2 if secure else 1,
+        "source_port": 443 if secure else 80,
+        "last_update_utc": now_nt,
+    }
+    return {k: v for k, v in row.items() if k in columns}
+
+
+def _ensure_cookies_schema(con: sqlite3.Connection) -> set[str]:
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS cookies (
+            creation_utc INTEGER NOT NULL,
+            host_key TEXT NOT NULL,
+            top_frame_site_key TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL,
+            value TEXT NOT NULL,
+            encrypted_value BLOB NOT NULL DEFAULT '',
+            path TEXT NOT NULL,
+            expires_utc INTEGER NOT NULL,
+            is_secure INTEGER NOT NULL,
+            is_httponly INTEGER NOT NULL,
+            last_access_utc INTEGER NOT NULL,
+            has_expires INTEGER NOT NULL,
+            is_persistent INTEGER NOT NULL,
+            priority INTEGER NOT NULL,
+            samesite INTEGER NOT NULL DEFAULT -1,
+            source_scheme INTEGER NOT NULL DEFAULT 0,
+            source_port INTEGER NOT NULL DEFAULT -1,
+            last_update_utc INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (host_key, top_frame_site_key, name, path)
+        );
+        CREATE TABLE IF NOT EXISTS meta (key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR);
+        """
+    )
+    cols = {str(r[1]) for r in con.execute("PRAGMA table_info(cookies)")}
+    if "top_frame_site_key" not in cols:
+        con.execute("ALTER TABLE cookies ADD COLUMN top_frame_site_key TEXT NOT NULL DEFAULT ''")
+    return {str(r[1]) for r in con.execute("PRAGMA table_info(cookies)")}
+
+
+def write_profile_cookies(profile_id: str, cookies: list[dict[str, Any]]) -> int:
+    """Insert cookies into the profile SQLite DB. Returns rows written."""
+    if not cookies:
+        return 0
+    import time
+
+    default = profile_user_data_dir(profile_id) / "Default"
+    db_path = _cookies_db_path(profile_id)
+    if db_path is None:
+        db_path = default / ("Cookies" if sys.platform == "darwin" else "Network/Cookies")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in ("-wal", "-shm"):
+        side = Path(str(db_path) + suffix)
+        if side.is_file():
+            side.unlink()
+
+    now_nt = unix_expires_to_nt(time.time())
+    con = sqlite3.connect(str(db_path))
+    try:
+        columns = _ensure_cookies_schema(con)
+        insert_cols = [c for c in _COOKIE_COLUMNS if c in columns]
+        placeholders = ", ".join("?" for _ in insert_cols)
+        sql = (
+            f"INSERT OR REPLACE INTO cookies ({', '.join(insert_cols)}) "
+            f"VALUES ({placeholders})"
+        )
+        written = 0
+        for cookie in cookies:
+            if not str(cookie.get("name") or "").strip():
+                continue
+            row = _cookie_row(cookie, now_nt, columns)
+            con.execute(sql, [row[c] for c in insert_cols])
+            written += 1
+        con.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('mmap_status', '-1')"
+        )
+        con.commit()
+        return written
+    finally:
+        con.close()
+
+
 def cookie_to_playwright(cookie: dict[str, Any]) -> dict[str, Any]:
+    host = str(cookie["host"])
+    secure = bool(cookie.get("secure"))
+    # Playwright drops domain/path when url is also set, which turns ".site" into
+    # a host-only cookie and Chromium then ignores it. Keep domain+path.
     out: dict[str, Any] = {
         "name": cookie["name"],
         "value": cookie.get("value", ""),
-        "domain": cookie["host"],
+        "domain": host,
         "path": cookie.get("path") or "/",
     }
     if cookie.get("expires") is not None:
         out["expires"] = float(cookie["expires"])
-    if cookie.get("secure"):
+    if secure:
         out["secure"] = True
     if cookie.get("httpOnly"):
         out["httpOnly"] = True
     ss = cookie.get("sameSite")
+    if ss == "None" and not secure:
+        ss = "Lax"
     if ss in ("Strict", "Lax", "None"):
         out["sameSite"] = ss
     return out
