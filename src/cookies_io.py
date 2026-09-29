@@ -20,8 +20,41 @@ _SAMESITE_TO_STR: dict[int, str] = {
 }
 
 
-def _cookies_db_path(profile_id: str) -> Path:
-    return profile_user_data_dir(profile_id) / "Default" / "Network" / "Cookies"
+def _cookies_db_candidates(profile_id: str) -> list[Path]:
+    """Chromium cookie DB locations.
+
+    Modern Chromium (Win/Linux) stores cookies in Default/Network/Cookies.
+    macOS and older profiles keep them in Default/Cookies. If both exist, prefer
+    the one that actually has a WAL sidecar — that is the live database.
+    """
+    default = profile_user_data_dir(profile_id) / "Default"
+    return [
+        default / "Network" / "Cookies",
+        default / "Cookies",
+    ]
+
+
+def _db_has_rows(db_path: Path) -> bool:
+    try:
+        with _open_cookies_db(db_path) as (con, _snapshot):
+            row = con.execute("SELECT 1 FROM cookies LIMIT 1").fetchone()
+            return row is not None
+    except Exception:
+        return False
+
+
+def _cookies_db_path(profile_id: str) -> Path | None:
+    existing = [p for p in _cookies_db_candidates(profile_id) if p.is_file()]
+    if not existing:
+        return None
+    if len(existing) == 1:
+        return existing[0]
+    with_wal = [p for p in existing if Path(str(p) + "-wal").is_file()]
+    pool = with_wal or existing
+    for p in pool:
+        if _db_has_rows(p):
+            return p
+    return pool[0]
 
 
 def _local_state_path(profile_id: str) -> Path:
@@ -29,7 +62,7 @@ def _local_state_path(profile_id: str) -> Path:
 
 
 def cookies_db_available(profile_id: str) -> bool:
-    return _cookies_db_path(profile_id).is_file()
+    return _cookies_db_path(profile_id) is not None
 
 
 def nt_expires_to_unix(expires_utc: int) -> float | None:
@@ -76,7 +109,7 @@ def _open_cookies_db(db_path: Path) -> Iterator[tuple[sqlite3.Connection, Path]]
 
 def list_cookie_hosts(profile_id: str) -> list[tuple[str, int]]:
     db_path = _cookies_db_path(profile_id)
-    if not db_path.is_file():
+    if db_path is None:
         return []
     with _open_cookies_db(db_path) as (con, _snapshot):
         rows = con.execute(
@@ -115,7 +148,7 @@ def read_profile_cookies(
     hosts: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     db_path = _cookies_db_path(profile_id)
-    if not db_path.is_file():
+    if db_path is None:
         return []
 
     with _open_cookies_db(db_path) as (con, snapshot):
